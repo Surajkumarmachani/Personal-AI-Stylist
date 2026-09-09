@@ -1,0 +1,563 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# GARMENT TAXONOMY — SINGLE SOURCE OF TRUTH
+#
+# This file generates, and must never be duplicated by hand:
+#   1. Postgres ENUM types            (packages/db/taxonomy_enums.py)
+#   2. VLM extraction JSON schemas    (services/worker/stages/tag.py)
+#   3. Slot legality rules            (packages/domain/slots.py)
+#   4. ATR → slot mapping             (services/worker/stages/segment.py)
+#   5. Golden-set label validation    (eval/run_eval.py)
+#
+# CHANGING THIS FILE IS A MIGRATION. Bump `version`, write an Alembic
+# migration, and bump `extractor_version` on affected garments so the
+# backfill job re-tags them.
+#
+# HARD RULE: there is no "other" value anywhere in this file, by design.
+# If a real garment cannot be classified, that is a taxonomy bug — open an
+# issue and add the value. Do not add an escape hatch; "other" becomes 30%
+# of your data within a month and every downstream filter degrades.
+# ─────────────────────────────────────────────────────────────────────────────
+
+version: "1.0.0"
+locale_scope: [IN, global]        # designed for Indian + Western mixed wardrobes
+frozen_at: "2026-09-09"
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 1. SLOTS — the positions an outfit can fill
+# ═════════════════════════════════════════════════════════════════════════════
+slots:
+  - id: head
+    label: Headwear
+  - id: upper_base
+    label: Upper body, base layer
+  - id: upper_layer
+    label: Upper body, outer layer
+  - id: lower
+    label: Lower body
+  - id: full_body
+    label: Single garment covering upper and lower
+  - id: drape
+    label: Draped / wrapped garment
+    note: >
+      Exists as a distinct slot because a draped garment is neither a top,
+      a bottom, nor an accessory. A saree covers the lower body and drapes
+      over the upper; a dupatta is structurally required by an outfit but
+      is not jewellery. Forcing either into a Western slot loses information
+      the stylist needs.
+  - id: feet
+    label: Footwear
+  - id: bag
+    label: Bag
+  - id: accessory
+    label: Accessory
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 2. OUTFIT RULES — replaces "{top+bottom} or {one_piece}"
+#
+#    ⚠ DECISION 1 (made on your behalf — override here if you disagree)
+#    A saree occupies `drape` and REQUIRES an `upper_base` (the blouse/choli).
+#    It is NOT modelled as `full_body`.
+#    Reasons:
+#      a) users own blouses independently and re-pair them across sarees;
+#         collapsing them loses the combinatorics that make the product useful
+#      b) cost-per-wear is tracked per physical garment, and a blouse wears
+#         out on a different schedule to a silk saree
+#      c) segmentation produces separate masks anyway — modelling it as one
+#         garment means discarding a mask you already computed
+#    Cost of this choice: ingest must link the two, and the UI must explain
+#    why a saree alone is an "incomplete" outfit. Accepted.
+# ═════════════════════════════════════════════════════════════════════════════
+outfit_rules:
+  exactly_one_of:
+    - [upper_base, lower]         # shirt + trousers, kurta + churidar
+    - [full_body]                 # dress, jumpsuit, sherwani, anarkali
+
+  exactly_one:
+    - feet
+
+  at_most_one:
+    - upper_layer
+    - head
+    - bag
+
+  ranges:
+    # ⚠ DECISION 4 (made on your behalf, flag if you disagree): raised from
+    # 3 to 5. A festive_ethnic outfit routinely carries bangles + earrings +
+    # necklace + maang_tikka (4) without reading as "too much" — capping at
+    # 3 would hard-reject legitimate, common outfits in exactly the wear
+    # occasions this taxonomy exists to serve. If jewellery-heavy looks
+    # still feel over-scored, split jewellery into its own slot rather than
+    # lowering this back down.
+    - {slot: accessory, min: 0, max: 5}
+    - {slot: drape, min: 0, max: 2}   # saree + dupatta is legal; 3 drapes is not
+
+  # Composite garments: subcategory X in one slot forces another slot.
+  requires:
+    - {subcategory: saree,         needs_slot: upper_base, hint: choli_blouse}
+    - {subcategory: half_saree,    needs_slot: upper_base, hint: choli_blouse}
+    - {subcategory: lehenga_skirt, needs_slot: upper_base, hint: choli_blouse}
+
+  # Hard incompatibilities → score 0, never surfaced.
+  forbidden_pairs:
+    - [dhoti, boots_knee]
+    - [saree, cargo_pants]
+    - [gown_ball, sneakers]
+    - [track_pants, heels_stiletto]
+    - [sherwani, denim_shorts]
+
+  # Soft penalties, applied by the scorer (not hard rejections).
+  penalties:
+    - rule: more_than_two_saturated_hues
+      weight: -0.25
+    - rule: more_than_two_bold_patterns
+      weight: -0.30
+      note: >
+        bold set is defined in `patterns[].bold` below (12 values), NOT
+        hand-listed here — a hand-listed copy previously drifted out of
+        sync with the real data and silently under-penalised
+        embroidered/zari_work/sequinned festive combinations.
+    - rule: formality_spread_gt_2
+      weight: -0.35
+      note: a formality-1 item with a formality-4 item reads as a mistake
+    - rule: dress_code_mismatch
+      weight: -0.40
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 3. SUBCATEGORIES — 144 values, grouped by their default slot
+# ═════════════════════════════════════════════════════════════════════════════
+subcategories:
+
+  head:
+    [cap_baseball, cap_flat, hat_fedora, hat_sun, beanie, turban_pagdi,
+     dupatta_headcover, headband, veil_ghoonghat]
+
+  upper_base:
+    [t_shirt, polo_shirt, tank_top, camisole, crop_top, bodysuit, henley,
+     shirt_casual, shirt_oxford, shirt_formal, blouse, tunic,
+     sweatshirt, hoodie, sweater_pullover, jersey_sports,
+     kurta, kurti, choli_blouse, angrakha]
+
+  upper_layer:
+    [blazer, suit_jacket, sport_coat, waistcoat, cardigan, shrug,
+     denim_jacket, leather_jacket, bomber_jacket, windcheater, raincoat,
+     overcoat, trench_coat, puffer_jacket, gilet_vest, nehru_jacket]
+
+  lower:
+    [jeans, trousers_formal, chinos, cargo_pants, joggers, track_pants,
+     leggings, capris, culottes, shorts, denim_shorts,
+     skirt_mini, skirt_midi, skirt_maxi, skirt_pencil, skirt_a_line,
+     lehenga_skirt, churidar, salwar, patiala, palazzo, dhoti, sarong_lower]
+
+  full_body:
+    [dress_casual, dress_shirt, dress_midi, dress_maxi, dress_bodycon,
+     gown_evening, gown_ball, jumpsuit, romper, dungarees, co_ord_set,
+     anarkali, salwar_kameez_set, sherwani, bandhgala, indo_western_set,
+     kaftan, abaya]
+
+  drape:
+    [saree, half_saree, dupatta, stole, shawl, pallu_cape, angavastram]
+
+  feet:
+    [sneakers, running_shoes, oxford_shoes, derby_shoes, loafers, brogues,
+     boots_ankle, boots_knee, chelsea_boots, ballet_flats, mules,
+     espadrilles, sandals_flat, sandals_heeled, heels_pump, heels_stiletto,
+     wedges, mojari_jutti, kolhapuri_chappal, flip_flops, slides]
+
+  bag:
+    [tote_bag, shoulder_bag, crossbody_bag, sling_bag, belt_bag, clutch,
+     potli_bag, backpack, briefcase, duffel_bag]
+
+  accessory:
+    [belt, watch, sunglasses, tie, bow_tie, pocket_square, cufflinks,
+     gloves, socks, hair_accessory, brooch,
+     necklace, earrings, bracelet, bangles, ring, anklet,
+     maang_tikka, kamarbandh, nose_ring]
+
+# Overrides: a subcategory can legally occupy a non-default slot in context.
+slot_overrides:
+  - {subcategory: dupatta,     also_slot: head, when: worn_as_headcover}
+  - {subcategory: shawl,       also_slot: upper_layer, when: climate_band_cold}
+  - {subcategory: waistcoat,   also_slot: upper_base, when: worn_without_shirt}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 4. COLOUR PALETTE — 28 values
+#
+#    Hex anchors are converted to CIELAB at load time; the scorer's
+#    colour_harmony term computes ΔE2000 against these anchors, so the
+#    hex values are load-bearing, not decorative.
+#
+#    ⚠ Nine values here exist specifically for ethnic wear and would be
+#    absent from a Western palette: maroon, mustard, rani_pink, rust,
+#    emerald, teal, gold, silver, cream_ivory. Removing them collapses
+#    a large fraction of Indian wardrobes into "red" and "yellow".
+# ═════════════════════════════════════════════════════════════════════════════
+colours:
+  # neutrals — act as harmony anchors, never counted as "saturated hues"
+  - {id: black,         hex: "#111111", family: neutral}
+  - {id: white,         hex: "#FAFAFA", family: neutral}
+  - {id: cream_ivory,   hex: "#F3E9D2", family: neutral}
+  - {id: beige,         hex: "#D9C7A7", family: neutral}
+  - {id: grey_light,    hex: "#B8B8B8", family: neutral}
+  - {id: grey_charcoal, hex: "#4A4A4A", family: neutral}
+  - {id: brown,         hex: "#6B4A2F", family: neutral}
+  - {id: tan_camel,     hex: "#C19A6B", family: neutral}
+  - {id: denim_indigo,  hex: "#3B5A80", family: neutral}
+  # warm
+  - {id: red,           hex: "#C62828", family: warm}
+  - {id: maroon,        hex: "#7B1F2B", family: warm}
+  - {id: rust,          hex: "#A8471F", family: warm}
+  - {id: orange,        hex: "#E8712F", family: warm}
+  - {id: coral,         hex: "#F0715F", family: warm}
+  - {id: pink_blush,    hex: "#EEB4B8", family: warm}
+  - {id: rani_pink,     hex: "#D2286E", family: warm}
+  - {id: mustard,       hex: "#D4A017", family: warm}
+  - {id: yellow,        hex: "#F2D24B", family: warm}
+  # cool
+  - {id: olive,         hex: "#6B7043", family: cool}
+  - {id: green_forest,  hex: "#2E5D3A", family: cool}
+  - {id: emerald,       hex: "#1E8C6B", family: cool}
+  - {id: teal,          hex: "#1F7A82", family: cool}
+  - {id: blue_light,    hex: "#7FB2D9", family: cool}
+  - {id: blue_navy,     hex: "#1F3556", family: cool}
+  - {id: purple,        hex: "#6B4A8C", family: cool}
+  # metallic — special-cased by the scorer (never clash, cap at 2 per outfit)
+  - {id: gold,          hex: "#C9A227", family: metallic}
+  - {id: silver,        hex: "#C0C4C8", family: metallic}
+  # escape valve for genuinely multi-hue garments (prints, bandhani)
+  - {id: multicolour,   hex: null,      family: multi}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 5. FORMALITY AND DRESS CODE — TWO INDEPENDENT AXES
+#
+#    ⚠ DECISION 2 (made on your behalf)
+#    The spec's original 1–5 formality scale is split into two dimensions.
+#    A mehendi outfit is formality 4, dress_code festive_ethnic. A boardroom
+#    suit is formality 4, dress_code business. On a single scale these are
+#    identical and therefore interchangeable, which is exactly the failure
+#    that makes generic wardrobe apps feel wrong in India.
+# ═════════════════════════════════════════════════════════════════════════════
+formality:
+  - {value: 1, id: very_casual, examples: [t_shirt, joggers, flip_flops]}
+  - {value: 2, id: casual,      examples: [jeans, polo_shirt, sneakers]}
+  - {value: 3, id: smart,       examples: [chinos, shirt_oxford, loafers]}
+  - {value: 4, id: formal,      examples: [suit_jacket, saree, sherwani]}
+  - {value: 5, id: ceremonial,  examples: [gown_ball, bandhgala, gown_evening]}
+
+dress_codes:
+  - {id: loungewear,     formality_range: [1, 1]}
+  - {id: activewear,     formality_range: [1, 2]}
+  - {id: casual,         formality_range: [1, 3]}
+  - {id: smart_casual,   formality_range: [2, 4]}
+  - {id: business,       formality_range: [3, 5]}
+  - {id: festive_ethnic, formality_range: [3, 5]}
+  - {id: formal_ethnic,  formality_range: [4, 5]}
+  - {id: black_tie,      formality_range: [5, 5]}
+
+# Which dress codes can share an outfit without a penalty.
+dress_code_compatibility:
+  loungewear:     [loungewear]
+  activewear:     [activewear, casual]
+  casual:         [casual, smart_casual, activewear]
+  smart_casual:   [smart_casual, casual, business]
+  business:       [business, smart_casual]
+  festive_ethnic: [festive_ethnic, formal_ethnic]
+  formal_ethnic:  [formal_ethnic, festive_ethnic, black_tie]
+  black_tie:      [black_tie, formal_ethnic]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6. CLIMATE AND WARMTH
+#
+#    ⚠ DECISION 3: four-season enums are replaced by climate bands.
+#    Bengaluru has no autumn. Monsoon is a first-class wardrobe constraint
+#    (fabric, footwear, hemline) and has no Western-season equivalent.
+# ═════════════════════════════════════════════════════════════════════════════
+#
+#    RESOLUTION IS ORDERED — evaluate top to bottom, first match wins.
+#    This list was previously a set of ad-hoc ranges that left temp=30°C/
+#    50% humidity (an ordinary Bengaluru afternoon) matching NO band, and
+#    temp=28°C/70% matching TWO. It is now a total, non-overlapping
+#    partition:
+#      1. `monsoon` fires whenever the forecast reports precipitation,
+#         at any humidity, because rain — not heat — is the dominant
+#         wardrobe constraint (footwear, hemline, fabric) in that range.
+#      2/3. `hot_dry` vs `hot_humid` split hot weather (temp ≥ 28°C) at
+#         50% humidity — one bucket each side, no gap, no overlap.
+#      4/5. `mild` and `cold` partition everything below 28°C at 18°C.
+#    `null` means "open-ended" (no lower/upper bound). Every (temp,
+#    humidity, precip) combination matches exactly one band — this is
+#    asserted by `scripts/validate_taxonomy.py`.
+climate_bands:
+  - {id: monsoon,   temp_c: [20, 34],  precip: true}
+  - {id: hot_humid, temp_c: [28, null], humidity_pct: [50, 100]}
+  - {id: hot_dry,   temp_c: [28, null], humidity_pct: [0, 50]}
+  - {id: mild,      temp_c: [18, 28]}
+  - {id: cold,      temp_c: [null, 18]}
+
+# warmth 1–5, calibrated to a 16–34°C operating range (NOT 0–30°C).
+warmth:
+  - {value: 1, id: minimal,  feels_like_c_max: 34, examples: [tank_top, sandals_flat]}
+  - {value: 2, id: light,    feels_like_c_max: 30, examples: [t_shirt, skirt_midi]}
+  - {value: 3, id: moderate, feels_like_c_max: 26, examples: [shirt_oxford, chinos]}
+  - {value: 4, id: warm,     feels_like_c_max: 21, examples: [blazer, sweater_pullover]}
+  - {value: 5, id: heavy,    feels_like_c_max: 16, examples: [overcoat, puffer_jacket]}
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 6b. CLIMATE_BAND_RULES — the derivation for the garment-level `climate_bands`
+#     field declared in fields.climate_bands (§10) as `required: true,
+#     tier: rule, source: derived`. Without this table that field had no
+#     producer. This is what the ingest `classify` stage actually calls;
+#     it answers "which weather bands is THIS garment suitable for",
+#     which is a different question from the `climate_bands` list above
+#     (which classifies a *forecast reading* into a band).
+#
+#     Step 1: warmth value → candidate bands, by insulation alone.
+#     Step 2: monsoon is then added or removed based on material, because
+#     insulation and monsoon-suitability are independent properties (a
+#     light silk blouse and a light cotton kurta are both `warmth: 2`
+#     but only one survives a monsoon).
+# ═════════════════════════════════════════════════════════════════════════════
+climate_band_rules:
+  by_warmth:
+    1: [hot_dry, hot_humid, monsoon, mild]
+    2: [hot_dry, hot_humid, monsoon, mild]
+    3: [hot_humid, mild]
+    4: [mild, cold]
+    5: [cold]
+  monsoon_material_override:
+    add_monsoon_if:    [polyester, viscose_rayon, blend, knit_synthetic, cotton, linen, georgette]
+    remove_monsoon_if: [silk, brocade, velvet, suede, khadi, chiffon, wool, cashmere, denim, leather, crepe, satin, jute_blend]
+    # `unknown` material takes neither action — monsoon suitability from
+    # warmth alone, no penalty and no bonus, until a real material is known.
+
+# Monsoon overrides warmth targeting: a light cotton kurta and a light silk
+# blouse are the same warmth but not the same monsoon garment.
+#
+# ⚠ First-pass classification of every material and footwear subcategory —
+# the previous version left 11/21 materials and 14/21 footwear items with
+# no verdict, which is silent, not neutral. Reviewed for plausibility, not
+# lab-tested; revisit against golden-set correction data in Phase 3.
+monsoon_suitability:
+  good: [polyester, viscose_rayon, blend, knit_synthetic, cotton, linen, georgette]
+  poor: [silk, brocade, velvet, suede, khadi, chiffon, wool, cashmere, denim,
+         leather, crepe, satin, jute_blend]
+  # `unknown` is deliberately absent from both lists — no verdict when the
+  # material itself is unknown, rather than defaulting to a guess.
+  footwear_good: [flip_flops, slides, sandals_flat, kolhapuri_chappal,
+                  running_shoes, sandals_heeled]
+  footwear_poor: [mojari_jutti, espadrilles, boots_knee, boots_ankle,
+                  chelsea_boots, sneakers, oxford_shoes, derby_shoes,
+                  loafers, brogues, heels_pump, heels_stiletto, mules,
+                  ballet_flats, wedges]
+  # (previous list had "suede_shoes", which is not a real subcategory and
+  # never matched anything — suede-ness is already captured by
+  # material=suede above; this list is about shoe CONSTRUCTION, e.g. open
+  # weave, delicate trim, poor grip, not about upper material.)
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 7. MATERIAL, PATTERN, FIT
+# ═════════════════════════════════════════════════════════════════════════════
+materials:
+  [cotton, linen, khadi, silk, brocade, chiffon, georgette, crepe, satin,
+   wool, cashmere, velvet, denim, leather, suede, viscose_rayon, polyester,
+   knit_synthetic, jute_blend, blend, unknown]
+
+patterns:
+  # `bold` patterns are counted by the more_than_two_bold_patterns penalty
+  - {id: solid,          bold: false}
+  - {id: texture_woven,  bold: false}
+  - {id: stripe,         bold: false}
+  - {id: check,          bold: false}
+  - {id: polka_dot,      bold: false}
+  - {id: colourblock,    bold: false}
+  - {id: ombre,          bold: false}
+  - {id: geometric,      bold: true}
+  - {id: floral,         bold: true}
+  - {id: paisley,        bold: true}
+  - {id: abstract_print, bold: true}
+  - {id: graphic_print,  bold: true}
+  - {id: animal_print,   bold: true}
+  - {id: bandhani,       bold: true}
+  - {id: ikat,           bold: true}
+  - {id: block_print,    bold: true}
+  - {id: embroidered,    bold: true}
+  - {id: sequinned,      bold: true}
+  - {id: zari_work,      bold: true}
+  - {id: unknown,        bold: false}
+
+fits:
+  [skinny, slim, regular, relaxed, oversized, tailored, straight,
+   a_line, flared, bodycon, unstructured, draped]
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 8. ATR → SLOT MAPPING  (segmentation, Phase 3)
+#
+#    SegFormer-clothes is trained on the ATR human-parsing dataset: 18
+#    classes, none of which is a saree. This table is the honest mapping,
+#    with the known gaps marked. The Phase 3 exit criterion is a measured
+#    accuracy number on the 50 ethnic-wear golden images — expect this
+#    section to change once you have it.
+# ═════════════════════════════════════════════════════════════════════════════
+atr_to_slot:
+  Background:      null
+  Hat:             head
+  Hair:            null
+  Sunglasses:      accessory
+  Upper-clothes:   upper_base
+  Skirt:           lower
+  Pants:           lower
+  Dress:           full_body
+  Belt:            accessory
+  Left-shoe:       feet          # merge L/R into ONE garment at the
+  Right-shoe:      feet          # dedupe stage, not two
+  Face:            null
+  Left-leg:        null
+  Right-leg:       null
+  Left-arm:        null
+  Right-arm:       null
+  Bag:             bag
+  Scarf:           drape         # ⚠ ATR's only drape-adjacent class
+
+atr_known_gaps:
+  - garment: saree
+    expected_behaviour: >
+      Fires as some combination of Skirt + Dress + Scarf, unpredictably.
+      Handle at the split stage: if 2+ of {Skirt, Dress, Scarf} overlap
+      >30% IoU on a single subject, route to NEEDS_REVIEW with the manual
+      crop UI rather than emitting three wrong garments.
+  - garment: dupatta
+    expected_behaviour: Usually Scarf; sometimes absorbed into Upper-clothes.
+  - garment: lehenga_skirt
+    expected_behaviour: Usually Skirt. Acceptable.
+  - garment: sherwani
+    expected_behaviour: Usually Dress or Upper-clothes. Needs override.
+  - garment: dhoti
+    expected_behaviour: Usually Pants or Skirt. Acceptable either way.
+  - garment: kurta
+    expected_behaviour: Upper-clothes if short, Dress if long. Length ambiguity.
+
+# Confidence policy: mask-derived slots are treated as HINTS, not truth.
+# The VLM tagging stage may override a slot hint; a user correction always wins.
+slot_hint_confidence: 0.65
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 9. OCCASION → TARGETS  (context resolution, Phase 6)
+#
+#    Used by resolve_context() to convert an occasion into scoring targets.
+#    Also the label set for the calendar-event classifier in Phase 8.
+# ═════════════════════════════════════════════════════════════════════════════
+occasions:
+  - id: wfh
+    dress_code: loungewear
+    formality_target: 1
+  - id: office_casual
+    dress_code: smart_casual
+    formality_target: 3
+  - id: office_formal
+    dress_code: business
+    formality_target: 4
+  - id: client_meeting
+    dress_code: business
+    formality_target: 4
+  - id: interview
+    dress_code: business
+    formality_target: 4
+  - id: casual_outing
+    dress_code: casual
+    formality_target: 2
+  - id: dinner_date
+    dress_code: smart_casual
+    formality_target: 3
+  - id: party_night
+    dress_code: smart_casual
+    formality_target: 4
+  - id: workout
+    dress_code: activewear
+    formality_target: 1
+  - id: travel_day
+    dress_code: casual
+    formality_target: 2
+  - id: festival_day          # Diwali, Onam, Pongal, Eid
+    dress_code: festive_ethnic
+    formality_target: 4
+  - id: mehendi
+    dress_code: festive_ethnic
+    formality_target: 4
+  - id: sangeet
+    dress_code: festive_ethnic
+    formality_target: 5
+  - id: wedding_ceremony
+    dress_code: formal_ethnic
+    formality_target: 5
+  - id: wedding_reception
+    dress_code: formal_ethnic
+    formality_target: 5
+  - id: temple_visit
+    dress_code: festive_ethnic
+    formality_target: 3
+    constraints: [covered_shoulders, covered_knees, removable_footwear]
+  - id: funeral
+    dress_code: formal_ethnic
+    formality_target: 4
+    constraints: [subdued_colours]
+    note: >
+      Colour convention is regionally specific (white in much of India,
+      black in Western contexts). Resolve from user locale, and when
+      uncertain ASK rather than guess — this is the single occasion where a
+      wrong suggestion causes real offence.
+  - id: black_tie_event
+    dress_code: black_tie
+    formality_target: 5
+
+# ═════════════════════════════════════════════════════════════════════════════
+# 10. PER-FIELD EXTRACTION AND CONFIDENCE POLICY
+#
+#     `tier` decides who computes the field, and is the entire basis of the
+#     two-tier cost model: `local` fields cost nothing.
+#     `review_below` gates the correction UI.
+# ═════════════════════════════════════════════════════════════════════════════
+fields:
+  slot:              {tier: local, source: atr_mask,        review_below: 0.70, required: true}
+  subcategory:       {tier: vlm,   source: vlm,             review_below: 0.75, required: true}
+  primary_colour:    {tier: local, source: lab_kmeans,      review_below: 0.80, required: true}
+  secondary_colour:  {tier: local, source: lab_kmeans,      review_below: 0.60, required: false}
+  pattern:           {tier: local, source: classifier_head, review_below: 0.70, required: true}
+  material:          {tier: vlm,   source: vlm,             review_below: 0.60, required: false}
+  formality:         {tier: vlm,   source: vlm,             review_below: 0.70, required: true}
+  dress_code:        {tier: vlm,   source: vlm,             review_below: 0.70, required: true}
+  warmth:            {tier: vlm,   source: vlm,             review_below: 0.70, required: true}
+  fit:               {tier: vlm,   source: vlm,             review_below: 0.60, required: false}
+  climate_bands:     {tier: rule,  source: derived,         review_below: null, required: true}
+
+# `climate_bands` is DERIVED from (material, warmth, slot) — never asked of
+# the VLM. Deriving beats extracting whenever a deterministic rule exists:
+# it is free, consistent, and re-derivable on backfill without a model call.
+
+# Accuracy floors for the CI eval gate (eval/run_eval.py).
+# Set to your Phase 3 measured baseline, then ratchet UP only. Never lower
+# a floor to make a build pass — that is how quality silently regresses.
+eval_floors:
+  slot:            0.95
+  primary_colour:  0.92
+  subcategory:     0.80
+  pattern:         0.85
+  formality:       0.75
+  dress_code:      0.75
+  warmth:          0.75
+  material:        0.65
+  # Sliced floors — the overall number hides the failures that matter.
+  by_slice:
+    flat_lay:        0.95
+    on_hanger:       0.90
+    worn_single:     0.90
+    worn_multi:      0.80
+    ethnic_wear:     0.60   # ⚠ deliberately low. This is a MEASUREMENT
+                            # target for Phase 3, not an acceptance
+                            # threshold. Set the real floor once you know
+                            # what SegFormer actually does with a saree.
+    dark_on_dark:    0.75
+    pattern_heavy:   0.75
+    low_light:       0.70
+    folded:          0.75   # was missing — GOLDEN_SET_SPEC.md quotas 20
+                            # images for this slice; CI was silently not
+                            # gating it. "Shape priors fail entirely" per
+                            # spec, same difficulty tier as dark_on_dark.
