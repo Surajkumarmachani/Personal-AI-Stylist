@@ -675,15 +675,193 @@ Only now, with ≥5k feedback events: Thompson-sampling bandit (85/15 exploit/ex
 
 ---
 
-## Phase 0 status (as committed)
+## Build status
 
-Phase 0.1 is complete: [config/taxonomy.yaml](../config/taxonomy.yaml) is frozen at v1.0.0 and validated by
-[scripts/validate_taxonomy.py](../scripts/validate_taxonomy.py) (0 errors). Four Type-1 decisions are
-recorded in the file itself: saree as `drape` + required `upper_base`; two-axis
-formality/dress_code; climate bands replacing seasons; accessory range raised to 5
-for festive jewellery.
+_Last updated 2026-09-09._
 
-Still open before Phase 1:
-- **Step 0.1 exit criterion** — the 30-real-garment hand-classification test proving zero need for an `other` value.
-- **Step 0.2** — golden set collection has a spec but no images yet. Runs in background, gates Phase 3.
-- **Step 0.3** — cloud accounts, second backup account, DPA process, bucket with versioning, branch protection.
+### Phase 0 — Decide and prepare · COMPLETE (0.1) / IN PROGRESS (0.2, 0.3)
+
+**Step 0.1 is done.** [config/taxonomy.yaml](../config/taxonomy.yaml) is frozen at
+v1.0.0 and validated by [scripts/validate_taxonomy.py](../scripts/validate_taxonomy.py)
+(0 errors, wired as a required CI check). Four Type-1 decisions are recorded in the
+file itself with their reasoning: saree as `drape` + required `upper_base`; two
+independent formality/dress_code axes; climate bands replacing four-season enums;
+accessory range raised 3→5 for festive jewellery.
+
+An audit after freezing found six defects the original validator did not check for,
+all since fixed — the significant one being that `climate_bands` was not a total
+partition (30°C at 50% humidity, an ordinary Bengaluru afternoon, matched **no**
+band, while 28°C/70% matched two). The validator now sweeps the whole
+(temperature, humidity, precipitation) grid so that class of gap cannot recur.
+
+**Steps 0.2 and 0.3 are owner-side and in progress** — the 30-real-garment
+hand-classification check, golden-set collection (spec written, images pending;
+gates Phase 3), and accounts/DPA/branch protection. Neither blocks Phase 1, and
+0.2 is designed to run in the background until Phase 3.
+
+### Phase 1 — Skeleton with tenancy · COMPLETE
+
+All five exit criteria met and demonstrated, not asserted:
+
+| Criterion | Evidence |
+|---|---|
+| `docker compose up` → healthy in <60s from clean | **12s**, exit 0, all 9 services healthy |
+| Three RLS tests green, required CI check | 9 tests, plus a CI step that disables RLS and fails the build if the suite still passes |
+| Presigned upload → object in storage with versioning | `scripts/verify_upload_e2e.py`, 14/14 against a live stack |
+| Same `Idempotency-Key` twice → same `job_id` | verified over HTTP and against live storage |
+| DB enums match `taxonomy.yaml` | 9 enum types, label-for-label, in creation order |
+
+42 tests; `ruff`, `ruff format` and `mypy --strict` clean across 27 source files;
+migration verified reversible (`downgrade base` → `upgrade head`).
+
+**Three deliberate departures from the plan as written**, each because the plan's
+text was wrong or unachievable rather than as a shortcut:
+
+1. **`SET LOCAL app.user_id = :uid` does not work.** Postgres `SET` takes no bind
+   parameters, so that snippet either errors or pushes you into interpolating a
+   UUID into SQL — an injection sink on the single value that decides which
+   tenant's data you can see. The parameterised form is
+   `SELECT set_config('app.user_id', :uid, true)`.
+2. **Presigned POST, not PUT.** Step 1.5 requires the size cap to live "in the
+   presigned policy"; a presigned PUT URL cannot cap a body. `generate_presigned_post`
+   carries a real `content-length-range` condition storage enforces before storing
+   bytes. Verified: a 13MB upload against a 12MB policy is rejected with HTTP 400
+   and never stored.
+3. **Async Alembic on asyncpg**, so the project ships one Postgres driver rather
+   than adding psycopg2 solely for migrations.
+
+Two smaller shape changes: python packages are prefixed (`packages/stylist_db`,
+not `packages/db`) to avoid generic top-level module names, and integration tests
+use GitHub Actions service containers rather than testcontainers — same "real
+Postgres and Redis, never a mock" intent, less fragility.
+
+**Deliberately not built:** Kubernetes (P9), the outbox relay and ingest stages
+(P2), models in `stylist_ml` (P3), a populated LiteLLM config (P4), and any web UI
+(the grid is P2.4). The worker registers exactly one real task — a `ping` that
+round-trips Postgres — and no placeholder pipeline stages, because a no-op that
+looks like a pipeline is worse than an absent one.
+
+#### What running it actually caught
+
+Four bugs survived unit tests and were only exposed by `docker compose up` and a
+real upload. Recorded because they argue for the plan's own "works from a clean
+`docker compose up`" clause being part of the definition of done:
+
+- **The worker never started.** arq refuses to boot with zero registered
+  functions — the "no placeholder stages" choice left the container dead.
+- **`redis_settings` declared as a `@staticmethod`.** arq reads it as an
+  attribute and got a `staticmethod` object. mypy could not catch it (arq ships
+  no stubs), and the error above masked it.
+- **Presigned URLs were unusable by any real client.** The API signed
+  `http://minio:9000`, the container-internal hostname. Fixed by splitting
+  `S3_ENDPOINT_URL` (server-side) from `S3_PUBLIC_ENDPOINT_URL` (client-facing).
+  This is a correctness issue, not just DNS: presigned GET signs the `Host`
+  header, so the wrong endpoint fails signature validation.
+- **A silently dead worker reported as started.** `compose up --wait` only waits
+  for *running* on a service with no healthcheck. The worker now has one that
+  reads arq's Redis health record, so a dead or hung worker fails visibly.
+
+### Phase 2 — Ingest vertical slice, zero AI · COMPLETE
+
+All six exit criteria met against a live stack:
+
+| Criterion | Evidence |
+|---|---|
+| Flat-lay → cutout in the grid, p95 under 10s | **2.5–3.2s** end to end |
+| Crash-before-commit leaves no orphan garment | rollback **and** a real `SIGKILL` mid-transaction |
+| Crash mid-pipeline resumes, does not re-run completed stages | call-counted across a simulated worker restart |
+| EXIF GPS stripped | asserted, with a guard test proving the fixture carries GPS |
+| Poison image → DLQ → alert fires, other jobs unaffected | DLQ path + `dlq.job_parked` alert asserted |
+| 50-photo batch drains, no duplicate rows | **58.9s**, 50 rows, 0 in DLQ, 0 unsent outbox events |
+
+77 tests; `ruff`, `ruff format`, `mypy --strict` clean across 40 source files;
+`npx tsc --noEmit` and `npm run build` clean for the web app with 0 npm
+vulnerabilities. Re-runnable via `make verify`
+([verify_ingest_e2e.py](../scripts/verify_ingest_e2e.py), 23 checks).
+
+**On the corrupt-image criterion:** the plan says a poison image should reach
+the DLQ after 3 attempts. It reaches `REJECTED` after ONE attempt instead, and
+that is the correct behaviour: a corrupt file fails identically on every
+attempt, so retrying it three times burns CPU and delays telling the user
+something they can act on. The DLQ is for genuinely retryable failures — a
+model service that is down, an S3 blip — and the state machine's DLQ path is
+asserted separately with a stage that keeps failing.
+
+**Shape decisions worth knowing:**
+
+- **Matting runs in `services/stylist_ml`, not in the worker.** The plan puts
+  matting in 2.3 and the ml service in 3.1; building the endpoint now avoids
+  writing rembg into the worker and moving it a week later, and it matches the
+  deployment topology either way — model inference scales on CPU-seconds,
+  workers scale on I/O concurrency. The ml service holds no database or storage
+  credentials, so the one process that touches user pixels structurally cannot
+  read the wardrobe.
+- **The relay enqueues arq jobs rather than publishing to a Redis stream.** The
+  guarantee that matters is at-least-once delivery from a durable outbox into
+  the job queue; arq refuses a duplicate `_job_id`, so deriving that id from the
+  outbox row makes a re-delivered event a no-op.
+- **Relay tick is 1s, not the plan's 250ms.** At 250ms that is 4 queries per
+  second per replica forever, and a sub-second dispatch delay is invisible
+  inside a 10-second ingest budget. Marked `# PROVISIONAL: retune in P9`.
+- **`jobs.state` vs `garments.state`.** The job reaches `complete` (every stage
+  Phase 2 defines has run); the garment stays at `matted`, because
+  classification, tagging, embedding and dedupe have not. Calling the garment
+  complete would be a lie the UI would repeat to the user.
+- **Model weights load at ml startup, not lazily.** See below.
+
+#### What running it caught, again
+
+Six defects survived the unit suite and only appeared under `docker compose up`
+plus a real upload. Recording them because they are the argument for the plan's
+"works from a clean `docker compose up`" clause:
+
+- **Read-your-own-writes was broken.** FastAPI runs a `yield` dependency's
+  teardown AFTER the response is sent, so with the ingest transaction owned by
+  the `TenantDB` dependency the 202 reached the client before the COMMIT — and
+  a client polling the job id it was just handed got a 404. Writes now manage
+  their own transaction inline. The regression test deliberately has no sleep,
+  because any sleep hides it.
+- **`enqueue_job(job_id=...)` silently did nothing useful.** arq reserves
+  underscore-prefixed kwargs; `job_id=` was forwarded to the task as an
+  argument it does not accept, so every ingest died with a `TypeError` *and*
+  the duplicate-suppression never happened. It is `_job_id`.
+- **A batch replay returned 1 job id instead of 10.** Per-photo idempotency
+  keys were suffixed (`key:1`, `key:2`, …) while the replay query matched the
+  bare key, so nine of ten photos vanished from the client's view with no error
+  anywhere. The whole batch is now claimed under one key, ids and order intact.
+- **The first ingest took 28s against a 10s budget** — a ~20s lazy ONNX model
+  load landing on whichever user uploaded first. The model now loads at ml
+  startup, and `/readyz` reports whether the session is *built* rather than
+  whether the file exists, so traffic is gated until the pod can actually serve.
+- **The state machine wrote to `jobs` without tenant context.** `jobs` is
+  RLS-protected and the worker connects as `stylist_app` (NOBYPASSRLS), so
+  every transition matched zero rows — silently, no error. `user_id` is now
+  threaded from the arq job arguments and every write is tenant-scoped, which
+  also means a worker bug that forgets a WHERE clause is contained by the same
+  mechanism that protects the API.
+- **Two stages claimed the same `completed_state`.** `matte` and `persist` both
+  said `MATTED`, so the resume check skipped `persist` on every run — the
+  pipeline would matte an image and never save it.
+
+One more, caught by tooling rather than by running: the initial web scaffold
+pulled a Next.js release with a published CVE. `npm audit --omit=dev
+--audit-level=high` is now a CI step.
+
+### Next: Phase 3 — CV pipeline and the accuracy verdict
+
+Segmentation (multi-garment split), embeddings in pgvector, and **a measured
+accuracy number on the golden set** — the phase that decides whether the product
+is viable. `services/stylist_ml` already exists with `/matte` and a model
+registry endpoint; Phase 3 adds `/segment` and `/embed` alongside them.
+
+Two things to handle when it lands:
+
+1. **Inserting `SEGMENTED` between `MODERATED` and `MATTED` changes what
+   `STATE_ORDER` means for jobs already parked at `MATTED`** — they would skip
+   segmentation entirely. Drain the queue first, or backfill in-flight jobs.
+   This is the one place the state machine is not self-migrating, and it is
+   flagged in the code.
+2. **Phase 0.2 is the blocker, not the code.** The golden set has a spec and no
+   images. `run_eval.py` cannot produce the ethnic-wear verdict until those 500
+   labelled images exist, and that verdict is what decides between accepting
+   manual crops for drapes, adding a drape detector, or fine-tuning SegFormer.

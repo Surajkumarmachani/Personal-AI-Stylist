@@ -1,0 +1,130 @@
+:root {
+  --bg: #fbfaf8;
+  --panel: #ffffff;
+  --ink: #1c1a17;
+  --muted: #6d6459;
+  --line: #e6e0d8;
+  --accent: #7b1f2b; /* maroon, from the taxonomy palette */
+  --ok: #1e8c6b;
+  --warn: #d4a017;
+  --bad: #c62828;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+main { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+
+h1 { font-size: 22px; margin: 0 0 4px; letter-spacing: -0.01em; }
+.sub { color: var(--muted); margin: 0 0 28px; font-size: 14px; }
+
+.panel {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 20px;
+  margin-bottom: 24px;
+}
+
+label { display: block; font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+
+input[type="email"], input[type="password"] {
+  width: 100%;
+  padding: 9px 11px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  font: inherit;
+  background: #fff;
+}
+
+button {
+  padding: 9px 16px;
+  border: 1px solid var(--ink);
+  border-radius: 7px;
+  background: var(--ink);
+  color: #fff;
+  font: inherit;
+  cursor: pointer;
+}
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+button.ghost { background: transparent; color: var(--ink); }
+
+.row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.row > div { flex: 1 1 220px; }
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 16px;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+/* Checkerboard so a transparent cutout reads as transparent rather than white
+   — the alpha channel is the product of this pipeline, so it should be visible. */
+.thumb {
+  aspect-ratio: 3 / 4;
+  display: grid;
+  place-items: center;
+  background-color: #f4f1ec;
+  background-image:
+    linear-gradient(45deg, #e9e4dc 25%, transparent 25%),
+    linear-gradient(-45deg, #e9e4dc 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #e9e4dc 75%),
+    linear-gradient(-45deg, transparent 75%, #e9e4dc 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+.thumb img { max-width: 100%; max-height: 100%; display: block; }
+
+.meta { padding: 10px 12px; border-top: 1px solid var(--line); font-size: 12px; }
+
+.badge {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+.badge.processing { background: #fdf4dc; color: #8a6b12; }
+.badge.ready { background: #e4f4ef; color: var(--ok); }
+.badge.review { background: #fdeaea; color: var(--bad); }
+
+.spinner {
+  width: 22px; height: 22px;
+  border: 2px solid var(--line);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.err {
+  background: #fdeaea;
+  border: 1px solid #f3c9c9;
+  color: #8c1d1d;
+  padding: 10px 12px;
+  border-radius: 7px;
+  font-size: 13px;
+  margin-top: 12px;
+  white-space: pre-wrap;
+}
+
+.progress { font-size: 13px; color: var(--muted); margin-top: 12px; }
+.progress code { background: #f2efe9; padding: 1px 5px; border-radius: 4px; }
+
+.empty { color: var(--muted); text-align: center; padding: 48px 0; font-size: 14px; }

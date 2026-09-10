@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    # Real Postgres and real Redis. RLS, enum types and set_config are Postgres
+    # behaviours — a suite run against SQLite or a mock would pass while
+    # production leaked, which is worse than having no suite.
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: stylist_owner
+          POSTGRES_PASSWORD: stylist_owner_ci
+          POSTGRES_DB: stylist_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U stylist_owner -d stylist_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+
+    env:
+      MIGRATION_DATABASE_URL: postgresql://stylist_owner:stylist_owner_ci@localhost:5432/stylist_test
+      # The app role, created by the migration: NOSUPERUSER, NOBYPASSRLS.
+      DATABASE_URL: postgresql+asyncpg://stylist_app:stylist_app_local_only@localhost:5432/stylist_test
+      REDIS_QUEUE_URL: redis://localhost:6379/0
+      REDIS_CACHE_URL: redis://localhost:6379/1
+      PYTHONPATH: packages:services
+      U2NET_HOME: models/u2net
+      ML_BASE_URL: http://localhost:8081
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install
+        # dev,ml: the ml extra pulls rembg + onnxruntime so the matting tests
+        # run for real rather than being skipped in the one environment that
+        # is supposed to catch regressions.
+        run: pip install -e ".[dev,ml]"
+
+      - name: Cache model weights
+        # ~176MB. Downloading it on every run wastes minutes and hammers the
+        # upstream host; the key is static because the weights are versioned
+        # by filename, not by content that changes.
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-u2net-v1
+
+      - name: Fetch model weights
+        run: python scripts/download_models.py
+
+      # Taxonomy first: it generates the DB enums, the VLM schemas and the slot
+      # rules, so a broken taxonomy makes every later failure a red herring.
+      - name: Validate taxonomy
+        run: python scripts/validate_taxonomy.py
+
+      - name: Lint
+        run: ruff check packages services tests scripts
+
+      - name: Format check
+        run: ruff format --check packages services tests scripts
+
+      - name: Type check
+        run: mypy packages services
+
+      - name: Migrate
+        run: alembic -c packages/stylist_db/alembic.ini upgrade head
+
+      # Called out as its own step so the required-check name in branch
+      # protection reads "RLS cross-tenant leak test". Non-negotiable per §D2:
+      # this is the one check that must never be made optional or skipped.
+      - name: RLS cross-tenant leak test
+        run: pytest tests/test_rls_isolation.py -v
+
+      - name: Test
+        run: pytest -v
+
+      # Proves the suite can actually fail. A green RLS test that stays green
+      # with the policy removed is not a test, and this catches the day someone
+      # "fixes" a fixture by connecting as the owner.
+      - name: Verify the RLS test has teeth
+        run: |
+          psql "$MIGRATION_DATABASE_URL" -q -c \
+            "ALTER TABLE garments DISABLE ROW LEVEL SECURITY;"
+          if pytest tests/test_rls_isolation.py -q > /dev/null 2>&1; then
+            echo "::error::RLS tests passed with RLS disabled — the suite is not testing anything"
+            exit 1
+          fi
+          echo "confirmed: RLS tests fail when RLS is disabled"
+          psql "$MIGRATION_DATABASE_URL" -q -c \
+            "ALTER TABLE garments ENABLE ROW LEVEL SECURITY;
+             ALTER TABLE garments FORCE ROW LEVEL SECURITY;"
+
+      - name: Migration downgrade rehearsal
+        # A migration you cannot reverse is a migration you cannot roll back.
+        run: |
+          alembic -c packages/stylist_db/alembic.ini downgrade base
+          alembic -c packages/stylist_db/alembic.ini upgrade head
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -f infra/compose/Dockerfile -t ai-stylist:ci .
+
+  web:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      # `npm audit` at high severity, not a courtesy check: the initial
+      # scaffold pulled a Next release with a published CVE, and only the
+      # audit caught it.
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=high
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Build
+        run: npm run build

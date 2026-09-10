@@ -1,0 +1,23 @@
+# LiteLLM gateway config.
+#
+# PHASE 1 SCOPE: placeholder. The gateway is deployed and wired in Phase 4,
+# at which point EVERY model call routes through it from the first line of code
+# — including self-hosted embeddings, priced at zero. Routing them through a
+# gateway that prices them at 0 is what makes the degrade ladder work: a tenant
+# who exhausts their budget still gets cataloguing and deterministic boards,
+# because those models are budget-exempt (§B3).
+#
+# Deliberately empty rather than half-configured: a model_list with invented
+# provider names would fail at runtime in a way that looks like a bug rather
+# than an unfinished phase.
+
+model_list: []
+
+general_settings:
+  # store_model_in_db lets a model be swapped with an UPDATE instead of a
+  # deploy, which is what makes rollback possible without shipping code (§D1).
+  store_model_in_db: true
+
+litellm_settings:
+  drop_params: true
+  num_retries: 2

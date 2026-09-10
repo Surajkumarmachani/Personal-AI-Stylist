@@ -6,3 +6,14 @@ venv/
 .DS_Store
 node_modules/
 eval/golden/images/
+
+# Model weights: 176MB of ONNX, fetched by scripts/download_models.py and
+# mounted into the ml container. Weights are data, not code — a binary this
+# size in version control makes every clone painful and every bisect slow.
+models/*
+!models/.gitkeep
+
+# Next.js
+web/.next/
+web/next-env.d.ts
+*.tsbuildinfo

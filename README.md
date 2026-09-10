@@ -5,7 +5,11 @@ Western mixed wardrobes. Photograph your clothes, get them catalogued
 automatically, get outfit suggestions that account for weather, occasion and
 what you actually wear.
 
-**Status:** Phase 0 complete (taxonomy frozen). Phase 1 not started.
+**Status:** Phase 2 complete — a flat-lay photo becomes a background-removed
+cutout in the wardrobe grid in ~3s, through a durable pipeline that survives
+`kill -9`. No AI tagging yet; segmentation and the accuracy verdict are Phase 3.
+See [build status](docs/implementation-plan.md#build-status) for what is
+verified and how.
 
 ## Documents
 
@@ -25,6 +29,41 @@ scripts/validate_taxonomy.py  structural + cross-reference checks on the above
 docs/                         architecture spec and implementation plan
 GOLDEN_SET_SPEC.md            eval set collection and labelling spec
 ```
+
+## Running locally
+
+```bash
+make models      # once: fetch u2net weights into ./models (~176MB)
+make up          # postgres + 2x redis + minio + api + worker + ml
+make check       # what CI runs: taxonomy, lint, typecheck, tests
+make verify      # the exit-criteria scripts, against the running stack
+
+cd web && npm install && npm run dev   # wardrobe grid on :3100
+```
+
+Weights are never baked into an image — `make up` mounts `./models` read-only,
+so `make models` has to run first. The ml service reports `/readyz` false until
+the ONNX session is actually built, which is why `compose up --wait` takes
+~30s on a cold start rather than ~12s.
+
+`make up` serves the API on <http://localhost:8080/docs>, the ML stub on
+:8081, and the MinIO console on :9001. Host ports are deliberately
+non-standard — a developer machine usually already has Postgres on 5432, and
+connecting successfully to the *wrong* database is the worst failure mode
+available.
+
+To run the tests against your own Postgres instead of compose, two DSNs are
+needed and they are not interchangeable:
+
+```bash
+export MIGRATION_DATABASE_URL=postgresql://owner@localhost:5432/stylist_test
+export DATABASE_URL=postgresql+asyncpg://stylist_app:stylist_app_local_only@localhost:5432/stylist_test
+pytest -q
+```
+
+The distinction is the point: migrations run as the owner, the app runs as
+`stylist_app` (NOSUPERUSER, NOBYPASSRLS). A superuser bypasses RLS entirely, so
+a test suite connected as one would pass while production leaked.
 
 ## Taxonomy validation
 
