@@ -34,6 +34,59 @@ services:
       timeout: 3s
       retries: 30
 
+  # LiteLLM keeps virtual keys, budgets and its spend log in Postgres. A
+  # SEPARATE database in the same cluster, not shared tables: the gateway owns
+  # its schema and migrates it independently of ours, and we mirror what we
+  # need into `model_calls` rather than joining across the boundary.
+  litellm-db-init:
+    image: pgvector/pgvector:pg16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: stylist_owner_local_only
+    entrypoint: >
+      /bin/sh -c "
+      psql -h postgres -U stylist_owner -d postgres -tc \"SELECT 1 FROM pg_database WHERE datname='litellm'\" | grep -q 1
+      || psql -h postgres -U stylist_owner -d postgres -c 'CREATE DATABASE litellm';
+      echo 'litellm database ready'
+      "
+    restart: "no"
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    depends_on:
+      litellm-db-init:
+        condition: service_completed_successfully
+      redis-cache:
+        condition: service_healthy
+    environment:
+      LITELLM_MASTER_KEY: sk-master-local-only
+      LITELLM_DATABASE_URL: postgresql://stylist_owner:stylist_owner_local_only@postgres:5432/litellm
+      # Deliberately unset locally. Without a provider key the gateway cannot
+      # reach a provider, which is the correct state until the DPA is signed —
+      # and it means the DEGRADED_TAGGED path is the default here, so it gets
+      # exercised constantly rather than only in a drill.
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      STORE_MODEL_IN_DB: "True"
+    volumes:
+      - ../litellm/config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
+    ports:
+      - "4000:4000"
+    healthcheck:
+      # python, not curl: the litellm image has no curl, so a curl-based
+      # check reports unhealthy on a service that is answering 200 — and
+      # `compose up --wait` then fails the whole stack over a working gateway.
+      test:
+        - CMD-SHELL
+        - python -c "import sys,urllib.request; sys.exit(0 if urllib.request.urlopen('http://localhost:4000/health/liveliness').status==200 else 1)"
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
   redis-queue:
     image: redis:7-alpine
     # noeviction: nothing in here is disposable. If this fills up we want
@@ -117,6 +170,15 @@ services:
     environment:
       # Migrations run as the OWNER. The app never does.
       MIGRATION_DATABASE_URL: postgresql://stylist_owner:stylist_owner_local_only@postgres:5432/stylist
+    # Mounted like api/ml/worker, NOT baked. Without this the versions/
+    # directory is frozen at image build time, so a NEW migration file is
+    # invisible to the container — and `alembic upgrade head` then reports
+    # success having done nothing, because as far as it can see 0003 IS head.
+    # That is the dangerous failure: a migration that silently did not run
+    # looks exactly like one that did.
+    volumes:
+      - ../../packages:/app/packages
+      - ../../services:/app/services
     command: alembic -c packages/stylist_db/alembic.ini upgrade head
     restart: "no"
 
@@ -139,6 +201,14 @@ services:
       # connecting as the owner would silently disable every tenant policy.
       DATABASE_URL: postgresql+asyncpg://stylist_app:stylist_app_local_only@postgres:5432/stylist
       REDIS_QUEUE_URL: redis://redis-queue:6379/0
+      # For the /readyz dependency probe only — the api never calls ml on a
+      # request path. Probing over DNS is what makes an ml container that is
+      # detached from the network visible; its own healthcheck runs inside the
+      # container against localhost and cannot see that.
+      ML_BASE_URL: http://ml:8000
+      # The web dev server's origin. 3100 because 3000 was already taken on
+      # the dev machine; keep this in step with web/package.json's dev port.
+      CORS_ALLOW_ORIGINS: "${CORS_ALLOW_ORIGINS:-http://localhost:3100}"
       REDIS_CACHE_URL: redis://redis-cache:6379/0
       S3_ENDPOINT_URL: http://minio:9000
       # What the BROWSER must use. Presigned URLs signed with the internal
@@ -147,6 +217,8 @@ services:
       S3_BUCKET: stylist-local
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
+      LITELLM_BASE_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: sk-master-local-only
     ports:
       - "8080:8000"
     command: uvicorn stylist_api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -179,6 +251,15 @@ services:
       S3_ACCESS_KEY: minioadmin
       S3_SECRET_KEY: minioadmin
       ML_BASE_URL: http://ml:8000
+      # Matched to ML_MAX_CONCURRENCY above. Unmatched bulkheads are not
+      # bulkheads — they are just a queue in a different place (§C2).
+      WORKER_MAX_JOBS: "2"
+      LITELLM_BASE_URL: http://litellm:4000
+      LITELLM_MASTER_KEY: sk-master-local-only
+      # Which model the tag stage asks for. `vlm-tagger-mock` locally so the
+      # whole gateway path runs without credentials; `vlm-tagger` once a
+      # provider key and a signed DPA exist.
+      VLM_MODEL: ${VLM_MODEL:-vlm-tagger-mock}
     command: arq stylist_worker.main.WorkerSettings
     volumes:
       - ../../packages:/app/packages
@@ -217,8 +298,70 @@ services:
       # rembg resolves its weight cache from here. Populated on the HOST by
       # `python scripts/download_models.py`, then mounted in read-only.
       U2NET_HOME: /models/u2net
+      # Where the registry looks for the ONNX files it pins.
+      MODELS_ROOT: /models
+      # Pin onnxruntime's thread pool instead of letting it size from detected
+      # cores. Left to itself it assumes it owns the machine, so several ml
+      # pods per node oversubscribe and everything gets slower under load.
+      # PROVISIONAL: retune in P9.
+      # 2 threads x 2 concurrent inferences = 4 busy threads on an 8-vCPU
+      # box, leaving room for the event loop and the other services. At 4x4 the
+      # service thrashed and every request read-timed-out.
+      # PROVISIONAL: retune in P9.
+      ORT_INTRA_OP_THREADS: "2"
+      # MEASURED, A/B on fresh containers with a drained queue (2026-09-10):
+      #
+      #                       arena on      arena off
+      #   after models load   2191 MiB      2196 MiB
+      #   steady state        3924 MiB      2917 MiB
+      #   peak                4096 MiB *    3938 MiB
+      #   burst-of-5 median   19.8s         16.2s
+      #   * pinned AT the 4GiB limit
+      #
+      # Off saves ~1GB of steady state at no latency cost. The arena caches
+      # freed blocks and never returns them, so with it on the footprint
+      # plateaus against whatever limit it is given — and ml holding 3.9GB of a
+      # 5.85GB VM starves postgres, litellm and minio, which is the likelier
+      # cause of the latency spread than anything in the model code.
+      #
+      # Single-photo medians overlapped heavily between configs (25-50s either
+      # way), so treat the burst figure and the memory plateau as the signal
+      # and the single-photo number as noise. Revisit in P9.
+      ORT_ENABLE_CPU_ARENA: "${ORT_ENABLE_CPU_ARENA:-false}"
+      # 2 concurrent inferences x 2 intra-op threads = 4 busy threads on an
+      # 8-vCPU box. This is what Phase 3 ran at, measured 7-8s per photo.
+      #
+      # The earlier collapse was NOT caused by concurrency 2 — it was 2 x FOUR
+      # threads (8 busy threads, oversubscribed) with no load shedding at all.
+      # Dropping to 1 after adding the bulkhead over-corrected: with a 5s slot
+      # wait and the worker's backoff ladder, requests spent most of their time
+      # queued and one photo took 112s. Measured memory is 606MB of a 3GB
+      # ceiling, so memory was never the constraint — serialising was.
+      # PROVISIONAL: retune in P9 against real percentiles and pod counts.
+      ML_MAX_CONCURRENCY: "2"
     ports:
       - "8081:8000"
+    # 4g, sized to the measured PEAK rather than the steady state.
+    #
+    # With the arena off (the default above), a fresh container holds 2196 MiB
+    # once the four models are built, settles at 2917 MiB, and peaks at
+    # 3938 MiB during a burst of 5. The peak is what the limit has to cover, so
+    # 4g stands even though steady state is ~1GB under it. Lowering it to
+    # match the steady state would OOM on the first burst.
+    #
+    # Two ways I got this wrong, both worth not repeating:
+    #   - `docker stats` reports cgroup memory.current, which INCLUDES
+    #     reclaimable page cache. Read `anon` from memory.stat instead; here
+    #     cache was ~400MB right after loading weights and would have inflated
+    #     every reading.
+    #   - measuring while the stack was idle showed ~512MB and made the whole
+    #     thing look like it fitted in a 3.9GB VM.
+    #
+    # The ceiling is kept (rather than removed) so pressure becomes a legible
+    # OOM kill on ONE container instead of a wedged host VM — which is what
+    # happened when it had no limit at all.
+    # PROVISIONAL: retune in P9; production runs 2-12 pods, not one (View 2).
+    mem_limit: 4g
     command: uvicorn stylist_ml.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:
       - ../../packages:/app/packages

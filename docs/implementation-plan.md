@@ -847,21 +847,359 @@ One more, caught by tooling rather than by running: the initial web scaffold
 pulled a Next.js release with a published CVE. `npm audit --omit=dev
 --audit-level=high` is now a CI step.
 
-### Next: Phase 3 — CV pipeline and the accuracy verdict
+### Phase 3 — CV pipeline · STEPS 3.1–3.4 COMPLETE, 3.5 BLOCKED ON DATA
 
-Segmentation (multi-garment split), embeddings in pgvector, and **a measured
-accuracy number on the golden set** — the phase that decides whether the product
-is viable. `services/stylist_ml` already exists with `/matte` and a model
-registry endpoint; Phase 3 adds `/segment` and `/embed` alongside them.
+**162 tests**; `ruff`, `ruff format`, `mypy --strict` clean across 53 source
+files; migration 0002 reverses cleanly.
 
-Two things to handle when it lands:
+| Step | State | Evidence |
+|---|---|---|
+| 3.1 ml inference service | done | `/segment`, `/matte`, `/embed`, `/models` on real weights: ~1.3s / ~1.8s / ~0.8s |
+| 3.2 segmentation + split | done | one photo → 2 garments end-to-end in **7.6s** |
+| 3.3 cheap classifier | colour done, pattern deferred | maroon top + denim trousers read back correctly |
+| 3.4 embeddings + pgvector | done | `vector(768)`, HNSW index, `/garments/{id}/similar` |
+| 3.5 eval harness | **runs, cannot measure** | exits 2 (not-measured) — no golden set |
 
-1. **Inserting `SEGMENTED` between `MODERATED` and `MATTED` changes what
-   `STATE_ORDER` means for jobs already parked at `MATTED`** — they would skip
-   segmentation entirely. Drain the queue first, or backfill in-flight jobs.
-   This is the one place the state machine is not self-migrating, and it is
-   flagged in the code.
-2. **Phase 0.2 is the blocker, not the code.** The golden set has a spec and no
-   images. `run_eval.py` cannot produce the ethnic-wear verdict until those 500
-   labelled images exist, and that verdict is what decides between accepting
-   manual crops for drapes, adding a drape detector, or fine-tuning SegFormer.
+**The phase cannot close.** Its exit criterion is not "the harness runs", it is
+a NUMBER: segmentation accuracy on the 50 ethnic-wear images, plus a recorded
+decision between (a) accepting manual crops for drapes, (b) adding a drape
+detector, or (c) fine-tuning SegFormer. `eval/golden/labels.jsonl` does not
+exist, so all three eval entry points exit **2** — deliberately distinct from 0
+(passed) and 1 (floor breached), so CI can tell "unmeasured" from "bad". The
+accuracy floors in `taxonomy.yaml` are currently unenforceable.
+
+`pattern` is left NULL rather than guessed: it is `source: classifier_head`, a
+logistic head over the FashionSigLIP embedding trained on ~2k labelled
+examples — which come from the same golden set. A fabricated pattern label
+would be indistinguishable from a real one downstream, and
+`more_than_two_bold_patterns` is a scoring penalty that would then fire on
+invented data.
+
+**Deviations, each because the plan's text was unachievable or wrong:**
+
+1. **Fetch, not export.** Both upstream repos publish official ONNX, pinned
+   here by commit sha with verified sha256. An export path would need ~2GB of
+   torch to reproduce someone else's artefact, and our export settings would
+   become a second source of truth. `export_models.py` becomes necessary only
+   if we fine-tune — option (c) above.
+2. **Bytes in the body, not `{image_url}`.** URLs would mean giving the ml
+   service object-store credentials — the exact blast radius "no DB access"
+   exists to avoid — and an S3 round trip inside an 800ms budget.
+3. **`/segment` filters nothing.** It reports what the model saw; the 2% floor,
+   IoU dedupe, shoe merge and drape-ambiguity rule live in
+   `stylist_domain.split`, pure and unit-tested in milliseconds. Worth seeing
+   why: a real photo produced a 0.41% phantom "Dress" and a 0.00% "Bag".
+4. **Tests now run against the compose Postgres** (pgvector/pgvector:pg16), not
+   a local install. A stock Postgres has no pgvector, so `vector(768)` could
+   not be created; this also removed a quieter local-PG-17-vs-prod-PG-16 drift.
+
+#### Six more bugs that only running it exposed
+
+- **RESUME WAS BROKEN, AND I HAD REPORTED IT AS VERIFIED.** Phase 2's
+  "crash mid-pipeline resumes" criterion was tested with FAKE stages, so it
+  only ever proved the state machine's control flow. Real stages read
+  `ctx.scratch["sanitised_bytes"]`, which is empty after a restart — resuming a
+  job at MODERATED raised `KeyError`. Stages now derive object keys from ids
+  and fetch from storage, so any worker can run any stage with no handover.
+- **An ml restart DLQ'd every in-flight ingest.** Three attempts with jittered
+  backoff exhausts in ~6s; ml takes ~30s to build its sessions. A dependency
+  being down is backpressure, not a verdict on the image, so `Unavailable` now
+  waits on a 180s wall-clock budget WITHOUT consuming an attempt. Proven: the
+  same scenario that produced `dlq=true, stage_attempts={"matte":3}` now
+  completes in 19s.
+- **ORM enums had no values.** `ENUM(name="slot", create_type=False)` lets
+  SQLAlchemy WRITE `'lower'` and then throw `LookupError` on READ. Latent since
+  Phase 1, invisible while every enum column was NULL; the first symptom was
+  the wardrobe endpoint 500ing on a garment that had saved fine.
+- **numpy scalars leaked into SQL.** `np.float64 < float` is `np.bool_`, which
+  asyncpg rejects — surfacing as a DataError on an UPDATE, three layers from
+  the cause.
+- **Masked matting produced BLACK cutouts.** rembg zeroes RGB where its own
+  alpha is 0, so widening the alpha with a segmentation mask revealed blanked
+  pixels: a maroon top and denim trousers were both catalogued as `black`.
+  Alpha and colour now come from different sources by design.
+- **The SIGABRT flake returned, worse.** With three ONNX sessions instead of
+  one, `162 passed` again shipped alongside exit 134. Each session is now
+  released by whoever owns it; 4 consecutive runs clean.
+- **The ml service collapsed under a 5-photo burst.** One process serving
+  CPU-bound inference to 4 concurrent workers, with no concurrency limit: 4
+  requests x 4 onnxruntime threads on 8 vCPUs, so every request slowed, client
+  read timeouts fired, retries added load, and the queue climbed past 200 while
+  jobs stalled at `segmented` with `{"matte": 2}` and no DLQ marker. Added the
+  §C2 bulkhead it was missing — a concurrency semaphore that sheds with 503 +
+  Retry-After rather than queueing forever, plus a thread budget (2 threads x 2
+  slots) that fits the box. ReadTimeouts went from many to zero.
+- **And the shedding did not work, because the error handler ate it.** Each
+  endpoint wrapped inference in `except Exception`, and `HTTPException` IS an
+  Exception — so the deliberate 503 was rewritten as a 500. The client saw a
+  server error instead of backpressure, spent the image's retry budget on it,
+  and DLQ'd the job. The load shedding was correct; the handler destroyed the
+  signal. Verified after the fix: ml shed 4, the worker waited 4 times
+  consuming no attempts, zero read timeouts, burst of 5 drained clean.
+
+**One latency consequence worth stating plainly:** Phase 2's "under 10s" target
+described a five-stage pipeline. Phase 3 adds segmentation, classification and
+embedding — two more model calls — and warm runs now land at **7.4-8.3s** to
+COMPLETE with a cold first request around 11s. The e2e check was moved onto
+§B1's actual contract (reach >= CLASSIFIED within 60s) rather than loosened to
+whatever today's number happens to be. Under a 5-photo burst on one ml pod,
+per-photo wall clock is ~28s median — which is what `ml-inference 2-12 pods`
+in View 2 exists to fix, and is a P9 capacity item, not a correctness one.
+
+### Phase 4 — VLM tagging and correction UI · BUILT; 2 of 7 criteria need external inputs
+
+**190 tests**; `ruff`, `ruff format`, `mypy --strict` clean across 60 source
+files; migrations 0001-0003 all reversible; web app builds with 0 npm
+vulnerabilities.
+
+| Exit criterion | State |
+|---|---|
+| Batching: 6 garments = 1 VLM call | **verified by call count** (and 7 → 2, not 7) |
+| Kill the VLM provider → `DEGRADED_TAGGED`, item usable | verified |
+| Exhaust the budget → cataloguing still works | verified, and not retried |
+| Correction events flowing to the quality dashboard | verified end-to-end |
+| Non-garment / flagged upload → quarantined, **zero** outbound calls | verified by counting calls |
+| Measured cost per garment ingested | **mechanism** verified, **number** needs a paid provider |
+| Golden-set accuracy ≥92% on category + primary colour | **blocked** — no golden set |
+
+Verified against the live stack, one photo through the whole chain
+(`received → sanitised → moderated → segmented → matted → classified → tagged
+→ complete`, ~40s):
+
+| garment | subcategory | material | formality | dress_code | review |
+|---|---|---|---|---|---|
+| `upper_base` (maroon) | kurta | cotton, conf **0.55** | 3 | festive_ethnic | **yes** |
+| `lower` (denim_indigo) | jeans | denim, conf 0.88 | 2 | casual | no |
+
+`material` at 0.55 is under its taxonomy `review_below` of 0.60, so that
+garment routed to review and the other did not — the confidence gate working on
+real output rather than in principle.
+
+**What is real and what is a stand-in.** The gateway, virtual keys, per-tenant
+budgets, spend mirroring into `model_calls`, the grid batching, the
+taxonomy-generated JSON schema, the parser, the enum validation, the SQL and
+every degrade path are real and exercised. The MODEL is a stand-in: no provider
+key exists because Phase 0.3's DPA is outstanding, so `vlm-tagger-mock` returns
+a schema-valid response through the live gateway. `vlm-tagger` and a fallback
+provider are configured and unset — which means the DEGRADED_TAGGED path is the
+default locally and gets exercised constantly rather than only in a drill.
+
+**Moderation is a real local model.** `AdamCodd/vit-base-nsfw-detector`, pinned
+by commit sha with a verified digest, running in-VPC before every stage that
+could export pixels — because satisfying this gate with a hosted moderation API
+would upload the exact images it exists to keep off other infrastructure. An
+ordinary garment photo scores 0.078 and passes. Two thresholds, not one: ≥0.90
+quarantines (terminal, audited, no provider call), ≥0.60 flags for review but
+still processes. A false quarantine is a worse product failure than a false
+pass into review.
+
+**Non-garment photos are deliberately NOT handled here.** A screenshot or a
+photo of a dog is not a moderation problem and an NSFW classifier has no
+opinion about it. Segmentation already covers it: no garment class above the
+2% floor → NEEDS_REVIEW with a reason. A second, weaker check in the moderate
+stage would duplicate that with worse information.
+
+#### Findings from building it
+
+- **`moderation` only reached the first garment.** The verdict is a property of
+  the PHOTO, but moderate runs before segment — so garments discovered by the
+  split were inserted with `{}` and looked permanently unmoderated. Any audit
+  asking "was this image screened?" got the wrong answer for every garment but
+  one. The split now copies the verdict.
+- **The gateway's response cache silently masked a config change.** After
+  changing the mock payload, tagging still wrote nothing: LiteLLM was correctly
+  returning the cached previous response for a byte-identical request. The
+  cache working as designed, and a real gotcha — an identical test image
+  produces an identical grid produces a cache hit.
+- **The LiteLLM healthcheck used `curl`, which that image does not have.** The
+  gateway answered 200 on both health endpoints while compose reported it
+  unhealthy and `up --wait` failed the entire stack over a working service.
+- **An empty mock response is a worthless mock.** `{"items": []}` exercises the
+  call but never the parse/validate/write path — so the first time that code
+  would have run was against a paid provider. The mock now returns a
+  schema-valid two-item payload with one field deliberately below its review
+  threshold.
+
+#### Two criteria that need something from outside the code
+
+1. **Cost per garment.** The mechanism is verified — every call mirrors model,
+   tokens, cost, latency and cache status into `model_calls`, joined to the job
+   and user, which is what makes "cost per garment ingested" answerable at all.
+   But the mock is priced at zero, so the measured number is `$0.00`. A real
+   figure needs a provider key, which needs the DPA.
+2. **Golden-set accuracy.** Unchanged from Phase 3: `≥92% on category +
+   primary colour` cannot be evaluated without the 500 labelled images.
+
+### Next: Phase 5 — MVP ship
+
+Dedupe (phash + cosine > 0.95), wear log, search and filters, minimum-viable
+observability, and the "start with your 20 most-worn" onboarding flow.
+
+**Phase 5's exit criteria are the first that cannot be faked at all**: 20 real
+users, ≥2,000 garments, and correction rate measured on real wardrobes. The
+plan calls that "the real go/no-go" — if correction rate exceeds ~20% on any
+field, ingestion gets fixed before anything is built on those tags. The
+`/ops/correction-rate` endpoint and the in-app rate strip built in this phase
+are what that decision will be read from.
+
+Three things now sit on the critical path and none of them is code: the **500
+golden-set images**, a **provider key + signed DPA**, and **20 users**.
+
+---
+
+## Cross-phase verification pass (2026-09-10)
+
+A full re-verification of Phases 0–4 together, rather than each phase against
+its own criteria in isolation. Everything below is a measured result; where a
+number could not be measured honestly it says so.
+
+### What the pass found
+
+Five defects, **none of them a wrong-output bug** — every ingest in every run
+produced correct results (23/23 content checks). All five were in the seams:
+operational behaviour, or the test harness itself.
+
+**1. A skip is not a pass — 29 tests were never running.**
+`pytest` exits 0 for skipped tests, and several fixtures skip when they cannot
+reach a dependency. Run without the full env, the suite reported *163 passed,
+29 skipped*; `tests/test_api_smoke.py` reported "PASS" with **all 17 of its
+tests skipped** for want of redis. With the env complete it is **192 passed, 0
+skipped**. Two causes, both now closed:
+
+  - `conftest` defaults to `localhost:5432/stylist_test`, but the pgvector
+    container publishes **55432**. The wrong-port Postgres has no pgvector, so
+    the failure surfaced as `extension "vector" is not available` — which reads
+    like a broken migration, not a misdirected connection.
+  - `U2NET_HOME` unset falls back to the container path `/models/u2net`, absent
+    on the host, so every matting test skipped with "u2net weights absent".
+
+  Fixed by making `make test` set its own DSNs and env (it no longer depends on
+  what happens to be exported), documenting `U2NET_HOME` in `.env.example`,
+  adding a `make test-strict`, and making the gate runner **fail** when any
+  test skips.
+
+**2. An unreachable ml service was invisible to every probe.**
+`ml`'s container healthcheck probes `localhost:8000` from *inside* the
+container, so it passes while the container is detached from the network. The
+worker has no probe. The api's `/readyz` checked Postgres and both redises but
+not ml. Result: a container answering the host on its published port while
+every worker call failed with `ConnectError` — undetected for ~30 minutes.
+Fixed by probing ml from `/readyz` over DNS, on the worker's own path.
+Deliberately **non-fatal** to readiness: ingest is built to absorb an ml
+outage, so failing readiness would convert a designed degradation into a total
+API outage. Two regression tests pin both halves.
+
+**3. Head-of-line blocking under a dependency outage.** `Unavailable` sleeps
+*in-process*, so a job waiting on down infrastructure holds its worker slot for
+the full 180s budget. At `WORKER_MAX_JOBS=2`, two such jobs stall the whole
+queue — observed directly: eight jobs DLQ'd ~240s apart, in sequence, rather
+than together. The ml bulkhead caps inference concurrency but nothing caps
+*waiting*. **Not fixed.** The correct shape is to release the slot and
+re-enqueue with a delay, which resume already supports; that is a real change
+to the state machine and wants its own step.
+
+**4. An intermittent abort after a green run.** `tests/test_ml_inference.py`
+could abort at interpreter shutdown with `recursive_mutex lock failed` *after*
+reporting "10 passed" — exit 134 on a green suite. The existing fixture
+released the sessions it owned, but matting's session is held by an
+`lru_cache` on `matting._session`, so it outlived every fixture and its native
+destructor ran during interpreter teardown. Its own docstring already stated
+the rule ("each one has to be released by whoever owns it"); u2net's owner was
+that cache, and nothing cleared it. Fixed with a module-scoped autouse fixture
+that clears the cache while the interpreter is still alive. Verified over 6
+runs including 3 under concurrent ingest load — though it is a race, so that
+is evidence, not proof.
+
+**5. `docker compose run` does not register the service DNS alias.** A one-off
+container started that way answers the host on a published port but nothing
+resolves the service name on the compose network. This is what produced (2)
+during investigation, and it is worth knowing before debugging a "healthy but
+broken" service.
+
+### An investigation that produced no shippable change
+
+The ml container's memory was suspected of unbounded growth. It is not
+unbounded — it plateaus — but the first three attempts to measure it produced
+contradictory numbers (single-photo latency ranging 8–85s for the *same*
+config), and every one of those numbers was an artifact:
+
+  - `docker stats` reports cgroup `memory.current`, which **includes
+    reclaimable page cache**. Right after loading ~1GB of weights the cache
+    term was ~400MB. `anon` from `memory.stat` is the number that matters.
+  - `docker compose --force-recreate` is a **no-op** when the running container
+    already matches the requested config, so a "config change" measured the
+    old container.
+  - in **zsh**, an unquoted scalar is not word-split: `DC="docker compose -f x";
+    $DC ps` tries to execute the whole string as one filename. Every recreate
+    in the first harness silently failed this way, with its stderr filtered out.
+  - a DLQ backlog draining behind the measurement inflated the first run of
+    every batch.
+
+Once the harness asserted its own preconditions — fresh container, expected
+env, live code, ready models, worker-visible DNS, drained queue — the result
+was stable and is recorded in `docker-compose.yml`: the arena costs ~1GB of
+steady state (3924 MiB vs 2917 MiB) at **no** latency cost, so it now defaults
+off. The `mem_limit` stays 4g because the measured *peak* is 3938 MiB.
+
+The lesson is not about onnxruntime. A harness that does not verify its own
+assumptions will confidently produce numbers about a system it is not testing,
+and those numbers are indistinguishable from real ones.
+
+### Still not measurable
+
+Unchanged, and unchanged for the same reason: **cost per garment** needs a
+provider key (the mock is priced at zero, so the answer is `$0.00`), and
+**golden-set accuracy** needs the 500 labelled images. The eval harness exits
+**2** — not-measured — rather than reporting a pass, and the gate suite asserts
+that exit code so a future change cannot quietly turn "not measured" into
+"measured and fine".
+
+### The latency "regression" that was not one
+
+Worth recording because the wrong conclusion survived several rounds of
+measurement and was stated as fact before being checked.
+
+Symptom: end-to-end ingest measured 25–85s against a Phase 3 baseline of
+7–8s, and it stayed slow even after the memory work, with the spread
+narrowing but the absolute number staying ~25s. That looked like a real
+regression and was reported as one.
+
+It was not. Adding per-stage timing to the state machine answered it in one
+run:
+
+    pipeline_done total_ms=6976 breakdown={
+      validate: 15, sanitise: 29, moderate: 1171, segment: 1764,
+      matte: 2170, classify: 59, tag: 441, embed: 1261, persist: 66 }
+
+The pipeline was ~7s the whole time — the baseline, unchanged. An isolated
+single-photo ingest on a drained queue measures **6.0–6.6s**, accepted in
+16–66ms; a later run with warm-up discarded gives a median of **6.1s** against
+the 10s budget. Faster than the 8.37s the number was being compared against.
+
+Every slow figure came from the measurement, not the system:
+
+  - `verify_ingest_e2e.py` set `t0` ONCE before a burst and reported each job's
+    offset from it as "per-photo wall clock". That is drain time, not
+    per-photo latency, and the block ran *after* the SSE, duplicate and replay
+    sections had already queued jobs — so at `WORKER_MAX_JOBS=2` the timed jobs
+    waited behind them.
+  - concurrent commands (a background A/B, a monitor, ad-hoc `docker stats`)
+    loaded the same 8-vCPU box being measured.
+
+Fixed by renaming the burst metric to what it measures (`burst drain: median
+completion`), adding a separate isolated single-photo check asserted against
+the 10s budget, and discarding one warm-up sample — the burst's trailing outbox
+and arq work overlaps the first submission and inflated it to 17.7s against
+6–7s for the rest.
+
+Two things worth keeping from this:
+
+**Per-stage timing is now permanent.** One `stage_done stage=<n> job=<id>
+elapsed_ms=<n>` line per stage plus a `pipeline_done` breakdown. Before it,
+"an ingest takes 25s" was where the investigation stopped: the ml endpoints
+summed to ~6s of it and there was no way to attribute the rest. §B1's
+per-stage SLOs are unenforceable without it.
+
+**A benchmark that shares a machine with other work measures the other work.**
+Both of this pass's wrong conclusions — the arena's "3x latency penalty" and
+this regression — came from that, not from the system under test.

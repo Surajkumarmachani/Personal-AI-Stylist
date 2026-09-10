@@ -14,6 +14,7 @@ connections and take down the API (§C2).
 from __future__ import annotations
 
 import logging
+import os
 import uuid
 from datetime import UTC, datetime
 from typing import Any
@@ -93,10 +94,17 @@ class WorkerSettings:
     on_startup = startup
     on_shutdown = shutdown
 
-    # PROVISIONAL: retune in P9. Derived from the capacity model's claim that
-    # a 60-photo burst clears in ~12s at 4 concurrent workers (§B2) — which
-    # rests on a 0.8s/photo CPU estimate nothing has measured yet.
-    max_jobs = 4
+    # MATCHED to the ml service's inference capacity, not chosen independently.
+    #
+    # §C2's bulkheads only work as a pair: N workers each making 4 sequential
+    # ml calls against a service that serialises inference means N-1 workers
+    # spend their time waiting or being shed. Locally ml runs ONE inference at
+    # a time (four models in one process on a small VM), so piling four photos
+    # onto it produced read timeouts at whichever stage got unlucky.
+    #
+    # Production scales ml OUT (View 2: 2-12 pods) and raises this to match.
+    # PROVISIONAL: retune in P9 against measured ml throughput.
+    max_jobs = int(os.environ.get("WORKER_MAX_JOBS", "2"))
 
     # arq writes a health record to Redis on this interval, and the container
     # healthcheck reads it. The default is 3600s, which is useless as a

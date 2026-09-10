@@ -53,7 +53,27 @@ class Settings(BaseSettings):
     # The worker calls the ml service over HTTP rather than importing the
     # models: they scale on different axes (§View 2), and ml holds no DB or
     # storage credentials.
+    # Browser origins allowed to call this API. An EXPLICIT allowlist, not "*":
+    # the API is credential-bearing (Bearer tokens in Authorization), and a
+    # wildcard on a credentialed API is what turns any page the user visits
+    # into a client of their wardrobe. Comma-separated so one env var covers
+    # local dev plus a preview deploy.
+    cors_allow_origins: str = Field(default="http://localhost:3100")
+
     ml_base_url: str = Field(default="http://localhost:8081")
+
+    # ---- LiteLLM gateway ----
+    # The ONLY egress path to model providers. Every model call goes through
+    # it, including self-hosted embeddings priced at zero — that pricing is
+    # what makes budget exhaustion a downgrade rather than an outage (§B3).
+    litellm_base_url: str = Field(default="http://localhost:4000")
+    litellm_master_key: str = Field(default="sk-master-local-only")
+    # `vlm-tagger-mock` locally: exercises the whole gateway path with no
+    # credentials, which matters because Phase 0.3's DPA is outstanding.
+    vlm_model: str = Field(default="vlm-tagger-mock")
+    # Free-tier monthly LLM+VLM budget per tenant (§B3). Enforced by LiteLLM as
+    # a hard budget on the virtual key, not by feature code.
+    free_tier_monthly_budget_usd: float = Field(default=0.15)
 
     # ---- SSE progress stream ----
     # PROVISIONAL: retune in P9. 500ms is invisible inside a 10s ingest budget;

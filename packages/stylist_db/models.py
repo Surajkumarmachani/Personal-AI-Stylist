@@ -16,6 +16,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -34,15 +35,31 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, ENUM, JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
-# Enum types are owned by the migration; never auto-created from the ORM.
-SlotEnum = ENUM(name="slot", create_type=False)
-SubcategoryEnum = ENUM(name="subcategory", create_type=False)
-ColourEnum = ENUM(name="colour", create_type=False)
-MaterialEnum = ENUM(name="material", create_type=False)
-PatternEnum = ENUM(name="pattern", create_type=False)
-FitEnum = ENUM(name="fit", create_type=False)
-DressCodeEnum = ENUM(name="dress_code", create_type=False)
-ClimateBandEnum = ENUM(name="climate_band", create_type=False)
+from stylist_domain.taxonomy import load_taxonomy
+
+# Enum types are CREATED by the migration (create_type=False) but their VALUES
+# are declared here, from taxonomy.yaml.
+#
+# Declaring the name alone is not enough, and the failure is delayed and
+# confusing: SQLAlchemy can happily WRITE a value it does not know, then throws
+#   LookupError: 'lower' is not among the defined enum values.
+#   Enum name: slot. Possible values: None
+# when READING the row back. It stayed hidden through Phases 1-2 because every
+# enum column was NULL until segmentation started setting `slot` — so the first
+# symptom was the wardrobe endpoint 500ing on a garment that had saved fine.
+#
+# Values come from the same loader that generates the Postgres types, so the
+# ORM and the database cannot drift.
+_taxonomy = load_taxonomy()
+
+SlotEnum = ENUM(*_taxonomy.slots, name="slot", create_type=False)
+SubcategoryEnum = ENUM(*_taxonomy.subcategories, name="subcategory", create_type=False)
+ColourEnum = ENUM(*_taxonomy.colours, name="colour", create_type=False)
+MaterialEnum = ENUM(*_taxonomy.materials, name="material", create_type=False)
+PatternEnum = ENUM(*_taxonomy.patterns, name="pattern", create_type=False)
+FitEnum = ENUM(*_taxonomy.fits, name="fit", create_type=False)
+DressCodeEnum = ENUM(*_taxonomy.dress_codes, name="dress_code", create_type=False)
+ClimateBandEnum = ENUM(*_taxonomy.climate_bands, name="climate_band", create_type=False)
 
 
 class Base(DeclarativeBase):
@@ -103,6 +120,11 @@ class UserProfile(Base):
     preference_facts: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default="{}"
     )
+    # The tenant's LiteLLM virtual key. Nullable: a gateway outage at signup
+    # must not block registration, and the tag stage degrades for a tenant
+    # without one.
+    litellm_key: Mapped[str | None] = mapped_column(Text)
+    litellm_budget_usd: Mapped[float | None] = mapped_column(Numeric(10, 4))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
@@ -154,6 +176,18 @@ class Garment(Base):
         ARRAY(Text), nullable=False, server_default="{}"
     )
     extractor_version: Mapped[str | None] = mapped_column(String(32))
+    embedding_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # 768 dims, L2-normalised, from Marqo-FashionSigLIP's vision tower.
+    #
+    # Nullable and staying nullable: a garment is visible to the user before it
+    # is embedded, and a placeholder vector would be worse than a null because
+    # it would participate in similarity search and match things.
+    embedding: Mapped[list[float] | None] = mapped_column(Vector(768))
+
+    # NSFW score, verdict and model from the moderate gate. Held on the
+    # garment because audit_log deliberately stores no per-image detail.
+    moderation: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, server_default="{}")
 
     state: Mapped[str] = mapped_column(String(32), nullable=False, server_default="received")
     needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
@@ -307,4 +341,5 @@ TENANT_SCOPED_TABLES: tuple[str, ...] = (
     "user_profile",
     "garments",
     "jobs",
+    "garment_corrections",
 )

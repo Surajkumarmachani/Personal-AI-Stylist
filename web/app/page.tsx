@@ -11,8 +11,10 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  type CorrectionRate,
   type Garment,
   type JobEvent,
+  correctionRate,
   ingest,
   listGarments,
   login,
@@ -22,9 +24,20 @@ import {
   streamJob,
   uploadToStorage,
 } from "@/lib/api";
+import GarmentEditor from "./GarmentEditor";
 
 // jobs.state -> what the user is told.
-function badgeFor(state: string): { cls: string; label: string } {
+//
+// needs_review is a SEPARATE column from state, and a garment can be
+// state="complete" AND needs_review=true — a field came back below its
+// confidence threshold. Reading only `state` showed a green "ready" on items
+// the pipeline had explicitly flagged, which hid the entire review gate: the
+// low-confidence handling worked in the data and was invisible in the UI, so
+// nobody would ever go correct the field it was asking about.
+function badgeFor(state: string, needsReview = false): { cls: string; label: string } {
+  if (needsReview && (state === "complete" || state === "matted")) {
+    return { cls: "review", label: "needs review" };
+  }
   switch (state) {
     case "complete":
     case "matted":
@@ -48,12 +61,25 @@ export default function Home() {
   const [error, setError] = useState<string | null>(null);
   const [garments, setGarments] = useState<Garment[]>([]);
   const [progress, setProgress] = useState<Record<string, JobEvent>>({});
+  const [editing, setEditing] = useState<string | null>(null);
+  const [rates, setRates] = useState<CorrectionRate | null>(null);
   const fileInput = useRef<HTMLInputElement>(null);
   const cleanups = useRef<Array<() => void>>([]);
 
   const refresh = useCallback(async () => {
     try {
       setGarments(await listGarments());
+      // The correction rate is the live accuracy metric (§D1). Surfacing it in
+      // the app rather than only on a dashboard means whoever is using it sees
+      // extraction quality degrade at the same moment the users do.
+      setRates(await correctionRate());
+      // CLEAR on success. Without this an error outlives the condition it
+      // describes: a failed call left "TypeError: Failed to fetch" on screen
+      // permanently, so after the underlying problem was fixed the banner
+      // still accused the app of being broken while the wardrobe loaded
+      // perfectly well beneath it. A stale error is worse than none — it sends
+      // you debugging something that already works.
+      setError(null);
     } catch (e) {
       setError(String(e));
     }
@@ -121,7 +147,8 @@ export default function Home() {
     <main>
       <h1>Wardrobe</h1>
       <p className="sub">
-        Phase 2 — upload a flat-lay, get a background-removed cutout. No tagging yet.
+        Upload a photo — it is split into garments, cut out, coloured and tagged.
+        Click any item to review or correct its tags.
       </p>
 
       {!signedIn ? (
@@ -200,14 +227,53 @@ export default function Home() {
             </div>
           </div>
 
+          {rates && rates.by_field.length > 0 && (
+            <div className="panel" style={{ padding: "12px 16px", marginBottom: 18 }}>
+              <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>
+                Correction rate over {rates.window_days} days — how often each field needed fixing.
+                Above ~20% on any field means ingestion needs work before anything is built on
+                these tags.
+              </div>
+              <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 12 }}>
+                {rates.by_field.map((f) => (
+                  <span key={f.field}>
+                    <code>{f.field}</code>{" "}
+                    <strong
+                      style={{
+                        color: (f.rate ?? 0) > 0.2 ? "var(--bad)" : "var(--ok)",
+                      }}
+                    >
+                      {f.rate === null ? "—" : `${(f.rate * 100).toFixed(0)}%`}
+                    </strong>
+                    <span style={{ color: "var(--muted)" }}> ({f.corrections})</span>
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {editing && (
+            <GarmentEditor
+              garmentId={editing}
+              onClose={() => setEditing(null)}
+              onSaved={() => void refresh()}
+            />
+          )}
+
           {garments.length === 0 ? (
             <div className="empty">Nothing here yet. Add a photo above.</div>
           ) : (
             <div className="grid">
               {garments.map((g) => {
-                const badge = badgeFor(g.state);
+                const badge = badgeFor(g.state, g.needs_review);
                 return (
-                  <div className="card" key={g.id}>
+                  <div
+                    className="card"
+                    key={g.id}
+                    onClick={() => setEditing(g.id)}
+                    style={{ cursor: "pointer" }}
+                    title="Click to review and correct this item's tags"
+                  >
                     <div className="thumb">
                       {g.cutout_url ? (
                         // eslint-disable-next-line @next/next/no-img-element
@@ -221,6 +287,11 @@ export default function Home() {
                       <div style={{ marginTop: 6, color: "var(--muted)" }}>
                         {g.subcategory ?? g.slot ?? "untagged"}
                       </div>
+                      {g.primary_colour && (
+                        <div style={{ marginTop: 2, color: "var(--muted)", fontSize: 11 }}>
+                          {g.primary_colour}
+                        </div>
+                      )}
                     </div>
                   </div>
                 );

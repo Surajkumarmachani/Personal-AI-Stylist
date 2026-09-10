@@ -5,102 +5,93 @@ Western mixed wardrobes. Photograph your clothes, get them catalogued
 automatically, get outfit suggestions that account for weather, occasion and
 what you actually wear.
 
-**Status:** Phase 2 complete — a flat-lay photo becomes a background-removed
-cutout in the wardrobe grid in ~3s, through a durable pipeline that survives
-`kill -9`. No AI tagging yet; segmentation and the accuracy verdict are Phase 3.
-See [build status](docs/implementation-plan.md#build-status) for what is
-verified and how.
+**Status:** Phase 4 built — a photo is split into garments, cut out, coloured,
+moderated in-VPC, tagged through the LiteLLM gateway, embedded in pgvector, and
+every field is correctable with the correction locked against future backfills.
+Two exit criteria need external inputs: a real cost-per-garment number needs a
+provider key (DPA outstanding), and accuracy needs the 500-image golden set.
+See [build status](docs/implementation-plan.md#build-status).
 
-## Documents
+## Quickstart
 
-| Document | What it is |
+Requires Docker and Python 3.12+. Nothing else — Postgres, Redis, MinIO and the
+LiteLLM gateway all come up in containers, and no provider API key is needed
+(tagging runs against a deterministic mock by default).
+
+```bash
+# 0. A local Python env. The containers carry their own dependencies; this is
+#    for `make models`, `make test` and `make verify`, which run on the host.
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev,ml]"
+
+# 1. Model weights, once (~176MB). NOT baked into any image: weights are data.
+make models
+
+# 2. Bring up the stack (postgres+pgvector, redis x2, minio, litellm, ml,
+#    worker, api) and wait until every healthcheck is green.
+make up
+```
+
+That prints the local URLs:
+
+| what | where |
 |---|---|
-| [docs/architecture.md](docs/architecture.md) | Production architecture spec v1.0 — 5 views (trust boundaries, deployment, components, latency budget, ingest state machine) + 9 non-functional specs (SLOs, capacity, cost, consistency, failure, DR, ML lifecycle, release, observability) |
-| [docs/implementation-plan.md](docs/implementation-plan.md) | 14-week phased build plan, Phases 0–11, with exit criteria per phase |
-| [GOLDEN_SET_SPEC.md](GOLDEN_SET_SPEC.md) | The 500-image evaluation set: composition, label schema, consent, inter-annotator agreement |
-| [config/taxonomy.yaml](config/taxonomy.yaml) | **Single source of truth** for all garment enums. Changing this file is a migration. |
+| API docs (Swagger) | http://localhost:8080/docs |
+| API readiness — incl. ml reachability | http://localhost:8080/readyz |
+| ml service readiness | http://localhost:8081/readyz |
+| MinIO console | http://localhost:9001 — `minioadmin` / `minioadmin` |
+| LiteLLM gateway | http://localhost:4000 |
 
-## Repository layout
-
-```
-config/taxonomy.yaml          frozen enums — generates DB types, VLM schemas,
-                              slot rules, ATR mapping, golden-set validation
-scripts/validate_taxonomy.py  structural + cross-reference checks on the above
-docs/                         architecture spec and implementation plan
-GOLDEN_SET_SPEC.md            eval set collection and labelling spec
-```
-
-## Running locally
+Ports are deliberately non-standard (Postgres **55432**, Redis **63790/63791**)
+so the stack cannot collide with anything else running locally.
 
 ```bash
-make models      # once: fetch u2net weights into ./models (~176MB)
-make up          # postgres + 2x redis + minio + api + worker + ml
-make check       # what CI runs: taxonomy, lint, typecheck, tests
-make verify      # the exit-criteria scripts, against the running stack
-
-cd web && npm install && npm run dev   # wardrobe grid on :3100
+# 3. The web UI (separate terminal). Port 3100, not 3000.
+cd web && npm install && npm run dev     # -> http://localhost:3100
 ```
 
-Weights are never baked into an image — `make up` mounts `./models` read-only,
-so `make models` has to run first. The ml service reports `/readyz` false until
-the ONNX session is actually built, which is why `compose up --wait` takes
-~30s on a cold start rather than ~12s.
+### Try it end to end
 
-`make up` serves the API on <http://localhost:8080/docs>, the ML stub on
-:8081, and the MinIO console on :9001. Host ports are deliberately
-non-standard — a developer machine usually already has Postgres on 5432, and
-connecting successfully to the *wrong* database is the worst failure mode
-available.
+Upload a photo of clothing through the web UI and watch it get catalogued —
+split into garments, cut out, colour-extracted, moderated, tagged and embedded.
+Every field is editable, and an edit is permanent: it is recorded in
+`user_verified_fields` and the tag stage checks that column in SQL, so no
+backfill or model upgrade can overwrite it.
 
-To run the tests against your own Postgres instead of compose, two DSNs are
-needed and they are not interchangeable:
+Or drive it from the command line against the running stack:
 
 ```bash
-export MIGRATION_DATABASE_URL=postgresql://owner@localhost:5432/stylist_test
-export DATABASE_URL=postgresql+asyncpg://stylist_app:stylist_app_local_only@localhost:5432/stylist_test
-pytest -q
+# The exit-criteria scripts: upload path, then the full ingest pipeline.
+make verify
 ```
 
-The distinction is the point: migrations run as the owner, the app runs as
-`stylist_app` (NOSUPERUSER, NOBYPASSRLS). A superuser bypasses RLS entirely, so
-a test suite connected as one would pass while production leaked.
-
-## Taxonomy validation
-
-`config/taxonomy.yaml` is the single source of truth for every garment enum in
-the system — Postgres types, VLM extraction schemas, slot legality rules, the
-ATR→slot segmentation mapping, and golden-set label validation all derive from
-it. Never hand-duplicate a value out of it.
+### Development
 
 ```bash
-pip install pyyaml
-python scripts/validate_taxonomy.py
+make test          # full suite — sets its own DB/redis/S3 env (192 tests)
+make test-strict   # same, but surfaces anything SKIPPED (a skip exits 0)
+make check         # taxonomy + lint + typecheck + test
+make logs          # follow all container logs
+make down          # stop
+make reset-db      # destroy and recreate all local data
 ```
 
-Exits non-zero on any structural error. Checks include: every subcategory maps
-to a real slot, no duplicates, outfit rules and `requires` edges reference real
-values, dress-code compatibility is symmetric and closed, occasion formality
-targets sit inside their dress code's range, colours have hex anchors,
-`climate_bands` is a total partition of (temperature, humidity, precipitation)
-space with no gaps, every `tier: rule` field has a derivation table, and
-`eval_floors.by_slice` covers every slice `GOLDEN_SET_SPEC.md` quotas.
+`make test` sets its own DSNs on purpose. A bare `pytest` targets
+`localhost:5432`, where the pgvector extension is absent, and the failure looks
+like a broken migration rather than a misdirected connection.
 
-This runs as a required CI check — the taxonomy is load-bearing on the schema,
-so a broken one must not reach `main`.
+### Expected performance
 
-## Design decisions worth knowing up front
+On an 8-vCPU Docker VM with ~5.8GB, a single photo completes end to end in
+**~6s** (10s budget). A burst of 10 drains in ~26-44s: `ml` runs 2 concurrent
+inferences and the worker 2 concurrent jobs, matched on purpose so neither
+starves the other. `make verify` asserts the single-photo budget.
 
-Four decisions are recorded in `config/taxonomy.yaml` itself, with reasoning:
+If ingests are slow, check whether something else is loading the same box
+before suspecting the pipeline — the per-stage breakdown in the worker log
+(`stage_done` / `pipeline_done` lines) attributes the time directly:
 
-1. **A saree is `drape` + a required `upper_base`**, not `full_body` — users own
-   and re-pair blouses independently, cost-per-wear is tracked per physical
-   garment, and segmentation produces separate masks anyway.
-2. **Formality and dress code are two independent axes.** A mehendi outfit and a
-   boardroom suit are both formality 4; on a single scale they become
-   interchangeable, which is the specific failure that makes generic wardrobe
-   apps feel wrong in India.
-3. **Climate bands replace four-season enums.** Bengaluru has no autumn, and
-   monsoon is a first-class wardrobe constraint (fabric, footwear, hemline) with
-   no Western-season equivalent.
-4. **There is no `other` value anywhere, by design.** If a real garment cannot be
-   classified, that is a taxonomy bug — add the value and bump the version.
+```bash
+docker compose -f infra/compose/docker-compose.yml logs worker | grep pipeline_done
+```

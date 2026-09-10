@@ -201,3 +201,67 @@ export function streamJob(
 
   return () => controller.abort();
 }
+
+// ---------------------------------------------------------------- corrections
+
+export type GarmentDetail = {
+  garment: Record<string, unknown>;
+  options: Record<string, (string | number)[]>;
+  review_below: Record<string, number | null>;
+};
+
+export async function garmentDetail(id: string): Promise<GarmentDetail> {
+  return json<GarmentDetail>(
+    await fetch(`${API_BASE}/garments/${id}/detail`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}
+
+/**
+ * Correct one field.
+ *
+ * The value set comes from `garmentDetail().options`, which the API builds from
+ * taxonomy.yaml — so the UI can never offer a value the database would reject.
+ * Free-text entry here would let a user "fix" a field into something no filter
+ * matches, which looks to them like the fix silently failing.
+ */
+export async function correctField(
+  garmentId: string,
+  fieldName: string,
+  newValue: string | number | null,
+) {
+  return json<{
+    field_name: string;
+    old_value: string | null;
+    new_value: string | null;
+    user_verified_fields: string[];
+  }>(
+    await fetch(`${API_BASE}/garments/${garmentId}/fields`, {
+      method: "PATCH",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ field_name: fieldName, new_value: newValue }),
+    }),
+  );
+}
+
+export type CorrectionRate = {
+  window_days: number;
+  garments: number;
+  by_field: {
+    field: string;
+    corrections: number;
+    rate: number | null;
+    avg_model_confidence: number | null;
+  }[];
+};
+
+export async function correctionRate(): Promise<CorrectionRate> {
+  return json<CorrectionRate>(
+    await fetch(`${API_BASE}/ops/correction-rate`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}

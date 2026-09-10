@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from stylist_api.settings import Settings, get_settings
+from stylist_clients.litellm_client import LiteLLMClient
 from stylist_clients.redis_client import CacheRedis, QueueRedis
 from stylist_clients.storage import ObjectStore
 from stylist_db.models import User
@@ -37,6 +38,10 @@ def queue_redis(request: Request) -> QueueRedis:
 
 def cache_redis(request: Request) -> CacheRedis:
     return cast(CacheRedis, request.app.state.cache_redis)
+
+
+def litellm(request: Request) -> LiteLLMClient:
+    return cast(LiteLLMClient, request.app.state.litellm)
 
 
 def object_store(request: Request) -> ObjectStore:
@@ -107,3 +112,4 @@ SettingsDep = Annotated[Settings, Depends(settings_dep)]
 QueueRedisDep = Annotated[QueueRedis, Depends(queue_redis)]
 CacheRedisDep = Annotated[CacheRedis, Depends(cache_redis)]
 ObjectStoreDep = Annotated[ObjectStore, Depends(object_store)]
+LiteLLMDep = Annotated[LiteLLMClient, Depends(litellm)]

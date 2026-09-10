@@ -1,0 +1,6 @@
+stylist_api
+stylist_clients
+stylist_db
+stylist_domain
+stylist_ml
+stylist_worker

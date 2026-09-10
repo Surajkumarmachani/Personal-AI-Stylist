@@ -17,6 +17,7 @@ for local convenience and is off by default.
 
 from __future__ import annotations
 
+import hashlib
 import io
 import logging
 import os
@@ -77,6 +78,18 @@ def model_available() -> bool:
 
 
 _loaded = False
+_sha256: str | None = None
+
+
+def loaded_sha256() -> str | None:
+    """Digest of the weights this process actually loaded.
+
+    Computed at warm time so /models reports u2net on the same terms as the
+    models that go through runtime.load() — an inventory where one entry has no
+    checksum is an inventory you cannot use to answer "which weights served
+    that request".
+    """
+    return _sha256
 
 
 def is_loaded() -> bool:
@@ -102,11 +115,22 @@ def warm() -> bool:
     should come up and report NOT ready, not crash-loop on a mount problem it
     cannot fix by restarting.
     """
-    global _loaded
+    global _loaded, _sha256
     try:
         _session()
+        path = model_path()
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+
+        from stylist_ml.registry import U2NET
+
+        if U2NET.sha256 and digest != U2NET.sha256:
+            raise RuntimeError(
+                f"{path} checksum mismatch: registry pins {U2NET.sha256[:16]}…, "
+                f"file is {digest[:16]}…. Refusing to serve unverified weights."
+            )
+        _sha256 = digest
         _loaded = True
-        logger.info("matting model warm: %s", model_path())
+        logger.info("matting model warm: %s sha256=%s…", path, digest[:16])
     except Exception:
         _loaded = False
         logger.exception("matting model failed to load; service will report not ready")
@@ -134,15 +158,111 @@ def _session():  # type: ignore[no-untyped-def]  # rembg ships no stubs
     return new_session(MODEL_NAME)
 
 
-def matte(image_bytes: bytes) -> MatteResult:
-    """Remove the background and trim to the subject's bounding box."""
+def _crop_to_mask(image_bytes: bytes, mask_png: bytes) -> tuple[bytes, Image.Image]:
+    """Crop the image and its mask to the mask's bbox, WITHOUT masking pixels.
+
+    u2net must see real image content inside the crop. Blanking everything
+    outside the mask to white first — which is what this used to do — hands the
+    model a coloured shape on a white field and it regularly decides the WHITE
+    is the subject. Observed directly: a maroon shirt came back as a cutout
+    whose opaque pixels were white, so colour extraction read `white` for a
+    maroon garment.
+
+    Cropping still matters on its own: handing u2net a 4000x3000 frame with one
+    shirt in a corner spends the model's fixed input resolution on empty pixels.
+    """
+    with Image.open(io.BytesIO(image_bytes)) as base, Image.open(io.BytesIO(mask_png)) as mask:
+        rgb = base.convert("RGB")
+        binary = mask.convert("L")
+        if binary.size != rgb.size:
+            # The mask comes from /segment at full frame size; a mismatch means
+            # the caller paired a mask with the wrong image.
+            binary = binary.resize(rgb.size, resample=Image.Resampling.NEAREST)
+
+        box = binary.getbbox()
+        if box is not None:
+            rgb = rgb.crop(box)
+            binary = binary.crop(box)
+
+        buffer = io.BytesIO()
+        rgb.save(buffer, format="PNG", optimize=False)
+        return buffer.getvalue(), binary
+
+
+def matte(image_bytes: bytes, mask_png: bytes | None = None) -> MatteResult:
+    """Remove the background and trim to the subject's bounding box.
+
+    `mask_png` restricts matting to one garment out of a multi-garment frame
+    (Step 3.2 passes a mask from /segment). The mask is used to CROP the input
+    and then to intersect the resulting alpha — not to blank pixels before
+    inference. See _crop_to_mask for why: pre-masking made u2net treat the
+    white fill as the subject and produced white cutouts of coloured garments.
+    """
     from rembg import remove
 
     session = _session()
+
+    mask_crop: Image.Image | None = None
+    if mask_png is not None:
+        image_bytes, mask_crop = _crop_to_mask(image_bytes, mask_png)
+
     cutout = remove(image_bytes, session=session)
 
     with Image.open(io.BytesIO(cutout)) as img:
         rgba = img.convert("RGBA")
+
+        if mask_crop is not None:
+            # INTERSECT the two alphas rather than trusting either alone.
+            #
+            # The segmentation mask knows WHICH garment was asked about but has
+            # blocky edges (it is a 512x512 label map upsampled to frame size).
+            # u2net produces a fine, feathered alpha but does not know which
+            # garment we meant. Multiplying keeps u2net's edge quality inside
+            # the region segmentation chose, so a mirror selfie's shirt comes
+            # back as the shirt, cleanly cut.
+            import numpy as np
+
+            fine = np.asarray(rgba.getchannel("A"), dtype=np.float32) / 255.0
+            coarse = np.asarray(mask_crop.resize(rgba.size), dtype=np.float32) / 255.0
+            product = fine * coarse
+
+            # DEGRADE TO THE MASK WHEN u2net THREW THE GARMENT AWAY.
+            #
+            # u2net is unreliable on a tight crop with little surrounding
+            # context. Measured on one: its alpha summed to 17 against the
+            # segmentation mask's 48,793 over the same 169x313 region — it
+            # found essentially nothing. Intersecting with that loses a garment
+            # segmentation had located correctly, and the whole photo routes to
+            # manual review.
+            #
+            # The mask is already a usable alpha: blockier edges, right region.
+            # So u2net is an ENHANCEMENT — kept when it agrees with
+            # segmentation, discarded when it contradicts it. Every stage has a
+            # fallback (§C6); this is matting's.
+            coarse_area = float(coarse.sum())
+            if coarse_area > 0 and float(product.sum()) < 0.5 * coarse_area:
+                logger.info(
+                    "u2net alpha covered %.1f%% of the segmentation mask; "
+                    "falling back to the mask as alpha",
+                    100 * float(product.sum()) / coarse_area,
+                )
+                product = coarse
+
+            # REBUILD RGB FROM THE ORIGINAL CROP, not from u2net's output.
+            #
+            # rembg zeroes the colour channels wherever its own alpha is 0, so
+            # reusing its RGB and then widening the alpha reveals BLACK pixels
+            # rather than the garment. Measured: a maroon top and denim
+            # trousers both came back with primary_colour `black`, because the
+            # pixels the mask exposed had already been blanked.
+            #
+            # Alpha and colour therefore come from different places on purpose:
+            # the alpha is whatever we decided above, the colour is always the
+            # untouched original.
+            with Image.open(io.BytesIO(image_bytes)) as original:
+                rgb = original.convert("RGB")
+            rgba = rgb.copy().convert("RGBA")
+            rgba.putalpha(Image.fromarray((product * 255).astype("uint8"), mode="L"))
 
         alpha = rgba.getchannel("A")
         total = rgba.width * rgba.height

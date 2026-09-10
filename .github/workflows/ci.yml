@@ -47,6 +47,7 @@ jobs:
       REDIS_CACHE_URL: redis://localhost:6379/1
       PYTHONPATH: packages:services
       U2NET_HOME: models/u2net
+      MODELS_ROOT: models
       ML_BASE_URL: http://localhost:8081
 
     steps:
@@ -64,16 +65,23 @@ jobs:
         run: pip install -e ".[dev,ml]"
 
       - name: Cache model weights
-        # ~176MB. Downloading it on every run wastes minutes and hammers the
-        # upstream host; the key is static because the weights are versioned
-        # by filename, not by content that changes.
+        # ~650MB across three models. Downloading on every run wastes minutes
+        # and hammers the upstream hosts. The key names the pinned revisions,
+        # so bumping a model in the registry invalidates the cache instead of
+        # silently serving the old weights.
         uses: actions/cache@v4
         with:
           path: models
-          key: models-u2net-v1
+          key: models-u2net-segformer584abc1e-siglipc56244cc-nsfw8587de99-v3
 
       - name: Fetch model weights
         run: python scripts/download_models.py
+
+      - name: Verify model checksums
+        # The registry pins a sha256 per model; a mismatch means a corrupted
+        # download or a tampered mirror, and refusing to run beats producing
+        # accuracy numbers from unknown weights.
+        run: python scripts/download_models.py --verify
 
       # Taxonomy first: it generates the DB enums, the VLM schemas and the slot
       # rules, so a broken taxonomy makes every later failure a red herring.
@@ -116,6 +124,19 @@ jobs:
           psql "$MIGRATION_DATABASE_URL" -q -c \
             "ALTER TABLE garments ENABLE ROW LEVEL SECURITY;
              ALTER TABLE garments FORCE ROW LEVEL SECURITY;"
+
+      # The eval harness must at least RUN. It exits 2 when the golden set is
+      # absent (not 0, not 1) — so this step distinguishes "we have not
+      # measured accuracy" from "we measured it and it is bad", and does not
+      # pretend an unmeasured phase is a passing one.
+      - name: Golden-set label validation
+        run: |
+          python eval/validate_labels.py; code=$?
+          if [ $code -eq 2 ]; then
+            echo "::warning::No golden set yet — Phase 0.2 outstanding, accuracy floors unenforceable"
+          elif [ $code -ne 0 ]; then
+            exit $code
+          fi
 
       - name: Migration downgrade rehearsal
         # A migration you cannot reverse is a migration you cannot roll back.

@@ -1,23 +1,108 @@
-# LiteLLM gateway config.
+# LiteLLM gateway — the ONLY egress path to model providers (View 3).
 #
-# PHASE 1 SCOPE: placeholder. The gateway is deployed and wired in Phase 4,
-# at which point EVERY model call routes through it from the first line of code
-# — including self-hosted embeddings, priced at zero. Routing them through a
-# gateway that prices them at 0 is what makes the degrade ladder work: a tenant
-# who exhausts their budget still gets cataloguing and deterministic boards,
-# because those models are budget-exempt (§B3).
+# Every model call routes through here from the first line of code, including
+# self-hosted embeddings priced at zero. Two reasons, and the second is the one
+# that matters:
 #
-# Deliberately empty rather than half-configured: a model_list with invented
-# provider names would fail at runtime in a way that looks like a bug rather
-# than an unfinished phase.
+#   1. Uniform observability. One place that knows every call's model, tokens,
+#      cost, latency and cache status, instead of per-call-site logging that
+#      drifts.
+#   2. THE DEGRADE LADDER. Models priced at zero are exempt from budget checks,
+#      so a tenant who exhausts their spend still gets cataloguing and
+#      deterministic boards. Budget exhaustion becomes a feature downgrade
+#      rather than an outage (§B3). That only works if the zero-cost models are
+#      behind the same gateway that enforces the budget.
+#
+# Retrofitting this later means touching every call site, which is why it is
+# wired before there is a paid provider to call.
 
-model_list: []
+model_list:
+  # ---- the paid tier: garment tagging -------------------------------------
+  #
+  # api_key comes from the environment and is UNSET by default. That is
+  # deliberate: Phase 0.3's DPA is still outstanding, and a config that
+  # silently works without one would let pixels reach a provider we have no
+  # agreement with. With no key, calls fail and the ingest pipeline degrades to
+  # DEGRADED_TAGGED — which is exactly the behaviour we want to have already
+  # tested before the key exists.
+  - model_name: vlm-tagger
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      # 12MB images, batched 6 to a grid; the grid is what is actually sent.
+      max_tokens: 2048
+      temperature: 0.0 # tagging is extraction, not generation
+    model_info:
+      mode: chat
+
+  # Fallback target. A second PROVIDER, not a second model from the same one:
+  # provider outages correlate across their own models.
+  - model_name: vlm-tagger-backup
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+      api_key: os.environ/ANTHROPIC_API_KEY
+      max_tokens: 2048
+      temperature: 0.0
+    model_info:
+      mode: chat
+
+  # ---- local development: a deterministic stand-in ------------------------
+  #
+  # mock_response makes the gateway answer without any provider, so the whole
+  # path — virtual keys, budgets, spend logging, fallbacks, the tag stage's
+  # schema validation — is exercisable with no credentials and no cost. It is
+  # NOT a pretend model: the content is obviously synthetic, and the tag stage
+  # validates it against taxonomy.yaml exactly as it would a real response.
+  - model_name: vlm-tagger-mock
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: "sk-mock-not-a-real-key"
+      # A SCHEMA-VALID response, not an empty one. An empty payload means
+      # the tag stage's parse/validate/write path never runs locally, so
+      # the first time it executes is against a paid provider. `material`
+      # is deliberately below its 0.60 review threshold so the
+      # needs_review gate is exercised too.
+      mock_response: '{"items": [{"cell": "A1", "subcategory": "kurta", "material": "cotton", "formality": 3, "dress_code": "festive_ethnic", "warmth": 2, "fit": "relaxed", "confidence": {"subcategory": 0.82, "material": 0.55, "formality": 0.78, "dress_code": 0.71, "warmth": 0.8, "fit": 0.62}}, {"cell": "A2", "subcategory": "jeans", "material": "denim", "formality": 2, "dress_code": "casual", "warmth": 3, "fit": "slim", "confidence": {"subcategory": 0.91, "material": 0.88, "formality": 0.84, "dress_code": 0.86, "warmth": 0.75, "fit": 0.69}}]}'
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+    model_info:
+      mode: chat
+
+  # ---- self-hosted, priced at zero ---------------------------------------
+  #
+  # Routed through the gateway for uniform observability, and priced at zero so
+  # LiteLLM skips budget checks. This row IS the degrade path: when a tenant's
+  # budget is gone, embeddings and matting keep working.
+  - model_name: embed-fashion
+    litellm_params:
+      model: openai/marqo_fashionsiglip_vision
+      api_base: http://ml:8000/v1
+      api_key: "not-used-self-hosted"
+      input_cost_per_token: 0
+      output_cost_per_token: 0
 
 general_settings:
-  # store_model_in_db lets a model be swapped with an UPDATE instead of a
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/LITELLM_DATABASE_URL
+  # Hot-swappable model list: changing a model becomes an UPDATE rather than a
   # deploy, which is what makes rollback possible without shipping code (§D1).
   store_model_in_db: true
 
 litellm_settings:
   drop_params: true
+  # Two retries INSIDE the gateway, then fall through to the backup provider.
+  # Note this is the async plane: retrying here is fine precisely because
+  # tagging is not on a user-facing request path. The reranker (Phase 7) gets a
+  # hard timeout and NO retry for the opposite reason.
   num_retries: 2
+  request_timeout: 120
+  fallbacks: [{ "vlm-tagger": ["vlm-tagger-backup"] }]
+  # Response cache: re-tagging an identical grid is free. Keyed on the request
+  # body, so it also absorbs the duplicate deliveries the outbox relay can
+  # produce at-least-once.
+  cache: true
+  cache_params:
+    type: redis
+    host: redis-cache
+    port: 6379
+    ttl: 604800 # 7 days

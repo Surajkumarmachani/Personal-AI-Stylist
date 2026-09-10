@@ -28,7 +28,7 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
-from sqlalchemy import select
+from sqlalchemy import select, text
 
 from stylist_api.deps import CurrentUser, ObjectStoreDep, QueueRedisDep, TenantDB
 from stylist_api.schemas import GarmentSummary, IngestRequest, IngestResponse
@@ -178,4 +178,78 @@ async def list_garments(
             created_at=g.created_at,
         )
         for g in garments
+    ]
+
+
+@router.get("/garments/{garment_id}/similar", response_model=list[GarmentSummary])
+async def similar_garments(
+    garment_id: uuid.UUID,
+    user: CurrentUser,
+    db: TenantDB,
+    store: ObjectStoreDep,
+    limit: Annotated[int, Query(le=50, ge=1)] = 10,
+) -> list[GarmentSummary]:
+    """Garments closest to this one in embedding space (Step 3.4).
+
+    WHY THIS DOES NOT USE THE HNSW INDEX, AND THAT IS CORRECT
+    ---------------------------------------------------------
+    The query is scoped to one tenant by RLS, so the candidate set is at most a
+    few hundred rows. Postgres will choose a sequential scan with exact cosine
+    distances over an approximate index, and that is the better plan: perfect
+    recall, no ef_search tuning, and faster at this size.
+
+    The HNSW index from migration 0002 exists for CROSS-tenant style similarity
+    in Phase 11, where the candidate set is millions of rows. §B2 spells this
+    out because both misreadings are tempting: dropping an index that looks
+    unused, or assuming this endpoint is what it serves.
+
+    `<=>` is pgvector's cosine distance: 0 is identical, 2 is opposite. Vectors
+    are stored L2-normalised, so it is a true cosine.
+    """
+    anchor = await db.execute(
+        select(Garment).where(Garment.id == garment_id, Garment.is_active.is_(True))
+    )
+    garment = anchor.scalar_one_or_none()
+    if garment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="garment not found")
+    if garment.embedding is None:
+        # Not an error: the garment is real but has not reached the embed
+        # stage. 409 rather than 404 so the client can retry instead of
+        # concluding the garment does not exist.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="garment has no embedding yet; still processing",
+        )
+
+    # No user_id filter: RLS scopes it, exactly as everywhere else. That is
+    # what stops a similarity query becoming a cross-tenant read.
+    rows = await db.execute(
+        text(
+            """
+            SELECT id, slot, subcategory, primary_colour, state, needs_review,
+                   cutout_key, created_at,
+                   embedding <=> (SELECT embedding FROM garments WHERE id = :gid)
+                     AS distance
+            FROM garments
+            WHERE is_active
+              AND embedding IS NOT NULL
+              AND id <> :gid
+            ORDER BY distance
+            LIMIT :limit
+            """
+        ),
+        {"gid": garment_id, "limit": limit},
+    )
+    return [
+        GarmentSummary(
+            id=row.id,
+            slot=row.slot,
+            subcategory=row.subcategory,
+            primary_colour=row.primary_colour,
+            state=row.state,
+            needs_review=row.needs_review,
+            cutout_url=store.presign_download(row.cutout_key) if row.cutout_key else None,
+            created_at=row.created_at,
+        )
+        for row in rows
     ]

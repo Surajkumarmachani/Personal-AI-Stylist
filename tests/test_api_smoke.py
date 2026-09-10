@@ -402,3 +402,105 @@ async def test_sse_stream_404s_for_another_tenants_job(api: AsyncClient) -> None
 
     resp = await api.get(f"/jobs/{job_id}/events", headers={"Authorization": f"Bearer {token_b}"})
     assert resp.status_code == 404
+
+
+# --------------------------------------------------- readiness dependency probe
+
+
+async def test_readyz_reports_ml_reachability(api: AsyncClient) -> None:
+    """/readyz must say something about ml, over the network the worker uses.
+
+    Regression test for a real blind spot: ml's container healthcheck probes
+    localhost from inside the container, the worker has no probe, and /readyz
+    used to check only postgres and redis. An ml container detached from the
+    compose network therefore reported healthy on its published port while
+    every worker call failed with ConnectError — for half an hour, with no
+    signal anywhere.
+    """
+    resp = await api.get("/readyz")
+    body = resp.json()
+    assert "dependencies" in body, body
+    assert "ml" in body["dependencies"], body
+    # Either reachable, or a string that names WHY not — never silence.
+    assert body["dependencies"]["ml"]
+
+
+async def test_ml_being_down_does_not_fail_api_readiness(
+    api: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ml down is a DEGRADATION, not an API outage.
+
+    Ingest absorbs an ml outage by design (Unavailable backpressure, then
+    DEGRADED_TAGGED), and reads, corrections and boards do not touch ml at all.
+    If ml gated readiness, an outage it is built to survive would pull every
+    API pod out of rotation instead — turning a partial degradation into a
+    total one.
+    """
+    from stylist_api.routers import health
+
+    monkeypatch.setattr(health, "ML_BASE_URL", "http://127.0.0.1:1")  # nothing listens
+    resp = await api.get("/readyz")
+    body = resp.json()
+    assert body["dependencies"]["ml"].startswith("unreachable:"), body
+    # Postgres and redis are up, so readiness holds.
+    assert body["ready"] is True, body
+    assert resp.status_code == 200, resp.status_code
+
+
+# --------------------------------------------------------------------- CORS
+#
+# These assert HEADERS, not browser behaviour. CORS is enforced by the browser,
+# never by the server, which is exactly why the API shipped with no CORS
+# middleware at all and every server-side test still passed: httpx does not
+# care. The only symptom was "TypeError: Failed to fetch" in the UI, naming
+# neither the cause nor the service.
+
+
+async def test_preflight_from_the_web_origin_is_allowed(api: AsyncClient) -> None:
+    resp = await api.options(
+        "/auth/register",
+        headers={
+            "Origin": "http://localhost:3100",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+    assert resp.status_code == 200, resp.status_code
+    assert resp.headers.get("access-control-allow-origin") == "http://localhost:3100"
+
+
+async def test_ingest_preflight_allows_the_idempotency_key_header(api: AsyncClient) -> None:
+    """The trap this class of bug sets.
+
+    Ingest REQUIRES Idempotency-Key. Omit it from allow_headers and auth works
+    while every upload fails at the preflight — a partial break that looks like
+    a bug in the upload code rather than in CORS configuration.
+    """
+    resp = await api.options(
+        "/garments/ingest",
+        headers={
+            "Origin": "http://localhost:3100",
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": "authorization,content-type,idempotency-key",
+        },
+    )
+    assert resp.status_code == 200, resp.status_code
+    allowed = resp.headers.get("access-control-allow-headers", "").lower()
+    assert "idempotency-key" in allowed, allowed
+    assert "authorization" in allowed, allowed
+
+
+async def test_an_unlisted_origin_gets_no_allow_origin_header(api: AsyncClient) -> None:
+    """The allowlist has to actually exclude things.
+
+    A wildcard would pass the two tests above while making the API callable by
+    any page the user happens to visit.
+    """
+    resp = await api.options(
+        "/auth/register",
+        headers={
+            "Origin": "https://evil.example",
+            "Access-Control-Request-Method": "POST",
+        },
+    )
+    assert resp.headers.get("access-control-allow-origin") is None, dict(resp.headers)

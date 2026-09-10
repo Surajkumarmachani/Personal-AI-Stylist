@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import uuid
 from datetime import UTC, datetime
 
@@ -10,7 +11,7 @@ from fastapi import APIRouter, HTTPException, status
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
-from stylist_api.deps import QueueRedisDep, SettingsDep
+from stylist_api.deps import LiteLLMDep, QueueRedisDep, SettingsDep
 from stylist_api.schemas import (
     LoginRequest,
     RefreshRequest,
@@ -26,6 +27,8 @@ from stylist_api.security import (
 from stylist_db.models import User, UserProfile
 from stylist_db.session import system_session
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/auth", tags=["auth"])
 
 
@@ -33,6 +36,7 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 async def register(
     body: RegisterRequest,
     settings: SettingsDep,
+    gateway: LiteLLMDep,
 ) -> TokenResponse:
     user_id = uuid.uuid4()
     # users/user_profile creation runs without tenant context: the tenant does
@@ -58,7 +62,31 @@ async def register(
         from stylist_db.session import set_tenant
 
         await set_tenant(session, user_id)
-        session.add(UserProfile(id=uuid.uuid4(), user_id=user_id))
+
+        # One LiteLLM virtual key per tenant, created at signup with a hard
+        # budget (§B3). Enforced by the gateway ON THE CREDENTIAL, so feature
+        # code cannot exceed it even with a bug, and spend is attributable.
+        #
+        # A gateway outage must NOT block signup: registration is the least
+        # appropriate moment to fail, and the tag stage already degrades to
+        # DEGRADED_TAGGED for a tenant with no key. The key is backfillable.
+        litellm_key: str | None = None
+        try:
+            issued = await gateway.create_virtual_key(
+                user_id=user_id, max_budget=settings.free_tier_monthly_budget_usd
+            )
+            litellm_key = issued.key
+        except Exception as exc:
+            logger.warning("could not create a virtual key for %s: %s", user_id, exc)
+
+        session.add(
+            UserProfile(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                litellm_key=litellm_key,
+                litellm_budget_usd=settings.free_tier_monthly_budget_usd,
+            )
+        )
 
     pair, _ = issue_token_pair(
         user_id=user_id,

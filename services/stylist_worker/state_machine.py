@@ -39,6 +39,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -54,6 +55,21 @@ logger = logging.getLogger(__name__)
 
 MAX_ATTEMPTS = 3
 BACKOFF_BASE_SECONDS = 2.0
+
+# A dependency reporting "not up yet" is BACKPRESSURE, not failure, and it gets
+# its own budget measured in wall-clock seconds rather than attempts.
+#
+# Why: three attempts with full-jitter backoff off a 2s base exhausts in ~6
+# seconds. The ml service takes ~30s to build its ONNX sessions. So under the
+# attempt-counting rule, restarting ml — an ordinary rolling deploy — DLQ'd
+# every in-flight ingest, with `stage_attempts={"matte": 3}` and a
+# ConnectError. Users lose uploads because we shipped a new model.
+#
+# §C6 says a dependency outage should mean "workers backoff; queue absorbs".
+# 180s covers a cold start with room for a slow node; past that it is a real
+# outage and the DLQ is the right place for the job.
+UNAVAILABLE_BUDGET_SECONDS = 180.0
+UNAVAILABLE_BACKOFF_CAP_SECONDS = 15.0
 
 
 class IngestState(StrEnum):
@@ -140,6 +156,25 @@ class Terminal(Exception):  # noqa: N818 - name matches the plan's stage contrac
         self.reason = reason
 
 
+class Unavailable(Exception):  # noqa: N818 - a state, not an error type
+    """A dependency is not ready — a connection refused, or a 503 from a service
+    still loading. NOT a failure of this image.
+
+    Raising this instead of a generic exception is what stops a deploy from
+    looking like data corruption: it does not consume a stage attempt, so a
+    30-second ml restart costs latency rather than the whole job.
+
+    `retry_after` carries the server's own hint when it sent one (Retry-After),
+    because a service that knows when it will be ready should be believed over
+    our backoff guess.
+    """
+
+    def __init__(self, reason: str, retry_after: float | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
 class Exhausted(Exception):  # noqa: N818 - name matches the plan's stage contract
     """All attempts for one stage failed. The job goes to the DLQ with its last
     good state, so it is replayable from there rather than from the start."""
@@ -187,17 +222,54 @@ async def _sleep_backoff(attempt: int) -> None:
 async def _run_stage_with_retry(
     stage: Stage, ctx: JobContext, attempts_so_far: int
 ) -> dict[str, Any]:
+    """Run one stage, distinguishing three kinds of outcome.
+
+      Terminal    -> stop now, park the job in a user-visible state. Never
+                     retried: a corrupt file fails identically every time.
+      Unavailable -> a dependency is down. Wait and retry WITHOUT consuming an
+                     attempt, bounded by a wall-clock budget.
+      anything else -> a real failure of this attempt. Consumes one of
+                     MAX_ATTEMPTS; exhausting them sends the job to the DLQ.
+
+    Collapsing the middle case into the third is what made an ml restart look
+    like three failed attempts on a bad photo.
+    """
     attempt = attempts_so_far
     last_error = ""
     max_attempts = MAX_ATTEMPTS if stage.retryable else 1
+    waited_for_dependency = 0.0
+    unavailable_round = 0
 
     while attempt < max_attempts:
-        attempt += 1
         try:
             return await stage.run(ctx)
         except Terminal:
-            raise  # never retried; the outcome is deterministic
+            raise  # deterministic outcome; retrying wastes CPU and delays the user
+        except Unavailable as exc:
+            if not stage.retryable or waited_for_dependency >= UNAVAILABLE_BUDGET_SECONDS:
+                last_error = f"Unavailable: {exc.reason}"
+                break
+            unavailable_round += 1
+            delay = exc.retry_after or min(
+                UNAVAILABLE_BACKOFF_CAP_SECONDS,
+                BACKOFF_BASE_SECONDS * (2 ** (unavailable_round - 1)),
+            )
+            delay = min(delay, UNAVAILABLE_BUDGET_SECONDS - waited_for_dependency)
+            logger.info(
+                "stage %s: dependency unavailable (%s); waiting %.1fs "
+                "(%.0f/%.0fs of budget, attempt %d not consumed)",
+                stage.name,
+                exc.reason,
+                delay,
+                waited_for_dependency,
+                UNAVAILABLE_BUDGET_SECONDS,
+                attempt + 1,
+            )
+            await asyncio.sleep(delay)
+            waited_for_dependency += delay
+            continue
         except Exception as exc:
+            attempt += 1
             last_error = f"{type(exc).__name__}: {exc}"
             logger.warning(
                 "stage %s attempt %d/%d failed: %s",
@@ -354,6 +426,7 @@ async def run_pipeline(user_id: uuid.UUID, job_id: uuid.UUID, stages: tuple[Stag
 
     scratch: dict[str, Any] = {}
     current_state = ctx.state
+    stage_durations: dict[str, int] = {}
 
     for stage in stages:
         if state_rank(stage.completed_state) <= state_rank(current_state):
@@ -370,6 +443,16 @@ async def run_pipeline(user_id: uuid.UUID, job_id: uuid.UUID, stages: tuple[Stag
         )
         attempts_so_far = await _attempts_for(user_id, job_id, stage.name)
 
+        # PER-STAGE DURATION. Without this, "an ingest takes 25s" is where the
+        # investigation stops: summing the ml endpoints accounted for ~6s of it
+        # and there was no way to attribute the rest, because nothing recorded
+        # where the time inside the pipeline actually went. §B1's per-stage SLOs
+        # are unenforceable without it too.
+        #
+        # Logged rather than persisted: a jsonb column would need a migration
+        # and would be written on the hot path for every stage of every job,
+        # and log aggregation is where this belongs (§D3).
+        stage_started = time.perf_counter()
         try:
             result = await _run_stage_with_retry(stage, stage_ctx, attempts_so_far)
         except Terminal as term:
@@ -380,10 +463,26 @@ async def run_pipeline(user_id: uuid.UUID, job_id: uuid.UUID, stages: tuple[Stag
             await _to_dlq(user_id, job_id, current_state, str(exhausted))
             return "dlq"
 
+        stage_elapsed = time.perf_counter() - stage_started
+
         scratch.update(result)
         await _transition(user_id, job_id, stage.completed_state)
         current_state = str(stage.completed_state)
+        # One line per stage, parseable: stage=<name> job=<id> elapsed_ms=<n>
+        logger.info(
+            "stage_done stage=%s job=%s elapsed_ms=%d",
+            stage.name,
+            job_id,
+            round(stage_elapsed * 1000),
+        )
+        stage_durations[stage.name] = round(stage_elapsed * 1000)
 
+    logger.info(
+        "pipeline_done job=%s total_ms=%d breakdown=%s",
+        job_id,
+        round(sum(stage_durations.values())),
+        stage_durations,
+    )
     return current_state
 
 

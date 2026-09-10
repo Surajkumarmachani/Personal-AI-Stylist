@@ -25,11 +25,13 @@ from sqlalchemy import text
 from stylist_worker.state_machine import (
     MAX_ATTEMPTS,
     STATE_ORDER,
+    UNAVAILABLE_BUDGET_SECONDS,
     Exhausted,
     IngestState,
     JobContext,
     Stage,
     Terminal,
+    Unavailable,
     run_pipeline,
     state_rank,
 )
@@ -343,3 +345,117 @@ def test_exhausted_carries_diagnostics() -> None:
     assert exc.stage == "matte"
     assert exc.attempts == 3
     assert "boom" in str(exc)
+
+
+class UnavailableStage:
+    """A stage whose dependency is down for the first N calls."""
+
+    def __init__(self, name: str, *, unavailable_times: int, retry_after: float = 0.01):
+        self.name = name
+        self.calls = 0
+        self.unavailable_times = unavailable_times
+        self.retry_after = retry_after
+
+    async def __call__(self, ctx: JobContext) -> dict[str, Any]:
+        self.calls += 1
+        if self.calls <= self.unavailable_times:
+            raise Unavailable(f"{self.name} dependency down", retry_after=self.retry_after)
+        return {f"{self.name}_done": True}
+
+
+async def test_an_unavailable_dependency_does_not_consume_retry_attempts(
+    owner_engine, make_stages
+) -> None:
+    """THE BUG THIS GUARDS, measured against the real system:
+
+    ml takes ~30s to build its ONNX sessions. The attempt budget is 3 tries
+    with full-jitter backoff off a 2s base, which exhausts in ~6s. So an
+    ordinary `docker compose restart ml` DLQ'd every in-flight ingest with
+    `stage_attempts={"matte": 3}` and a ConnectError — users losing uploads
+    because a new model shipped.
+
+    A dependency being down says nothing about the image, so it must not spend
+    the image's budget.
+    """
+    job_id, user_id = await _make_job(owner_engine)
+    # More rounds than MAX_ATTEMPTS: under the old rule this was a guaranteed DLQ.
+    matte = UnavailableStage("matte", unavailable_times=6)
+    stages, _ = make_stages(matte=matte)
+    try:
+        final = await run_pipeline(user_id, job_id, stages)
+        assert final == "complete", "an ml restart still fails the job"
+        assert matte.calls == 7, "expected 6 unavailable rounds then a success"
+
+        row = await _job_row(owner_engine, job_id)
+        assert row["dlq_at"] is None, "job was parked in the DLQ by a dependency restart"
+        assert "matte" not in row["stage_attempts"], (
+            f"unavailability consumed retry attempts: {row['stage_attempts']}"
+        )
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_a_permanently_unavailable_dependency_eventually_dlqs(
+    owner_engine, make_stages, monkeypatch
+) -> None:
+    """The budget is bounded: "wait forever" would hide a real outage.
+
+    Past the wall-clock budget it IS an outage, and the DLQ is where the job
+    belongs — replayable from its last good state once the dependency is back.
+    """
+    import stylist_worker.state_machine as sm
+
+    monkeypatch.setattr(sm, "UNAVAILABLE_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr(sm, "UNAVAILABLE_BACKOFF_CAP_SECONDS", 0.01)
+
+    job_id, user_id = await _make_job(owner_engine)
+    stages, _ = make_stages(matte=UnavailableStage("matte", unavailable_times=9999))
+    try:
+        assert await run_pipeline(user_id, job_id, stages) == "dlq"
+        row = await _job_row(owner_engine, job_id)
+        assert row["dlq_at"] is not None
+        assert row["state"] == "moderated", "DLQ must preserve the last good state"
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_unavailability_honours_the_servers_retry_after(owner_engine, make_stages) -> None:
+    """A service that knows when it will be ready should be believed over our
+    backoff guess — that is what Retry-After is for."""
+    job_id, user_id = await _make_job(owner_engine)
+    matte = UnavailableStage("matte", unavailable_times=2, retry_after=0.02)
+    stages, _ = make_stages(matte=matte)
+    try:
+        import time
+
+        t0 = time.monotonic()
+        assert await run_pipeline(user_id, job_id, stages) == "complete"
+        elapsed = time.monotonic() - t0
+        # Two waits of 20ms each. Without honouring Retry-After the default
+        # ladder would be 2s then 4s, so this would take seconds.
+        assert elapsed < 1.0, f"ignored Retry-After; took {elapsed:.2f}s"
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_a_real_failure_still_consumes_attempts(owner_engine, make_stages) -> None:
+    """Guard the other direction: the fix must not make everything infinitely
+    retryable. A genuine error still burns an attempt and still reaches the DLQ.
+    """
+    job_id, user_id = await _make_job(owner_engine)
+    stages, _ = make_stages(matte=CountingStage("matte", fail_times=99))
+    try:
+        assert await run_pipeline(user_id, job_id, stages) == "dlq"
+        row = await _job_row(owner_engine, job_id)
+        assert row["stage_attempts"].get("matte") == MAX_ATTEMPTS
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+def test_the_unavailable_budget_exceeds_a_realistic_cold_start() -> None:
+    """The number has to beat the thing it exists to survive.
+
+    Measured: the ml service needs ~30s to build three ONNX sessions. A budget
+    below that would make this whole mechanism decorative.
+    """
+    assert UNAVAILABLE_BUDGET_SECONDS >= 120.0

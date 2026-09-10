@@ -34,6 +34,35 @@ APP_DSN = os.environ.get(
 
 
 @pytest.fixture(scope="session", autouse=True)
+def release_onnx_sessions():
+    """Drop ONNX sessions deterministically before the interpreter exits.
+
+    Left to Python's shutdown, onnxruntime's native session destructors race
+    its thread-pool teardown and the process aborts with
+
+        libc++abi: terminating due to uncaught exception of type
+        std::__1::system_error: recursive_mutex lock failed
+
+    AFTER every test has passed — pytest reports "106 passed" and exits 134.
+    That is the worst possible flake: a red build on a green run, roughly one
+    time in two, with nothing in the test output to explain it.
+
+    Releasing the sessions while the interpreter is still healthy avoids the
+    race. Ordered before the DB fixture below so it tears down last.
+    """
+    yield
+    import gc
+
+    try:
+        from stylist_ml import matting
+
+        matting._session.cache_clear()
+    except Exception:
+        pass
+    gc.collect()
+
+
+@pytest.fixture(scope="session", autouse=True)
 def migrated_database() -> None:
     """Run Alembic once per session against the owner DSN."""
     env = {**os.environ, "MIGRATION_DATABASE_URL": MIGRATION_DSN}

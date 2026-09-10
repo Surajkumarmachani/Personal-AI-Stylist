@@ -12,11 +12,13 @@ without a live S3 or model service while leaving production wiring trivial.
 from __future__ import annotations
 
 from stylist_api.settings import get_settings
+from stylist_clients.litellm_client import LiteLLMClient
 from stylist_clients.ml_client import MLClient
 from stylist_clients.storage import ObjectStore
 
 _store: ObjectStore | None = None
 _ml: MLClient | None = None
+_litellm: LiteLLMClient | None = None
 
 
 def get_object_store() -> ObjectStore:
@@ -42,8 +44,20 @@ def get_ml_client() -> MLClient:
     return _ml
 
 
+def get_litellm_client() -> LiteLLMClient:
+    """The gateway. The worker holds the MASTER key only because compose has no
+    secret store; in production it should hold none — every chat call uses the
+    tenant's virtual key, and the worker never needs admin access."""
+    global _litellm
+    if _litellm is None:
+        s = get_settings()
+        _litellm = LiteLLMClient(s.litellm_base_url, s.litellm_master_key)
+    return _litellm
+
+
 def reset() -> None:
     """For tests, so a fake does not leak between cases."""
-    global _store, _ml
+    global _store, _ml, _litellm
     _store = None
     _ml = None
+    _litellm = None

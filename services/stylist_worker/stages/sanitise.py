@@ -43,7 +43,9 @@ SENSITIVE_EXIF_TAGS: tuple[int, ...] = (
 
 async def _run(ctx: JobContext) -> dict[str, Any]:
     store = ctx.scratch.get("store") or _default_store()
-    data: bytes = ctx.scratch["source_bytes"]
+    # Prefer the bytes validate already read, but never REQUIRE them: on a
+    # resume, validate is skipped and scratch is empty.
+    data: bytes = ctx.scratch.get("source_bytes") or store.get_bytes(ctx.payload["key"])
 
     with Image.open(io.BytesIO(data)) as opened:
         # Bake the EXIF orientation into the pixels BEFORE discarding metadata.
@@ -70,9 +72,11 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
         clean.save(buffer, format="PNG", optimize=False)
         sanitised = buffer.getvalue()
 
+    from stylist_worker.keys import sanitised_key as make_sanitised_key
+
     original_key: str = ctx.payload["key"]
-    sanitised_key = f"sanitised/{ctx.user_id}/{ctx.job_id}.png"
-    store.put_bytes(sanitised_key, sanitised, content_type="image/png")
+    key = make_sanitised_key(ctx.user_id, ctx.job_id)
+    store.put_bytes(key, sanitised, content_type="image/png")
 
     logger.info(
         "sanitised job=%s exif_stripped bytes=%d -> %d",
@@ -81,7 +85,7 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
         len(sanitised),
     )
     return {
-        "sanitised_key": sanitised_key,
+        "sanitised_key": key,
         "sanitised_bytes": sanitised,
         "original_key": original_key,
     }

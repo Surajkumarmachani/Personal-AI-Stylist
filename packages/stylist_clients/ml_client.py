@@ -1,16 +1,69 @@
 """Client for services/stylist_ml.
 
-Timeouts are explicit and finite. A model service that hangs must fail the
-stage so the state machine can retry it with backoff; an unbounded wait would
-occupy a worker slot indefinitely and, across a burst, starve the queue — the
-failure mode bulkheads exist to prevent (§C2).
+Timeouts are explicit and finite everywhere. A model service that hangs must
+fail the stage so the state machine can retry with backoff; an unbounded wait
+would occupy a worker slot indefinitely and, across an onboarding burst,
+starve the queue — the failure bulkheads exist to prevent (§C2).
+
+Per-endpoint timeouts rather than one global value, because the work differs by
+an order of magnitude: embedding a 224x224 crop is ~0.5s, matting a full frame
+on CPU is several seconds. A single timeout would either be too tight for
+matting or uselessly loose for embedding.
 """
 
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass
+from typing import Any
 
 import httpx
+
+# Measured in-container: embed ~0.5s, segment ~2.6s, matte ~3-5s. Ceilings are
+# ~4x those so a slow-but-working call succeeds while a hung one fails fast.
+# PROVISIONAL: retune in P9 against real percentiles.
+CONNECT_TIMEOUT = 5.0
+EMBED_TIMEOUT = 20.0
+MODERATE_TIMEOUT = 25.0
+SEGMENT_TIMEOUT = 45.0
+MATTE_TIMEOUT = 60.0
+
+
+class MLUnavailable(RuntimeError):  # noqa: N818 - a state, not an error type
+    """The service is unreachable or still loading.
+
+    Distinct from a request that failed: this one says nothing about the image,
+    so the caller should wait rather than count it against the image's retry
+    budget. Carries the server's Retry-After when it sent one.
+    """
+
+    def __init__(self, reason: str, retry_after: float | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
+def _raise_if_unavailable(exc: Exception) -> None:
+    """Map transport-level failures to MLUnavailable.
+
+    Connect errors and timeouts mean "nobody is listening" or "nobody
+    answered" — both are the service being down, not a verdict on the image.
+    A read timeout is deliberately NOT included: the service accepted the
+    request and then took too long, which can genuinely be this image (a huge
+    frame) rather than the service.
+    """
+    if isinstance(exc, httpx.ConnectError | httpx.ConnectTimeout | httpx.PoolTimeout):
+        raise MLUnavailable(f"{type(exc).__name__}: {exc}") from exc
+
+
+def _raise_for_status(resp: httpx.Response) -> None:
+    if resp.status_code in (502, 503, 504):
+        retry_after = resp.headers.get("Retry-After")
+        raise MLUnavailable(
+            f"HTTP {resp.status_code} from ml service",
+            retry_after=float(retry_after) if retry_after and retry_after.isdigit() else None,
+        )
+    resp.raise_for_status()
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,22 +75,60 @@ class MatteResponse:
     model: str
 
 
-class MLClient:
-    def __init__(self, base_url: str, *, timeout_seconds: float = 60.0) -> None:
-        self._base_url = base_url.rstrip("/")
-        # Matting a 12MP image on CPU takes seconds, so the read timeout is
-        # generous; connect stays short because a slow connect means the
-        # service is down, not busy.
-        self._timeout = httpx.Timeout(timeout_seconds, connect=5.0)
+@dataclass(frozen=True, slots=True)
+class SegmentMask:
+    atr_class: int
+    atr_label: str
+    # From taxonomy.yaml's atr_to_slot. None for a class with no slot mapping.
+    # A HINT: the VLM stage may override it and a user correction always wins.
+    slot_hint: str | None
+    area_pct: float
+    bbox: tuple[int, int, int, int]
+    mask_png: bytes
 
-    async def matte(self, *, image_bytes: bytes) -> MatteResponse:
-        async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{self._base_url}/matte",
-                content=image_bytes,
-                headers={"Content-Type": "application/octet-stream"},
-            )
-        resp.raise_for_status()
+
+@dataclass(frozen=True, slots=True)
+class SegmentResponse:
+    masks: tuple[SegmentMask, ...]
+    width: int
+    height: int
+    skin_pct: float
+    non_garment_coverage: dict[str, float]
+    slot_hint_confidence: float
+    model: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmbedResponse:
+    vector: tuple[float, ...]
+    dim: int
+    model: str
+
+
+class MLClient:
+    def __init__(self, base_url: str) -> None:
+        self._base_url = base_url.rstrip("/")
+
+    def _timeout(self, read: float) -> httpx.Timeout:
+        # Short connect, long read: a slow connect means the service is down,
+        # not busy, and waiting 60s to discover that wastes a worker slot.
+        return httpx.Timeout(read, connect=CONNECT_TIMEOUT)
+
+    async def matte(self, *, image_bytes: bytes, mask_png: bytes | None = None) -> MatteResponse:
+        """Background removal. `mask_png` restricts it to one garment."""
+        headers = {"Content-Type": "application/octet-stream"}
+        if mask_png is not None:
+            headers["X-Mask-PNG-B64"] = base64.b64encode(mask_png).decode("ascii")
+
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout(MATTE_TIMEOUT)) as client:
+                resp = await client.post(
+                    f"{self._base_url}/matte", content=image_bytes, headers=headers
+                )
+        except Exception as exc:
+            _raise_if_unavailable(exc)
+            raise
+        _raise_for_status(resp)
         return MatteResponse(
             cutout_png=resp.content,
             alpha_coverage=float(resp.headers.get("X-Alpha-Coverage", "0")),
@@ -46,7 +137,96 @@ class MLClient:
             model=resp.headers.get("X-Matte-Model", "unknown"),
         )
 
+    async def segment(self, *, image_bytes: bytes) -> SegmentResponse:
+        """Per-class garment masks.
+
+        Returns everything the model saw, unfiltered. Area thresholds, IoU
+        de-duplication and L/R shoe merging are Step 3.2 policy and belong to
+        the caller — this is a report, not a decision.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout(SEGMENT_TIMEOUT)) as client:
+                resp = await client.post(
+                    f"{self._base_url}/segment",
+                    content=image_bytes,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+        except Exception as exc:
+            _raise_if_unavailable(exc)
+            raise
+        _raise_for_status(resp)
+        body = resp.json()
+        return SegmentResponse(
+            masks=tuple(
+                SegmentMask(
+                    atr_class=m["atr_class"],
+                    atr_label=m["atr_label"],
+                    slot_hint=m["slot_hint"],
+                    area_pct=m["area_pct"],
+                    bbox=(m["bbox"][0], m["bbox"][1], m["bbox"][2], m["bbox"][3]),
+                    mask_png=base64.b64decode(m["mask_png_b64"]),
+                )
+                for m in body["masks"]
+            ),
+            width=body["width"],
+            height=body["height"],
+            skin_pct=body["skin_pct"],
+            non_garment_coverage=dict(body["non_garment_coverage"]),
+            slot_hint_confidence=body["slot_hint_confidence"],
+            model=body["model"],
+        )
+
+    async def embed(self, *, image_bytes: bytes) -> EmbedResponse:
+        """768-d unit vector.
+
+        Pass a CUTOUT, not an original: the embedding of a shirt photographed
+        on a bed encodes the bed too, and two shirts on different backgrounds
+        end up further apart than two different shirts on the same one.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout(EMBED_TIMEOUT)) as client:
+                resp = await client.post(
+                    f"{self._base_url}/embed",
+                    content=image_bytes,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+        except Exception as exc:
+            _raise_if_unavailable(exc)
+            raise
+        _raise_for_status(resp)
+        body = resp.json()
+        return EmbedResponse(
+            vector=tuple(float(v) for v in body["vector"]),
+            dim=int(body["dim"]),
+            model=body["model"],
+        )
+
+    async def moderate(self, *, image_bytes: bytes) -> dict[str, Any]:
+        """NSFW verdict, computed in-VPC.
+
+        Called before any stage that could export pixels — the whole reason the
+        model is self-hosted rather than a moderation API.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout(MODERATE_TIMEOUT)) as client:
+                resp = await client.post(
+                    f"{self._base_url}/moderate",
+                    content=image_bytes,
+                    headers={"Content-Type": "application/octet-stream"},
+                )
+        except Exception as exc:
+            _raise_if_unavailable(exc)
+            raise
+        _raise_for_status(resp)
+        return dict(resp.json())
+
     async def readyz(self) -> dict[str, object]:
-        async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
+        async with httpx.AsyncClient(timeout=self._timeout(5.0)) as client:
             resp = await client.get(f"{self._base_url}/readyz")
+        return dict(resp.json())
+
+    async def models(self) -> dict[str, object]:
+        async with httpx.AsyncClient(timeout=self._timeout(10.0)) as client:
+            resp = await client.get(f"{self._base_url}/models")
+        resp.raise_for_status()
         return dict(resp.json())
