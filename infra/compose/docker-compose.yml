@@ -69,6 +69,11 @@ services:
       # exercised constantly rather than only in a drill.
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Langfuse. Unset by default; the gateway only exports when the callback
+      # in config.yaml is uncommented AND these carry values.
+      LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}
+      LANGFUSE_SECRET_KEY: ${LANGFUSE_SECRET_KEY:-}
+      LANGFUSE_HOST: ${LANGFUSE_HOST:-https://cloud.langfuse.com}
       STORE_MODEL_IN_DB: "True"
     volumes:
       - ../litellm/config.yaml:/app/config.yaml:ro

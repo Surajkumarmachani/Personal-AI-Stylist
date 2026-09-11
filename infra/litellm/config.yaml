@@ -90,6 +90,19 @@ general_settings:
 
 litellm_settings:
   drop_params: true
+  # LANGFUSE (§D3). Traces every model call — prompt, response, tokens, cost,
+  # latency — to a UI built for inspecting them, which is what you want the
+  # first time a tag comes back wrong and the question is what the model was
+  # actually shown.
+  #
+  # Enabled by the presence of keys, not by this line: with the callback set
+  # and no LANGFUSE_PUBLIC_KEY, LiteLLM logs an exporter error on EVERY call,
+  # which turns a missing integration into per-request noise that buries real
+  # errors. The compose file passes the keys through; set them in .env and
+  # uncomment the two lines below.
+  #
+  # success_callback: ["langfuse"]
+  # failure_callback: ["langfuse"]
   # Two retries INSIDE the gateway, then fall through to the backup provider.
   # Note this is the async plane: retrying here is fine precisely because
   # tagging is not on a user-facing request path. The reranker (Phase 7) gets a

@@ -113,3 +113,26 @@ class CacheRedis:
 
     async def set(self, key: str, value: str, *, ttl_seconds: int) -> None:
         await self._r.set(key, value, ex=ttl_seconds)
+
+    # ---- request-outcome counters (api_5xx alert) -------------------------
+    #
+    # On the wrapper rather than exposing the raw client: the point of this
+    # class is that callers cannot reach Redis primitives directly, and the
+    # middleware reaching through it for .pipeline() silently did nothing —
+    # the attribute does not exist, and the middleware swallows its own errors
+    # by design so that telemetry can never fail a request. The counters read
+    # as empty, and the alert built on them could not fire.
+
+    async def incr_bucketed(self, key: str, field: str, *, ttl_seconds: int) -> None:
+        """Increment one field of a bucketed hash, refreshing its expiry."""
+        pipe = self._r.pipeline()
+        pipe.hincrby(key, field, 1)
+        pipe.expire(key, ttl_seconds)
+        await pipe.execute()
+
+    async def read_buckets(self, keys: list[str]) -> list[dict[str, str]]:
+        """Read many bucket hashes in one round trip."""
+        pipe = self._r.pipeline()
+        for key in keys:
+            pipe.hgetall(key)
+        return cast(list[dict[str, str]], await pipe.execute())

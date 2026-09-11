@@ -37,6 +37,7 @@ from sqlalchemy import text
 
 from stylist_api.deps import CurrentUser, TenantDB
 from stylist_db.outbox import emit
+from stylist_db.session import tenant_session
 from stylist_domain.taxonomy import load_taxonomy
 
 router = APIRouter(tags=["corrections"])
@@ -130,11 +131,30 @@ async def correct_field(
     garment_id: uuid.UUID,
     body: CorrectionRequest,
     user: CurrentUser,
-    db: TenantDB,
 ) -> CorrectionResponse:
-    """Correct one field. Append-only log + permanent verification marker."""
+    """Correct one field. Append-only log + permanent verification marker.
+
+    Owns its transaction rather than taking `TenantDB`: FastAPI commits a
+    `yield` dependency AFTER the response, so the correction UI — which
+    re-reads the garment as soon as it gets 200 — could render the value the
+    user just replaced. Latent here since Phase 4; found while fixing the same
+    bug in the Phase 5 wear endpoints.
+    """
     value = _validate_value(body.field_name, body.new_value)
     enum_type = CORRECTABLE[body.field_name]
+
+    async with tenant_session(user.id) as db:
+        return await _apply_correction(db, garment_id, body, user, value, enum_type)
+
+
+async def _apply_correction(
+    db: Any,
+    garment_id: uuid.UUID,
+    body: CorrectionRequest,
+    user: Any,
+    value: Any,
+    enum_type: str | None,
+) -> CorrectionResponse:
 
     row = await db.execute(
         text(
@@ -237,6 +257,10 @@ async def garment_detail(garment_id: uuid.UUID, user: CurrentUser, db: TenantDB)
                    pattern, material, fit, dress_code, formality, warmth,
                    state, needs_review, cutout_key, field_confidence,
                    user_verified_fields, extractor_version, moderation,
+                   -- Phase 5: the correction UI shows laundry state and any
+                   -- outstanding duplicate question alongside the tags.
+                   needs_wash, duplicate_of, purchase_price_minor,
+                   purchase_currency, embedding_version,
                    attributes_raw->'tag'->>'degraded' AS tag_degraded,
                    attributes_raw->'tag'->>'reason'   AS tag_reason
             FROM garments WHERE id = :gid AND is_active

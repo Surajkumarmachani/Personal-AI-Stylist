@@ -265,3 +265,216 @@ export async function correctionRate(): Promise<CorrectionRate> {
     }),
   );
 }
+
+// ---------------------------------------------------------------- Phase 5
+
+export type SearchResult = {
+  id: string;
+  slot: string | null;
+  subcategory: string | null;
+  primary_colour: string | null;
+  dress_code: string | null;
+  material: string | null;
+  state: string;
+  needs_review: boolean;
+  needs_wash: boolean;
+  duplicate_of: string | null;
+  cutout_url: string | null;
+  rank: number | null;
+};
+
+export type SearchFilters = {
+  q?: string;
+  slot?: string;
+  primary_colour?: string;
+  dress_code?: string;
+  material?: string;
+  needs_wash?: boolean;
+  needs_review?: boolean;
+};
+
+export type Facets = {
+  slot: Array<{ value: string; count: number }>;
+  primary_colour: Array<{ value: string; count: number }>;
+  dress_code: Array<{ value: string; count: number }>;
+  material: Array<{ value: string; count: number }>;
+  flags: {
+    needs_wash: number;
+    needs_review: number;
+    duplicate_suspect: number;
+    total: number;
+  };
+};
+
+export async function searchGarments(
+  filters: SearchFilters,
+): Promise<{ items: SearchResult[]; total: number }> {
+  const params = new URLSearchParams();
+  // Empty strings are dropped rather than sent: `?slot=` is a filter on the
+  // empty string, which the API correctly rejects as an invalid enum, and the
+  // user sees a 400 for having cleared a dropdown.
+  for (const [key, value] of Object.entries(filters)) {
+    if (value !== undefined && value !== "" && value !== null) {
+      params.set(key, String(value));
+    }
+  }
+  return json(
+    await fetch(`${API_BASE}/garments/search?${params}`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function facets(): Promise<Facets> {
+  return json(
+    await fetch(`${API_BASE}/wardrobe/facets`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}
+
+export type WearResponse = {
+  garment_id: string;
+  worn_on: string;
+  total_wears: number;
+  already_logged: boolean;
+  cost_per_wear_minor: number | null;
+  currency: string | null;
+};
+
+export async function logWear(id: string): Promise<WearResponse> {
+  return json(
+    await fetch(`${API_BASE}/garments/${id}/wear`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    }),
+  );
+}
+
+export async function setLaundry(id: string, needsWash: boolean): Promise<void> {
+  await json(
+    await fetch(`${API_BASE}/garments/${id}/laundry`, {
+      method: "PATCH",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ needs_wash: needsWash }),
+    }),
+  );
+}
+
+export type MostWorn = {
+  items: Array<{
+    id: string;
+    subcategory: string | null;
+    primary_colour: string | null;
+    wears: number;
+    last_worn: string | null;
+    cost_per_wear_minor: number | null;
+    currency: string | null;
+  }>;
+  count: number;
+};
+
+export async function mostWorn(limit = 20): Promise<MostWorn> {
+  return json(
+    await fetch(`${API_BASE}/wardrobe/most-worn?limit=${limit}`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}
+
+export type DuplicatePair = {
+  garment_id: string;
+  subcategory: string | null;
+  primary_colour: string | null;
+  created_at: string;
+  duplicate_of: {
+    id: string;
+    subcategory: string | null;
+    primary_colour: string | null;
+    created_at: string;
+  };
+};
+
+export async function pendingDuplicates(): Promise<{ items: DuplicatePair[] }> {
+  return json(
+    await fetch(`${API_BASE}/wardrobe/duplicates`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}
+
+export async function resolveDuplicate(
+  id: string,
+  resolution: "different" | "same",
+): Promise<void> {
+  await json(
+    await fetch(`${API_BASE}/garments/${id}/duplicate-resolution`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ resolution }),
+    }),
+  );
+}
+
+// ------------------------------------------------------------- model QA view
+
+export type EvalField = {
+  field: string;
+  value: string | number | null;
+  confidence: number | null;
+  review_below: number | null;
+  below_threshold: boolean;
+  user_verified: boolean;
+};
+
+export type EvalItem = {
+  id: string;
+  created_at: string;
+  state: string;
+  needs_review: boolean;
+  cutout_url: string | null;
+  original_url: string | null;
+  fields: EvalField[];
+  climate_bands: string[];
+  tag_source: string;
+  tag_is_real: boolean;
+  tag_degraded: boolean;
+  tag_reason: string | null;
+  extractor_version: string | null;
+  embedding_version: string | null;
+  has_embedding: boolean;
+  phash: string | null;
+  duplicate_of: string | null;
+  moderation: Record<string, unknown>;
+};
+
+export type EvalPage = {
+  items: EvalItem[];
+  total: number;
+  limit: number;
+  offset: number;
+  tagging_model: string;
+  tagging_is_mock: boolean;
+};
+
+export async function evalView(opts: {
+  limit?: number;
+  offset?: number;
+  onlyReal?: boolean;
+}): Promise<EvalPage> {
+  const p = new URLSearchParams();
+  p.set("limit", String(opts.limit ?? 24));
+  p.set("offset", String(opts.offset ?? 0));
+  if (opts.onlyReal) p.set("only_real", "true");
+  return json(
+    await fetch(`${API_BASE}/garments/eval?${p}`, {
+      headers: authHeaders(),
+      cache: "no-store",
+    }),
+  );
+}

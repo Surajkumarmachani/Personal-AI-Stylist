@@ -91,6 +91,29 @@ outfit_rules:
     - {slot: accessory, min: 0, max: 5}
     - {slot: drape, min: 0, max: 2}   # saree + dupatta is legal; 3 drapes is not
 
+  # Drapes that COVER THE LOWER BODY, and so satisfy the `lower` half of a
+  # base structure without a separate lower garment.
+  #
+  # ⚠ Without this, `exactly_one_of` cannot express the single most important
+  # ethnic outfit in the market this taxonomy was built for. A saree plus a
+  # choli_blouse plus sandals has drape=1, upper_base=1, feet=1 and NO `lower`,
+  # so it satisfied neither [upper_base, lower] nor [full_body] and was
+  # rejected as an incomplete outfit. DECISION 1 above already says a saree
+  # "occupies `drape` and REQUIRES an `upper_base`" — that sentence implies
+  # saree + blouse IS the complete form, but the rules only encoded the
+  # `requires` half and never the "covers the lower body" half.
+  #
+  # Deliberately a SHORT list, not the whole `drape` slot: a dupatta, stole or
+  # shawl covers nothing, so treating every drape as lower-equivalent would
+  # accept "dupatta + blouse + sandals" as a complete outfit. lehenga_skirt is
+  # absent because it already lives in `lower`.
+  #
+  # A saree AND a separate lower garment still fails, because the effective
+  # count becomes 2 — you do not wear a saree over churidar.
+  lower_equivalent:
+    - saree
+    - half_saree
+
   # Composite garments: subcategory X in one slot forces another slot.
   requires:
     - {subcategory: saree,         needs_slot: upper_base, hint: choli_blouse}

@@ -1,0 +1,77 @@
+# Deterministic outfit scorer — Phase 6.3.
+#
+# WEIGHTS LIVE HERE, NOT IN CODE, and the plan is explicit about it. The reason
+# is that these numbers will be tuned against the internal blind eval ("rate 50
+# outfits, >=60% would wear") and tuning must not require a deploy. A weight
+# change is a config change with a version stamp, so a ranking regression can
+# be traced to the row that caused it.
+version: 1
+frozen_at: 2026-09-11
+
+weights:
+  # Largest weight, and deliberately so: colour is the field the vision
+  # pipeline gets RIGHT today (measured 96-98% on solids), while formality and
+  # dress_code currently come from a mock. Weighting the trustworthy signal
+  # highest is not a permanent judgement about fashion — revisit once real
+  # tags land.
+  colour_harmony: 0.30
+  formality_coherence: 0.20
+  weather_fit: 0.15
+  # Zero until Phase 8 builds the style vector. Present at zero rather than
+  # absent so `score_breakdown` has a stable shape and the sub-score is written
+  # and tested now instead of bolted on later.
+  style_affinity: 0.20
+  novelty: 0.10
+  # Zero until Phase 11.
+  trend_alignment: 0.05
+
+# Sub-scores that are structurally zero in this phase. Named explicitly so
+# score_breakdown can say "this contributed nothing BY DESIGN" rather than
+# leaving a reader to wonder whether it is broken.
+inactive_until_later_phases:
+  - style_affinity
+  - trend_alignment
+
+# Soft penalties from taxonomy.yaml's outfit_rules.penalties are applied
+# multiplicatively by hard_penalty(). Listed there, not here, because they are
+# rules about garments rather than tuning knobs.
+
+novelty:
+  # A garment worn yesterday should not top today's suggestions. Beyond this
+  # window, recency stops counting against it.
+  recency_window_days: 14
+  # Wear counts follow a power law, so a raw count would let one favourite
+  # dominate. Log-damped.
+  log_damping: true
+
+weather_fit:
+  # |warmth - target| <= this still scores > 0. The candidate generator already
+  # filters at 1, so this is about ranking within the survivors.
+  warmth_tolerance: 1
+  # A wet-weather outfit in unsuitable material is a hard filter, not a score:
+  # see taxonomy monsoon_suitability.
+
+colour_harmony:
+  # CIEDE2000 distance bands, measured with packages/stylist_domain/colour.py.
+  #
+  # Neutrals anchor an outfit and never clash, so they are excluded from the
+  # pairwise clash measurement. Which colours ARE neutral is NOT listed here —
+  # taxonomy.yaml already assigns every colour a `family`, and `neutral` is one
+  # of them. A copy of that list in this file is precisely the drift the
+  # taxonomy warns about elsewhere: the bold-pattern list was hand-copied once
+  # and silently under-penalised festive combinations until it was removed.
+  neutral_family_name: neutral
+
+  # Two strongly saturated hues can work together; three rarely do. The
+  # PENALTY for exceeding this lives in taxonomy.yaml outfit_rules.penalties
+  # (more_than_two_saturated_hues, -0.25) — this is only the threshold the
+  # sub-score uses when ranking within the survivors.
+  max_saturated_hues: 2
+
+  # CIEDE2000 bands. Very close reads as deliberate monochrome; far apart reads
+  # as deliberate contrast; the middle is where colours look like an accident.
+  # This is the one genuinely aesthetic judgement in the scorer, so it is
+  # stated as data and will be tuned against the blind eval.
+  monochrome_below_delta_e: 10.0
+  contrast_above_delta_e: 25.0
+  awkward_band_score: 0.30

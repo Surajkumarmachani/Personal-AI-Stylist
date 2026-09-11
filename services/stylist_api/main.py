@@ -13,16 +13,31 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from stylist_api.routers import auth, corrections, garments, health, jobs
+from stylist_api.middleware import RequestOutcomeMiddleware
+from stylist_api.routers import (
+    auth,
+    corrections,
+    duplicates,
+    evalview,
+    garments,
+    health,
+    jobs,
+    ops,
+    search,
+    suggestions,
+    wear,
+)
 from stylist_api.settings import get_settings
 from stylist_clients.litellm_client import LiteLLMClient
 from stylist_clients.redis_client import CacheRedis, QueueRedis
 from stylist_clients.storage import ObjectStore
 from stylist_db.session import dispose_engine, init_engine
+from stylist_obs import configure_tracing
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    configure_tracing("stylist-api")
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
 
@@ -62,6 +77,9 @@ def create_app() -> FastAPI:
     # service. Nothing caught it earlier because every test drives the API
     # server-side with httpx, and CORS is enforced by browsers, not servers.
     origins = [o.strip() for o in settings.cors_allow_origins.split(",") if o.strip()]
+    # Outermost: it must see the status code every other layer produces,
+    # including the 500 Starlette synthesises from an unhandled exception.
+    app.add_middleware(RequestOutcomeMiddleware)
     app.add_middleware(
         CORSMiddleware,
         allow_origins=origins,
@@ -80,6 +98,14 @@ def create_app() -> FastAPI:
     app.include_router(garments.router)
     app.include_router(jobs.router)
     app.include_router(corrections.router)
+    # Phase 5
+    app.include_router(wear.router)
+    app.include_router(search.router)
+    app.include_router(duplicates.router)
+    app.include_router(ops.router)
+    app.include_router(evalview.router)
+    # Phase 6
+    app.include_router(suggestions.router)
 
     from stylist_api.routers import uploads
 

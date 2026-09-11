@@ -18,6 +18,7 @@ Order matters, and two parts of it are requirements rather than preferences:
 """
 
 from stylist_worker.stages.classify import classify_stage
+from stylist_worker.stages.dedupe import dedupe_stage
 from stylist_worker.stages.embed import embed_stage
 from stylist_worker.stages.matte import matte_stage
 from stylist_worker.stages.moderate import moderate_stage
@@ -36,12 +37,14 @@ INGEST_STAGES = (
     classify_stage,
     tag_stage,
     embed_stage,
+    dedupe_stage,
     persist_stage,
 )
 
 __all__ = [
     "INGEST_STAGES",
     "classify_stage",
+    "dedupe_stage",
     "embed_stage",
     "matte_stage",
     "moderate_stage",

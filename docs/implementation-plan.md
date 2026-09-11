@@ -1203,3 +1203,337 @@ per-stage SLOs are unenforceable without it.
 **A benchmark that shares a machine with other work measures the other work.**
 Both of this pass's wrong conclusions — the arena's "3x latency penalty" and
 this regression — came from that, not from the system under test.
+
+---
+
+## Phase 5 — MVP ship (built 2026-09-11)
+
+All five deliverables are built and verified. The exit criteria are a different
+matter and are addressed at the end.
+
+### Dedupe — two signals, and it never merges
+
+Perceptual hash (dHash, 64-bit) **and** embedding cosine, because they fail in
+opposite directions: the hash catches the same PICTURE re-uploaded, the
+embedding catches the same GARMENT re-photographed. A match on either raises a
+proposal.
+
+Two decisions worth recording:
+
+**The hash is of the CUTOUT, not the original.** One flat-lay can yield three
+garments that share an original image, so hashing the original gives three
+identical hashes and the stage proposes that every garment in a photo is a
+duplicate of its neighbours. The cutout is the only image whose hash means
+"this garment".
+
+**It proposes; it never merges.** A match parks the garment at
+`DUPLICATE_SUSPECT` with `duplicate_of` set, and asks. The asymmetry is the
+argument: a wrong merge destroys a garment the user owns and they may never
+notice, a wrong proposal costs one tap. Merging is a soft delete and the wear
+log is reparented, because a user who logged three wearings against the
+duplicate did wear the garment three times.
+
+Measured dHash distances: JPEG re-encode **0 bits**, 50% resize **0**,
+brightness +35% **7**, a different garment **29**. The threshold is 10, in the
+empty space between, biased low because a false proposal interrupts while a
+miss costs only a row the user can merge later.
+
+### Wear log — rows, not a counter
+
+Every question worth asking is about WHEN: most-worn (the onboarding ranking),
+"not worn in 90 days", and cost-per-wear. A counter answers the last one badly
+and the first two not at all, and it cannot be corrected — decrementing an
+integer whose history is gone leaves you unable to say whether the new value is
+right. One wearing per garment per day, enforced by a unique index rather than
+by the handler: a double tap is the same fact twice, and cost-per-wear silently
+halves.
+
+Money is stored in **minor units as an integer**. Cost-per-wear divides it, and
+binary floating point accumulates error across a wardrobe.
+
+### Search — ts_rank, and why that is not BM25
+
+The plan says "BM25 over `search_text`". Postgres does not implement BM25;
+`ts_rank_cd` is a coverage-density rank with none of BM25's document-length
+normalisation or saturating term frequency. Real BM25 needs ParadeDB or a
+separate engine.
+
+It does not need one **yet**, and the reason is the corpus: a garment's search
+document is eight enum values, so every document is the same length and no term
+repeats. The two things BM25 adds are both no-ops on documents shaped like
+this. This becomes wrong the moment free text enters the document — a user's
+own notes — and that is the trigger to revisit it, not a version number.
+
+`search_text` is maintained by a trigger. A GENERATED column was the first
+choice and Postgres rejects it: casting an enum to text is not immutable, and
+every searchable field is an enum. Both approaches rule out the real risk,
+which is recomputing search text at the call site and having one forgotten
+UPDATE make a garment silently unfindable.
+
+Facets exist so the UI never offers a filter that matches nothing — a
+taxonomy-driven list offers 144 subcategories to someone with nine garments.
+
+### Observability — and the bug that made it worthless
+
+Four alerts, exactly as specified, each with a defined response: `dlq_age`,
+`spend_spike`, `ingest_success`, `api_5xx`.
+
+**The first version could not fire.** The alerts queried `jobs` directly. The
+API runs as `stylist_app` — NOSUPERUSER, NOBYPASSRLS by design — and every
+tenant table is FORCE RLS, so those queries returned zero rows with no error.
+`count(*) = 0` reads as "the DLQ is empty"; a rate over no samples reads as
+"nothing is failing". The alerts were live, green, and structurally incapable
+of firing, which is the worst possible failure for monitoring because it is
+indistinguishable from health.
+
+Migration `0006` fixes it with SECURITY DEFINER functions rather than by giving
+the API owner credentials. The function runs with the owner's rights, the API
+holds none, and the whole privileged surface is seven functions returning
+counts, rates and timestamps — no argument to any of them can yield a garment,
+an image key or an email. Verified both directions: `stylist_app` can call the
+aggregates and still reads **zero** raw rows.
+
+A second instance of the same class: the `api_5xx` counter called `.pipeline()`
+on the `CacheRedis` wrapper, which has no such method, and the middleware
+swallows its own exceptions by design so telemetry can never fail a request.
+The counter stayed empty and the alert could not fire. The counters now live on
+the wrapper as real methods.
+
+`tests/test_ops_alerts.py` asserts the FIRING direction for each alert, because
+a test that only checks "does not fire" passes perfectly against monitoring
+that is blind.
+
+Two further guards, both about trust rather than correctness: a rate over fewer
+than 20 samples never fires (2 failures in 3 is 67% and means nothing), and
+`/ops/*` requests are excluded from the counters so a monitoring loop cannot
+dilute the rate it measures.
+
+**Tracing** is a span per stage, off unless `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set, degrading to a no-op when the SDK is absent. An ingest pipeline that
+refuses to run because it cannot report on itself has its priorities backwards.
+**Langfuse** is wired but deliberately NOT enabled by default: with the
+callback on and no keys, LiteLLM logs an exporter error on every call, which
+buries real errors. Enabling is two uncommented lines plus keys.
+
+### Onboarding
+
+`/wardrobe/most-worn`, defaulting to 20 — the plan's "start with your 20
+most-worn". A wardrobe of 20 things you actually wear is useful immediately;
+a half-catalogued closet of 200 is a chore with no payoff.
+
+### Two bugs in earlier phases that Phase 5 exposed
+
+**`persist` was overwriting garment-level decisions.** It reset every garment
+to `matted` unconditionally, which silently discarded the `DUPLICATE_SUSPECT`
+the dedupe stage had just set: the duplicate was detected, recorded, and then
+presented as an ordinary garment with no question attached. The same
+last-writer-wins shape as the `extractor_version` collision found during the
+cross-phase pass.
+
+**`docker compose run` and zsh scalars, again.** Two more measurement detours
+came from the same two traps documented in the cross-phase pass. They are in
+the docs because knowing about them did not stop me repeating them.
+
+### Exit criteria — three of five cannot be met by code
+
+- [x] **Zero cross-tenant incidents** — RLS covers `wear_log`, verified by
+      mutation (disabling FORCE fails the suite), and search is tenant-scoped.
+- [ ] **20 users, ≥2,000 garments** — needs users.
+- [ ] **p95 ingest-to-CLASSIFIED < 60s under real load** — measurable now via
+      `/ops/dashboards`, but "under real load" needs real load. Current p95 on
+      synthetic traffic is polluted by the contention experiments described in
+      the cross-phase pass; single-photo latency is ~6.1s.
+- [ ] **Correction rate per field measured on real data** — the endpoint and
+      the in-app strip exist. The number is currently meaningless because tags
+      come from the mock: `subcategory` reads 67% because the mock answers
+      "kurta" for everything.
+- [ ] **Cost per user per month** — still needs a provider key.
+
+**The correction-rate criterion is now gated on the DPA, not just on users.**
+Search and filters consume `subcategory` and `dress_code`; with mock tags they
+will look broken to real users. That makes the provider key a prerequisite for
+Phase 5 being *usable*, not merely for closing Phase 4.
+
+---
+
+## Phase 6 — Deterministic suggest pipeline (built 2026-09-11)
+
+All four steps built. Four of the five exit criteria are met and measured; the
+fifth needs real tags.
+
+### 6.1 Context resolution
+
+`resolve_context(occasion, feels_like_c, precip, wind)` is a pure function in
+`packages/stylist_domain/context.py`. Every threshold comes from
+`taxonomy.yaml` — `warmth` carries `feels_like_c_max` per level (34/30/26/21/16)
+and all 18 occasions carry a `dress_code` and `formality_target`. Nothing is
+invented in code, so tuning is a reviewed data change.
+
+`feels_like`, not `temperature`: 30°C at 90% humidity and 30°C at 20% call for
+different clothes, and this product's market spans both within one city.
+
+Two details worth keeping:
+
+  - The warmth table reads as CEILINGS, so the answer is the HIGHEST level
+    whose ceiling is still at or above the reading. Taking the lowest
+    qualifying level would leave you under-dressed on every cold day, and a
+    single-value test would not catch it — hence a monotonicity test across
+    45°C to -10°C.
+  - `occasion` has no default. The same weather calls for very different
+    clothes depending on whether you are interviewing or going to the gym, and
+    a default would silently pick one.
+
+Weather comes from Open-Meteo `/v1/forecast` with current and daily in ONE
+call, coordinates rounded to 2dp (~1.1km). That rounding is a cache decision
+and a privacy decision at once: at full precision every request is a unique key
+so the 1h TTL never fires, and we stop sending a third party a location precise
+enough to identify a building. No API key, so weather is off the DPA critical
+path entirely.
+
+### 6.2 Slot rules — and a gap in the taxonomy they exposed
+
+The evaluator (`packages/stylist_domain/slots.py`) is table-driven from
+`outfit_rules`. No rule is expressed in Python, because these encode product
+decisions that will be argued about and should be settled by editing a reviewed
+data file.
+
+**Building it found a real bug.** `saree + choli_blouse + sandals` was
+REJECTED. A saree sits in `drape`, so that outfit satisfied neither
+`[upper_base, lower]` nor `[full_body]` — the single most important ethnic
+outfit in the market this taxonomy was built for was unrepresentable. DECISION 1
+says a saree "occupies `drape` and REQUIRES an `upper_base`", which implies
+saree + blouse IS the complete form, but only the `requires` half was ever
+encoded; the "covers the lower body" half was missing.
+
+Fixed with `outfit_rules.lower_equivalent: [saree, half_saree]`, deliberately a
+short list rather than the whole `drape` slot — a dupatta, stole or shawl
+covers nothing, so treating every drape as lower-equivalent would accept
+"dupatta + blouse + sandals" as complete. The count ADDS rather than
+substitutes, so a saree worn over churidar is 2 and still fails. `lehenga_skirt`
+is absent because it already lives in `lower`.
+
+Verified in both directions, plus a 1,500-case property test cross-checked
+against an INDEPENDENT re-implementation of the rules — re-calling `evaluate()`
+to check `evaluate()` would pass against any bug it contains.
+
+Candidate generation anchors on 8-12 items, three of them reserved for
+LOW-WEAR exploration. A recommender that only ranks by affinity converges on
+the six things you already wear, which is the problem this product exists to
+solve.
+
+### 6.3 The scorer, and the number that keeps it honest
+
+Weights live in `config/scoring.yaml`, not code, because they will be tuned
+against the blind eval and tuning must not need a deploy. They are validated to
+sum to 1.0 at load: weights that do not sum to 1 make the total uninterpretable.
+
+The scorer reports **`informative_weight`** per outfit — how much of the score
+came from inputs that could actually separate one outfit from another. Measured
+on the current data: **0.30 to 0.65 of 1.0**. With mock tags, `formality` and
+`warmth` are identical across every garment, so those sub-scores compute
+variance over a constant and rank nothing.
+
+This exists because a bad suggestion must be attributable. Without it you
+cannot tell a broken scorer from uniform input — the exact ambiguity that cost
+this project a long detour during the cross-phase pass. `style_affinity` (0.20)
+and `trend_alignment` (0.05) are present, weighted and reported at ZERO rather
+than omitted: dropping them would mean the other four weights secretly sum to
+0.75 and every score would be depressed for a reason no reader could see.
+
+Rule-breaking outfits score exactly 0, not merely low — the plan says
+forbidden combinations are "never surfaced", and a low score still surfaces
+when the wardrobe is small.
+
+### 6.4 Nightly precompute — and the same RLS trap, a second time
+
+`pg_try_advisory_lock(hashtext('nightly_precompute'))`, and `try_` rather than
+the blocking form on purpose: a replica that queued would run the entire job
+again the moment the winner finished, turning three replicas into three
+sequential runs instead of one.
+
+**The driver could not see any tenants.** `SELECT DISTINCT user_id FROM
+garments` as `stylist_app` against FORCE RLS returns zero rows with no error,
+so the job reported `{"ran": true, "tenants": 0, "written": 0}` — a successful
+run that did nothing, indistinguishable from a night when nobody owned any
+clothes. Every `GET /suggestions` would have been empty forever with no failure
+to point at.
+
+This is the SECOND instance of the identical mistake; the Phase 5 alerts were
+blind the same way. Fixed the same way, migration `0008`: a SECURITY DEFINER
+function exposing only the set of user UUIDs that own an active garment. RLS
+still prevents the app role from reading a single row belonging to any of them.
+Verified both directions — 266 tenants visible through the function, **0** raw
+garment rows.
+
+### Exit criteria
+
+- [x] **`GET /suggestions` ranked, zero model calls, p95 < 300ms** — measured
+      **7.5ms** materialised, **58.1ms** generating live. Both paths exist
+      because precompute cannot cover 18 occasions x 5 warmth levels x wet/dry
+      per tenant, and a user picking "interview" on a cold day must not get an
+      empty screen.
+- [x] **Slot-rule property tests green, including composite ethnic garments** —
+      1,500 random sets against an independent implementation, plus explicit
+      saree/half-saree/lehenga/dupatta cases.
+- [x] **3 cron replicas → exactly 1 execution** — verified; the two losers
+      report `lock_held` rather than erroring.
+- [x] **Candidate generation < 100ms for a 400-item wardrobe** — **3.8ms**.
+      Flat at ~4ms for pools of 100, 400 and 1000 because `MAX_CANDIDATES=500`
+      binds before pool size does. Measured against a fully-wearable synthetic
+      pool, because the seeded wardrobes filter down to ~30 items and would
+      have measured the wrong thing.
+- [ ] **Internal blind eval: 50 outfits, ≥60% "would wear"** — BLOCKED, and not
+      on code.
+
+### Why the blind eval is blocked, concretely
+
+A top-ranked suggestion from the seeded data reads:
+
+    henley(grey_charcoal) + lehenga_skirt(black) + slides(denim_indigo)
+
+That is nonsense, and it is nonsense because `scripts/seed_demo.py` assigns
+`dress_code` and `formality` at random, so the hard filters pass garbage and
+the scorer confidently ranks it. `informative_weight` on that outfit is 0.65 —
+the score itself says a third of its basis was uninformative.
+
+**Do not run the blind eval on seeded or mock-tagged data.** Rating 50 outfits
+built from random attributes yields a meaningless number, and acting on it
+means "fixing" a scorer that was never broken. The plan's warning — "the LLM
+will not save a bad candidate set" — has a corollary: nor will fixing a scorer
+that was fed noise.
+
+The eval needs real tags, which needs the provider key. Everything else in
+Phase 6 is done and measured.
+
+
+### A bug Phase 6's gate run surfaced in Phase 5 (and Phase 4)
+
+The Phase 5 e2e script started failing roughly **1 run in 4**, always on one
+check: "a mis-tap can be undone". A `DELETE /garments/{id}/wear/{date}`
+returned 204 and an immediate re-read still counted the deleted wearing.
+
+Cause: every Phase 5 write handler took `TenantDB`, a `yield` dependency whose
+transaction commits on teardown — and FastAPI runs teardown **after** the
+response is sent. The client therefore had its 204 before the delete was
+durable. `garments.py` documents this exact trap for ingest and fixes it by
+owning the transaction inline; the Phase 5 handlers reintroduced it, and so had
+Phase 4's `correct_field`, latent since it shipped — a correction could render
+as "didn't save" on a fast connection.
+
+Fixed in five handlers (`log_wear`, `unlog_wear`, `set_laundry`,
+`resolve_duplicate`, `correct_field`): 1-in-4 failures became 8 of 8 clean.
+
+**Two things worth keeping from this.**
+
+First, the gate harness was hiding the diagnosis. On failure it printed
+`tail -4` of the output, which for a 32-check script shows the last checks that
+PASSED and never the one that failed. It now greps for the failing lines. A
+harness that cannot show you the failure costs more than the bug.
+
+Second, the pytest regression tests for this **cannot catch it**, and say so in
+a comment. pytest drives the app in-process via httpx's `ASGITransport`, which
+awaits the full response cycle including dependency teardown, so the race is
+unreachable there — verified by mutation: reverting the fix leaves them green.
+The real guard is the e2e script, which crosses a socket from another process.
+A test that looks like a guard and is not is worse than no test, so the
+limitation is written down rather than assumed away.

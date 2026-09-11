@@ -50,6 +50,7 @@ from sqlalchemy import Text, bindparam, text
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 
 from stylist_db.session import tenant_session
+from stylist_obs import stage_span
 
 logger = logging.getLogger(__name__)
 
@@ -454,7 +455,17 @@ async def run_pipeline(user_id: uuid.UUID, job_id: uuid.UUID, stages: tuple[Stag
         # and log aggregation is where this belongs (§D3).
         stage_started = time.perf_counter()
         try:
-            result = await _run_stage_with_retry(stage, stage_ctx, attempts_so_far)
+            # One span per stage (§D3). The log line below carries the same
+            # timing for a single job; the span is what makes it aggregable
+            # across replicas and joinable with the API request that started it.
+            with stage_span(
+                f"ingest.{stage.name}",
+                job_id=ctx.job_id,
+                user_id=ctx.user_id,
+                garment_id=ctx.garment_id,
+                attempt=attempts_so_far,
+            ):
+                result = await _run_stage_with_retry(stage, stage_ctx, attempts_so_far)
         except Terminal as term:
             await _transition(user_id, job_id, term.state, reason=term.reason)
             logger.info("job %s terminal: %s (%s)", job_id, term.state, term.reason)

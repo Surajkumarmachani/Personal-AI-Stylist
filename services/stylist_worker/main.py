@@ -25,6 +25,8 @@ from sqlalchemy import text
 
 from stylist_api.settings import get_settings
 from stylist_db.session import dispose_engine, init_engine, system_session
+from stylist_obs import configure_tracing
+from stylist_worker.precompute import nightly_precompute
 from stylist_worker.relay import relay_outbox
 from stylist_worker.stages import INGEST_STAGES
 from stylist_worker.state_machine import run_pipeline
@@ -69,6 +71,7 @@ async def ping(ctx: dict[str, Any]) -> dict[str, str]:
 
 
 async def startup(ctx: dict[str, Any]) -> None:
+    configure_tracing("stylist-worker")
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
     init_engine(settings.database_url, pool_size=10)  # PROVISIONAL: retune in P9
@@ -89,6 +92,13 @@ class WorkerSettings:
     # PROVISIONAL: retune in P9.
     cron_jobs = [
         cron(relay_outbox, second=set(range(0, 60)), run_at_startup=True, max_tries=1),
+        # 03:15 local. Guarded by pg_try_advisory_lock, so running this on
+        # every replica is safe by design rather than by scheduling luck —
+        # see precompute.py on why try_ and not the blocking form.
+        #
+        # max_tries=1: a failed nightly run should wait for tomorrow, not
+        # retry into the morning traffic it was scheduled to avoid.
+        cron(nightly_precompute, hour={3}, minute={15}, max_tries=1),
     ]
 
     on_startup = startup

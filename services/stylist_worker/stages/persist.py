@@ -59,12 +59,27 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
             )
 
         for row in rows:
-            # `matted` for the garment, not `complete`: subcategory, material,
-            # formality, warmth and fit are all tier=vlm and arrive in Phase 4.
-            # Calling the garment complete would be a lie the UI repeats to the
-            # user.
+            # `matted` for the garment, not `complete`: `pattern` is still
+            # deliberately unset pending the golden set, so calling the garment
+            # complete would be a lie the UI repeats to the user.
+            #
+            # The WHERE clause preserves decisions earlier stages already made
+            # about this GARMENT. dedupe parks a near-duplicate at
+            # DUPLICATE_SUSPECT, and without the guard this statement — which
+            # runs after it — silently reset that to `matted`: the duplicate
+            # was detected, recorded in `duplicate_of`, and then presented to
+            # the user as an ordinary garment with no question attached.
+            # A job completing and a garment being unremarkable are different
+            # facts, and only the first one is persist's to assert.
             await session.execute(
-                text("UPDATE garments SET state = :state, updated_at = now() WHERE id = :gid"),
+                text(
+                    """
+                    UPDATE garments
+                    SET state = :state, updated_at = now()
+                    WHERE id = :gid
+                      AND state NOT IN ('duplicate_suspect', 'rejected', 'quarantined')
+                    """
+                ),
                 {"state": str(IngestState.MATTED), "gid": row["id"]},
             )
 

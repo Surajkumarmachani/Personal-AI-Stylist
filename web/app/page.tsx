@@ -22,9 +22,13 @@ import {
   register,
   setToken,
   streamJob,
+  logWear,
   uploadToStorage,
 } from "@/lib/api";
+import Link from "next/link";
+
 import GarmentEditor from "./GarmentEditor";
+import WardrobeTools from "./WardrobeTools";
 
 // jobs.state -> what the user is told.
 //
@@ -59,6 +63,9 @@ export default function Home() {
   const [signedIn, setSignedIn] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(
+    null,
+  );
   const [garments, setGarments] = useState<Garment[]>([]);
   const [progress, setProgress] = useState<Record<string, JobEvent>>({});
   const [editing, setEditing] = useState<string | null>(null);
@@ -109,11 +116,45 @@ export default function Home() {
     setBusy(true);
     setError(null);
     try {
+      // Uploads run CONCURRENTLY, capped at 4. Sequentially, 30 photos is 30
+      // round trips of presign-then-PUT with a blank screen in between; the cap
+      // exists because unbounded parallelism on a phone connection makes every
+      // upload slower and can exhaust the browser's connection pool.
+      const all = Array.from(files);
       const uploaded: { upload_id: string; key: string }[] = [];
-      for (const file of Array.from(files)) {
-        const p = await presign(file.type || "image/jpeg");
-        await uploadToStorage(p, file);
-        uploaded.push({ upload_id: p.upload_id, key: p.key });
+      const failures: string[] = [];
+      let done = 0;
+      const CONCURRENCY = 4;
+      const queue = [...all];
+
+      async function worker() {
+        for (;;) {
+          const file = queue.shift();
+          if (!file) return;
+          try {
+            const p = await presign(file.type || "image/jpeg");
+            await uploadToStorage(p, file);
+            uploaded.push({ upload_id: p.upload_id, key: p.key });
+          } catch (e) {
+            // One unreadable file must not discard the other 29 uploads. The
+            // batch continues and the failures are reported at the end.
+            failures.push(`${file.name}: ${String(e).slice(0, 80)}`);
+          } finally {
+            done += 1;
+            setUploadProgress({ done, total: all.length });
+          }
+        }
+      }
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, all.length) }, () => worker()),
+      );
+      setUploadProgress(null);
+
+      if (uploaded.length === 0) {
+        throw new Error(`no files uploaded. ${failures.join("; ")}`);
+      }
+      if (failures.length > 0) {
+        setError(`${failures.length} of ${all.length} failed: ${failures.join("; ")}`);
       }
 
       // One idempotency key per user action. A retry of the same click must
@@ -182,6 +223,11 @@ export default function Home() {
               </button>
             </div>
           </div>
+          {uploadProgress && uploadProgress.total > 1 && (
+            <div className="hint">
+              Uploading {uploadProgress.done} of {uploadProgress.total}…
+            </div>
+          )}
           {error && <div className="err">{error}</div>}
         </div>
       ) : (
@@ -260,6 +306,18 @@ export default function Home() {
             />
           )}
 
+          <div className="searchrow" style={{ justifyContent: "flex-end" }}>
+            {/* next/link, NOT <a href>. A plain anchor is a full page load,
+                which discards the in-memory access token (see lib/api.ts on
+                why it is not in localStorage) and lands you on a signed-out
+                page. Client-side navigation keeps the session. */}
+            <Link className="link" href="/eval">
+              Model QA — what each model actually produced →
+            </Link>
+          </div>
+
+          <WardrobeTools onChanged={() => void refresh()} />
+
           {garments.length === 0 ? (
             <div className="empty">Nothing here yet. Add a photo above.</div>
           ) : (
@@ -282,6 +340,30 @@ export default function Home() {
                         <span className="spinner" />
                       )}
                     </div>
+                    <button
+
+                      className="wear"
+
+                      title="Log that you wore this today"
+
+                      onClick={(e) => {
+
+                        // The card opens the editor. Without this the click does both,
+
+                        // and logging a wearing pops a dialog the user did not ask for.
+
+                        e.stopPropagation();
+
+                        void logWear(g.id).then(() => refresh());
+
+                      }}
+
+                    >
+
+                      Worn today
+
+                    </button>
+
                     <div className="meta">
                       <span className={`badge ${badge.cls}`}>{badge.label}</span>
                       <div style={{ marginTop: 6, color: "var(--muted)" }}>

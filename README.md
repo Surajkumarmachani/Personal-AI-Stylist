@@ -5,11 +5,24 @@ Western mixed wardrobes. Photograph your clothes, get them catalogued
 automatically, get outfit suggestions that account for weather, occasion and
 what you actually wear.
 
-**Status:** Phase 4 built — a photo is split into garments, cut out, coloured,
-moderated in-VPC, tagged through the LiteLLM gateway, embedded in pgvector, and
-every field is correctable with the correction locked against future backfills.
-Two exit criteria need external inputs: a real cost-per-garment number needs a
-provider key (DPA outstanding), and accuracy needs the 500-image golden set.
+**Status:** Phase 6 built — a photo is split into garments, cut out, coloured,
+moderated in-VPC, tagged through the LiteLLM gateway, embedded in pgvector,
+checked for duplicates, and every field is correctable with the correction
+locked against future backfills. You can log wears, track laundry and
+cost-per-wear, and search or filter the wardrobe.
+
+It now also suggests outfits: weather and occasion resolve to warmth,
+formality and dress-code targets, candidates are assembled against
+table-driven slot rules (a saree needs a blouse; a dress and trousers is two
+outfits), and a six-term deterministic scorer ranks them with **zero model
+calls**. `GET /suggestions` serves the nightly precompute in ~7ms, or generates
+live in ~58ms when the requested context was never precomputed.
+
+Three things still need something other than code: **20 real users** and
+**≥2,000 real garments** for Phase 5's go/no-go, and a **provider key** (DPA
+outstanding) for a real cost-per-garment number, a correction rate that means
+anything, and the outfit blind eval — tags currently come from a deterministic
+mock, so suggestion *quality* is not yet measurable even though the pipeline is.
 See [build status](docs/implementation-plan.md#build-status).
 
 ## Quickstart
@@ -54,10 +67,25 @@ cd web && npm install && npm run dev     # -> http://localhost:3100
 ### Try it end to end
 
 Upload a photo of clothing through the web UI and watch it get catalogued —
-split into garments, cut out, colour-extracted, moderated, tagged and embedded.
-Every field is editable, and an edit is permanent: it is recorded in
-`user_verified_fields` and the tag stage checks that column in SQL, so no
-backfill or model upgrade can overwrite it.
+split into garments, cut out, colour-extracted, moderated, tagged, embedded and
+checked against what you already own. Every field is editable, and an edit is
+permanent: it is recorded in `user_verified_fields` and the tag stage checks
+that column in SQL, so no backfill or model upgrade can overwrite it.
+
+Upload the **same photo twice** to see dedupe: the second copy is flagged as a
+possible duplicate and you are asked. It is never merged automatically — a
+wrong merge destroys a garment you own and you may never notice, while a wrong
+question costs one tap.
+
+Tap **Worn today** on any item to build the wear log. Cost-per-wear appears
+once a garment has a purchase price, and the most-worn ranking is what the
+onboarding flow ("start with your 20 most-worn") is built on.
+
+**A caveat worth knowing:** without a provider key, tagging runs against a
+deterministic mock that answers `kurta` for everything. Colours, cutouts,
+segmentation, embeddings and dedupe are all real work on your photos — only the
+category-ish fields are placeholders. Set `OPENAI_API_KEY` and
+`VLM_MODEL=vlm-tagger` in `.env` for real tags.
 
 Or drive it from the command line against the running stack:
 

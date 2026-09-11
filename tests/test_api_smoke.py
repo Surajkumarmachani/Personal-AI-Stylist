@@ -15,106 +15,14 @@ duplicated ingest is a doubled VLM bill plus duplicate wardrobe rows.
 from __future__ import annotations
 
 import json
-import os
 import uuid
-from datetime import UTC, datetime, timedelta
-from typing import Any
 
 import pytest
-import pytest_asyncio
-from httpx import ASGITransport, AsyncClient
+from httpx import AsyncClient
 
-from stylist_clients.storage import ALLOWED_CONTENT_TYPES, PresignedUpload
+from tests.conftest import FakeObjectStore, _register, _upload_one  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
-
-
-class FakeObjectStore:
-    """In-memory stand-in. Mirrors the real contract: presign refuses a
-    disallowed content type, and head() returns None until bytes 'exist'."""
-
-    def __init__(self) -> None:
-        self.objects: dict[str, dict[str, Any]] = {}
-        self.presign_ttl_seconds = 900
-
-    def presign_upload(
-        self, *, user_id: uuid.UUID | str, content_type: str, max_bytes: int = 12 * 1024 * 1024
-    ) -> PresignedUpload:
-        if content_type not in ALLOWED_CONTENT_TYPES:
-            raise ValueError(f"content_type not allowed: {content_type}")
-        upload_id = str(uuid.uuid4())
-        key = f"originals/{user_id}/{upload_id}"
-        return PresignedUpload(
-            upload_id=upload_id,
-            key=key,
-            url="http://fake-storage.local/stylist-local",
-            fields={"key": key, "Content-Type": content_type, "policy": "ZmFrZQ=="},
-            expires_at=datetime.now(UTC) + timedelta(seconds=900),
-            max_bytes=max_bytes,
-        )
-
-    def complete_upload(self, key: str) -> None:
-        """Simulate the client's direct-to-storage PUT succeeding."""
-        self.objects[key] = {"ContentLength": 2048, "ContentType": "image/jpeg"}
-
-    def head(self, key: str) -> dict[str, Any] | None:
-        return self.objects.get(key)
-
-    def presign_download(self, key: str, *, ttl_seconds: int | None = None) -> str:
-        return f"http://fake-storage.local/{key}?signed=1"
-
-
-@pytest_asyncio.fixture
-async def api(migrated_database):
-    """The real app, with only object storage faked."""
-    os.environ.setdefault("REDIS_QUEUE_URL", "redis://localhost:6379/0")
-    # No worker runs in these tests, so a job never leaves `received` and the
-    # SSE stream would otherwise poll until the production 300s cap — a
-    # five-minute test suite. Shrink the cap rather than sleeping around it.
-    os.environ["SSE_MAX_STREAM_SECONDS"] = "1.5"
-    os.environ["SSE_POLL_INTERVAL_SECONDS"] = "0.1"
-    from stylist_api.settings import get_settings
-
-    get_settings.cache_clear()
-
-    from stylist_api.deps import object_store
-    from stylist_api.main import create_app
-
-    app = create_app()
-    fake = FakeObjectStore()
-    app.dependency_overrides[object_store] = lambda: fake
-
-    async with app.router.lifespan_context(app):
-        try:
-            await app.state.queue_redis.ping()
-        except Exception:
-            pytest.skip("redis not reachable")
-        transport = ASGITransport(app=app)
-        async with AsyncClient(transport=transport, base_url="http://test") as client:
-            client.fake_store = fake  # type: ignore[attr-defined]
-            yield client
-
-
-async def _register(client: AsyncClient) -> tuple[str, str]:
-    email = f"user-{uuid.uuid4()}@example.com"
-    resp = await client.post(
-        "/auth/register", json={"email": email, "password": "a-long-enough-password"}
-    )
-    assert resp.status_code == 201, resp.text
-    return email, resp.json()["access_token"]
-
-
-async def _upload_one(client: AsyncClient, token: str) -> tuple[str, str]:
-    """Presign, then simulate the client's upload completing."""
-    resp = await client.post(
-        "/uploads/presign",
-        json={"content_type": "image/jpeg"},
-        headers={"Authorization": f"Bearer {token}"},
-    )
-    assert resp.status_code == 200, resp.text
-    body = resp.json()
-    client.fake_store.complete_upload(body["key"])  # type: ignore[attr-defined]
-    return body["upload_id"], body["key"]
 
 
 # --------------------------------------------------------------------------

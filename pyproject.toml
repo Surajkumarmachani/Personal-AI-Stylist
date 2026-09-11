@@ -43,6 +43,15 @@ ml = [
   "rembg[cpu]>=2.0.60",
 ]
 
+# Tracing is opt-in. The SDK plus an OTLP exporter is ~8MB of dependencies for
+# a feature that does nothing without a collector to export to, so it is an
+# extra rather than a base dependency — and stylist_obs degrades to a no-op
+# when it is absent, so nothing breaks if it is not installed.
+observability = [
+  "opentelemetry-sdk>=1.27",
+  "opentelemetry-exporter-otlp-proto-http>=1.27",
+]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
@@ -84,4 +93,12 @@ explicit_package_bases = true
 # Third-party packages without shipped stubs.
 [[tool.mypy.overrides]]
 module = ["arq.*", "boto3.*", "botocore.*", "rembg.*", "onnxruntime.*"]
+ignore_missing_imports = true
+
+
+# opentelemetry is an OPTIONAL extra (see [project.optional-dependencies]).
+# stylist_obs imports it inside a try/except and degrades to a no-op, so a
+# checkout without the extra installed must still typecheck.
+[[tool.mypy.overrides]]
+module = ["opentelemetry.*"]
 ignore_missing_imports = true

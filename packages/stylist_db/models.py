@@ -13,13 +13,15 @@ create or drop them.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any
 
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
+    Date,
     DateTime,
     ForeignKey,
     Index,
@@ -191,6 +193,21 @@ class Garment(Base):
 
     state: Mapped[str] = mapped_column(String(32), nullable=False, server_default="received")
     needs_review: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+
+    # ---- Phase 5 ---------------------------------------------------------
+    # Laundry state. Phase 6's suggester excludes what is in the basket.
+    needs_wash: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # Minor units (paise), never a float: cost-per-wear divides this, and
+    # binary floating point accumulates error across a wardrobe.
+    purchase_price_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    purchase_currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    # A PROPOSED duplicate, never an applied one. The pipeline asks; only the
+    # user answers. Self-referential, so it is typed as the raw column rather
+    # than a relationship to avoid a mapper cycle for a field that is read as
+    # an id everywhere it is used.
+    duplicate_of: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("garments.id", ondelete="SET NULL"), nullable=True
+    )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
 
     created_at: Mapped[datetime] = _created_at()
@@ -342,4 +359,30 @@ TENANT_SCOPED_TABLES: tuple[str, ...] = (
     "garments",
     "jobs",
     "garment_corrections",
+    "wear_log",
 )
+
+
+class WearLog(Base):
+    """One row per wearing. Append-only.
+
+    Not a counter on Garment: cost-per-wear, "your 20 most-worn" and "not worn
+    since March" are all questions about WHEN, and a counter answers none of
+    them. It also makes a mis-tap correctable by deleting a row rather than
+    decrementing a number whose history is gone.
+    """
+
+    __tablename__ = "wear_log"
+
+    id: Mapped[uuid.UUID] = _pk()
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    garment_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("garments.id", ondelete="CASCADE"), nullable=False
+    )
+    # A DATE. "I wore this on Tuesday" is the fact; a timestamp would imply a
+    # precision the user never gave and make "worn today" timezone-dependent.
+    worn_on: Mapped[date] = mapped_column(Date, nullable=False)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = _created_at()
