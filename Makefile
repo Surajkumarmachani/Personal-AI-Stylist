@@ -1,6 +1,17 @@
 .PHONY: up down logs migrate test lint fmt typecheck taxonomy reset-db check
 
-COMPOSE := docker compose -f infra/compose/docker-compose.yml
+# --env-file IS LOAD-BEARING. Compose takes its project directory from the
+# compose FILE's location, so it looks for infra/compose/.env and never reads
+# the .env at the repo root. Without this flag GEMINI_API_KEY interpolates to
+# "" and VLM_MODEL falls back to the mock — the stack comes up healthy and
+# silently tags every garment with the stand-in model, which looks exactly
+# like a working install. Passed only when the file exists, so a fresh clone
+# with no .env still runs (compose errors on a missing --env-file path).
+#
+# NOT --project-directory: that would also re-root `context: ../..` and the
+# ../../packages volume mounts, which are relative to the compose file.
+ENV_FILE := $(wildcard .env)
+COMPOSE := docker compose -f infra/compose/docker-compose.yml $(if $(ENV_FILE),--env-file .env,)
 export PYTHONPATH := packages:services
 
 models:            ## fetch model weights into ./models (once, ~176MB)

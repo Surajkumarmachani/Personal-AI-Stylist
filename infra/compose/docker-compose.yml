@@ -5,6 +5,13 @@
 # the worst possible failure mode, where your app connects successfully to the
 # WRONG database. Container-internal ports stay standard.
 #
+# RESTART POLICY. The long-running services are `unless-stopped` so the stack
+# comes back on its own after Docker Desktop restarts or the machine sleeps.
+# Without it they stay exited, and the only symptom is the web UI reporting
+# `TypeError: Failed to fetch` — a browser-side network error that says nothing
+# about the API being down. The one-shot init/migrate jobs keep `restart: "no"`:
+# they are meant to run once and exit 0, and restarting them would loop.
+#
 # TWO REDIS CONTAINERS, NOT TWO LOGICAL DATABASES. Production uses db0/db1 on
 # one managed instance, which is fine when `noeviction` is configured on the
 # queue db. Locally we use separate containers so an eviction policy cannot
@@ -15,6 +22,7 @@ name: ai-stylist
 
 services:
   postgres:
+    restart: unless-stopped
     # pgvector image even though Phase 1 does not use vectors: Phase 3 adds the
     # embedding column, and having the extension available from the start means
     # that migration is not also an infrastructure change.
@@ -54,6 +62,7 @@ services:
     restart: "no"
 
   litellm:
+    restart: unless-stopped
     image: ghcr.io/berriai/litellm:main-stable
     depends_on:
       litellm-db-init:
@@ -63,10 +72,12 @@ services:
     environment:
       LITELLM_MASTER_KEY: sk-master-local-only
       LITELLM_DATABASE_URL: postgresql://stylist_owner:stylist_owner_local_only@postgres:5432/litellm
-      # Deliberately unset locally. Without a provider key the gateway cannot
-      # reach a provider, which is the correct state until the DPA is signed —
-      # and it means the DEGRADED_TAGGED path is the default here, so it gets
-      # exercised constantly rather than only in a drill.
+      # Read from .env (gitignored). GEMINI_API_KEY drives the `vlm-tagger`
+      # row; the other two remain unset unless you have them, which is fine —
+      # a missing key degrades to DEGRADED_TAGGED rather than failing ingest.
+      # VLM_MODEL still defaults to the mock, so the stack continues to start
+      # and run end-to-end with no credentials at all.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # Langfuse. Unset by default; the gateway only exports when the callback
@@ -93,6 +104,7 @@ services:
       start_period: 40s
 
   redis-queue:
+    restart: unless-stopped
     image: redis:7-alpine
     # noeviction: nothing in here is disposable. If this fills up we want
     # writes to fail loudly, not for jobs to be silently dropped.
@@ -111,6 +123,7 @@ services:
       retries: 30
 
   redis-cache:
+    restart: unless-stopped
     image: redis:7-alpine
     # allkeys-lru: everything here (rationales, boards, weather context) is
     # recomputable, so evicting under pressure is correct behaviour.
@@ -129,6 +142,7 @@ services:
       retries: 30
 
   minio:
+    restart: unless-stopped
     image: minio/minio:latest
     command: server /data --console-address ":9001"
     environment:
@@ -188,6 +202,7 @@ services:
     restart: "no"
 
   api:
+    restart: unless-stopped
     build:
       context: ../..
       dockerfile: infra/compose/Dockerfile
@@ -238,6 +253,7 @@ services:
       retries: 20
 
   worker:
+    restart: unless-stopped
     build:
       context: ../..
       dockerfile: infra/compose/Dockerfile
@@ -291,6 +307,7 @@ services:
       start_period: 15s
 
   ml:
+    restart: unless-stopped
     build:
       context: ../..
       dockerfile: infra/compose/Dockerfile

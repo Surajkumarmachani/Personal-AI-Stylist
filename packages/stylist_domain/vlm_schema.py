@@ -64,6 +64,45 @@ def required_fields(taxonomy: Taxonomy) -> tuple[str, ...]:
     )
 
 
+# Largest enum we will inline in the response schema.
+#
+# Gemini's responseSchema rejects the full 144-value `subcategory` list with a
+# bare `400 INVALID_ARGUMENT` that names no field and no reason — the least
+# actionable error in this pipeline. Measured against gemini-3.6-flash by
+# bisection: 128 values pass, 136 fail. This sits at the last passing value.
+#
+# OpenAI and Anthropic both accept the full list, so this is a lowest common
+# denominator rather than a universal limit. ONE schema shape is sent to every
+# provider anyway: a schema that varies per provider means the fallback in
+# litellm/config.yaml exercises a shape that was never tested, which is exactly
+# when you do not want a surprise.
+#
+# Dropping an enum does NOT weaken validation. The permitted values move into
+# the prompt (build_prompt lists them), and `_parse` in the tag stage still
+# checks every value against the taxonomy and drops unknown ones per field.
+# The schema was always the polite request; the parse is the actual gate.
+MAX_SCHEMA_ENUM = 128
+
+
+def _enum_values(taxonomy: Taxonomy) -> dict[str, list[str]]:
+    """Permitted values per enum field, from the one taxonomy loader."""
+    return {
+        "subcategory": list(taxonomy.subcategories),
+        "material": list(taxonomy.materials),
+        "dress_code": list(taxonomy.dress_codes),
+        "fit": list(taxonomy.fits),
+    }
+
+
+def prompt_listed_enums(taxonomy: Taxonomy) -> tuple[str, ...]:
+    """Fields whose values are too numerous for the schema, so the prompt
+    must carry them instead. Shared by build_schema and build_prompt so the
+    two cannot disagree about which fields the model was told about."""
+    return tuple(
+        name for name, values in _enum_values(taxonomy).items() if len(values) > MAX_SCHEMA_ENUM
+    )
+
+
 def build_schema(taxonomy: Taxonomy, *, cells: list[str]) -> dict[str, Any]:
     """A strict JSON schema keyed by grid cell.
 
@@ -73,23 +112,56 @@ def build_schema(taxonomy: Taxonomy, *, cells: list[str]) -> dict[str, Any]:
     subsequent garment's tags onto the wrong garment — the worst possible
     failure, because every value is individually plausible.
     """
+    values = _enum_values(taxonomy)
+    listed_in_prompt = set(prompt_listed_enums(taxonomy))
+
+    def enum_field(name: str) -> dict[str, Any]:
+        """An enum property, or a plain string when the list is too long to
+        inline. The description names where the values went, so a response
+        read in Langfuse is not mystifying."""
+        if name in listed_in_prompt:
+            return {
+                "type": "string",
+                "description": (
+                    f"One of the {len(values[name])} permitted {name} values "
+                    "listed in the prompt. Values outside that list are discarded."
+                ),
+            }
+        return {"type": "string", "enum": values[name]}
+
     item_properties: dict[str, Any] = {
         "cell": {
             "type": "string",
             "enum": cells,
             "description": "Which labelled cell of the grid this describes.",
         },
-        "subcategory": {"type": "string", "enum": list(taxonomy.subcategories)},
-        "material": {"type": "string", "enum": list(taxonomy.materials)},
+        "subcategory": enum_field("subcategory"),
+        "material": enum_field("material"),
         "formality": {"type": "integer", "minimum": 1, "maximum": 5},
-        "dress_code": {"type": "string", "enum": list(taxonomy.dress_codes)},
+        "dress_code": enum_field("dress_code"),
         "warmth": {"type": "integer", "minimum": 1, "maximum": 5},
-        "fit": {"type": "string", "enum": list(taxonomy.fits)},
+        "fit": enum_field("fit"),
         "confidence": {
             "type": "object",
-            "description": "Per-field confidence, 0-1. Drives the review gate.",
+            # INTEGER PERCENT ON THE WIRE, float 0-1 everywhere else.
+            #
+            # Asked for as a float, Gemini's constrained decoding degenerates:
+            # it emits `0.95000000000...` for thousands of digits until the
+            # response hits max_tokens and the JSON is truncated mid-object, so
+            # a PERFECTLY GOOD extraction is thrown away by the parser. The
+            # number grammar allows unbounded trailing digits and nothing in a
+            # float schema can forbid them — `minimum`/`maximum` and
+            # `multipleOf` were all measured and none of them helps. An integer
+            # cannot express the pathology at all.
+            #
+            # The tag stage divides by 100 on the way in, so the database, the
+            # review thresholds and the API keep the 0-1 floats they always had.
+            "description": (
+                "Per-field confidence as an INTEGER 0-100 (95 means 0.95). "
+                "Drives the review gate."
+            ),
             "properties": {
-                name: {"type": "number", "minimum": 0, "maximum": 1}
+                name: {"type": "integer", "minimum": 0, "maximum": 100}
                 for name in vlm_fields(taxonomy)
             },
             "additionalProperties": False,
@@ -158,9 +230,27 @@ def build_prompt(taxonomy: Taxonomy, *, cells: list[str], hints: dict[str, str])
         "  - warmth is calibrated to a 16-34C range, not a temperate one. A "
         "cotton shirt is 2-3, not 4.",
         "",
+        "confidence is an INTEGER from 0 to 100 per field (95 means 95% "
+        "certain). Do not write it as a decimal.",
+        "",
         "confidence must reflect genuine uncertainty per field. Material from "
         "a photo is often ambiguous; say so with a low number rather than "
         "guessing confidently. Low-confidence fields are shown to the user for "
         "correction, which is a good outcome — a confident wrong answer is not.",
     ]
+
+    # Fields too large to express as a schema enum (see MAX_SCHEMA_ENUM). The
+    # schema cannot constrain these, so the prompt is the ONLY place the model
+    # learns the vocabulary — omit this and it invents plausible values that
+    # the tag stage then drops, which looks like a model that cannot classify
+    # clothes rather than a prompt missing its value list.
+    for name in prompt_listed_enums(taxonomy):
+        permitted = _enum_values(taxonomy)[name]
+        lines += [
+            "",
+            f"Permitted {name} values ({len(permitted)}) — use EXACTLY one of "
+            "these strings, verbatim. Anything else is discarded:",
+            "  " + ", ".join(permitted),
+        ]
+
     return "\n".join(lines)

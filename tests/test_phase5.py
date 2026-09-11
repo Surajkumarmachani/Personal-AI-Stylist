@@ -7,7 +7,9 @@ assert in isolation, including the two thresholds everything else depends on.
 from __future__ import annotations
 
 import io
+import os
 import uuid
+from contextlib import contextmanager
 from datetime import date, timedelta
 
 import pytest
@@ -216,10 +218,35 @@ async def test_facets_never_offer_a_filter_that_matches_nothing(
 # easy, because seeded tags, mock tags and real tags are the same columns.
 
 
+@contextmanager
+def _vlm_model(name: str):
+    """Pin VLM_MODEL for one test.
+
+    Settings reads the repo-root .env, so without this the assertion below is
+    really about whoever last edited that file — it passed only while the
+    default happened to be the mock, and broke the day a real provider was
+    configured. What is under test is the LABELLING, not the ambient config.
+    """
+    from stylist_api.settings import get_settings
+
+    previous = os.environ.get("VLM_MODEL")
+    os.environ["VLM_MODEL"] = name
+    get_settings.cache_clear()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("VLM_MODEL", None)
+        else:
+            os.environ["VLM_MODEL"] = previous
+        get_settings.cache_clear()
+
+
 @pytest.mark.asyncio
 async def test_eval_view_labels_mock_tagging_as_not_real(api: AsyncClient, registered) -> None:
     """With the mock configured, nothing may claim to be real model output."""
-    body = (await api.get("/garments/eval", headers=registered.auth)).json()
+    with _vlm_model("vlm-tagger-mock"):
+        body = (await api.get("/garments/eval", headers=registered.auth)).json()
     assert body["tagging_is_mock"] is True, body["tagging_model"]
     for item in body["items"]:
         assert item["tag_is_real"] is False, item["tag_source"]
@@ -228,6 +255,17 @@ async def test_eval_view_labels_mock_tagging_as_not_real(api: AsyncClient, regis
             or "synthetic" in item["tag_source"]
             or ("unknown" in item["tag_source"])
         ), item["tag_source"]
+
+
+@pytest.mark.asyncio
+async def test_eval_view_does_not_call_a_real_model_mock(api: AsyncClient, registered) -> None:
+    """The converse, which is what actually ships: with a real provider
+    configured the view must NOT label its output as mock, or every genuine
+    prediction gets discounted in QA and the eval measures nothing."""
+    with _vlm_model("vlm-tagger"):
+        body = (await api.get("/garments/eval", headers=registered.auth)).json()
+    assert body["tagging_is_mock"] is False, body["tagging_model"]
+    assert body["tagging_model"] == "vlm-tagger"
 
 
 @pytest.mark.asyncio

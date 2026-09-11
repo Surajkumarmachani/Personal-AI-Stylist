@@ -26,7 +26,14 @@ from PIL import Image, ImageDraw
 from sqlalchemy import text
 
 from stylist_domain.taxonomy import load_taxonomy
-from stylist_domain.vlm_schema import build_prompt, build_schema, required_fields, vlm_fields
+from stylist_domain.vlm_schema import (
+    MAX_SCHEMA_ENUM,
+    build_prompt,
+    build_schema,
+    prompt_listed_enums,
+    required_fields,
+    vlm_fields,
+)
 from stylist_worker.grid import MAX_CELLS, cell_name, compose
 
 
@@ -81,6 +88,8 @@ class FakeGateway:
 
 
 def tag_payload(cells: list[str], *, material_confidence: float = 0.9) -> str:
+    """`material_confidence` stays a 0-1 float for readability at call sites;
+    the payload carries the integer percent the VLM schema actually asks for."""
     return json.dumps(
         {
             "items": [
@@ -93,12 +102,12 @@ def tag_payload(cells: list[str], *, material_confidence: float = 0.9) -> str:
                     "warmth": 2,
                     "fit": "relaxed",
                     "confidence": {
-                        "subcategory": 0.9,
-                        "material": material_confidence,
-                        "formality": 0.9,
-                        "dress_code": 0.9,
-                        "warmth": 0.9,
-                        "fit": 0.9,
+                        "subcategory": 90,
+                        "material": round(material_confidence * 100),
+                        "formality": 90,
+                        "dress_code": 90,
+                        "warmth": 90,
+                        "fit": 90,
                     },
                 }
                 for cell in cells
@@ -181,20 +190,67 @@ async def cleanup(owner_engine, user_id: uuid.UUID) -> None:
 # ------------------------------------------------------------ schema
 
 
-def test_schema_enums_come_from_the_taxonomy() -> None:
-    """A model returning a bad value must be a SCHEMA violation, caught
-    mechanically — not a bad row discovered weeks later when no filter matches
-    it."""
+def test_every_enum_field_reaches_the_model_somehow() -> None:
+    """A model returning a bad value must be caught mechanically — not
+    discovered weeks later when no filter matches the row.
+
+    Enums under MAX_SCHEMA_ENUM ride in the schema. Larger ones cannot:
+    Gemini rejects the whole request with an unexplained 400, so their values
+    move into the prompt instead. What must NEVER happen is a field going out
+    with neither — the model would then be guessing at a vocabulary nobody
+    told it about, and `_parse` would drop every value it produced.
+    """
     taxonomy = load_taxonomy()
     schema = build_schema(taxonomy, cells=["A1", "A2"])
     props = schema["json_schema"]["schema"]["properties"]["items"]["items"]["properties"]
+    prompt = build_prompt(taxonomy, cells=["A1"], hints={"A1": "unknown"})
+    in_prompt = set(prompt_listed_enums(taxonomy))
 
-    assert props["subcategory"]["enum"] == list(taxonomy.subcategories)
-    assert props["material"]["enum"] == list(taxonomy.materials)
-    assert props["dress_code"]["enum"] == list(taxonomy.dress_codes)
-    assert props["fit"]["enum"] == list(taxonomy.fits)
+    expected = {
+        "subcategory": list(taxonomy.subcategories),
+        "material": list(taxonomy.materials),
+        "dress_code": list(taxonomy.dress_codes),
+        "fit": list(taxonomy.fits),
+    }
+    for field, values in expected.items():
+        if field in in_prompt:
+            assert "enum" not in props[field], f"{field} is in the prompt; drop it from the schema"
+            for value in values:
+                assert value in prompt, f"{field}={value} reaches the model nowhere"
+        else:
+            assert props[field]["enum"] == values, f"{field} must carry the taxonomy's values"
+            assert len(values) <= MAX_SCHEMA_ENUM
+
     assert props["cell"]["enum"] == ["A1", "A2"]
     assert schema["json_schema"]["strict"] is True
+
+
+def test_confidence_is_an_integer_percent() -> None:
+    """Asked for as a float, Gemini's decoder emits `0.95000...` until the
+    response truncates and a good extraction is discarded. Integers cannot
+    express that failure; the tag stage divides by 100 on the way in."""
+    taxonomy = load_taxonomy()
+    schema = build_schema(taxonomy, cells=["A1"])
+    conf = schema["json_schema"]["schema"]["properties"]["items"]["items"]["properties"][
+        "confidence"
+    ]["properties"]
+    for field, spec in conf.items():
+        assert spec["type"] == "integer", f"{field} confidence must not be a float"
+        assert (spec["minimum"], spec["maximum"]) == (0, 100)
+
+
+def test_confidence_percent_is_normalised_to_unit_interval() -> None:
+    """The database, the review thresholds and the API all speak 0-1."""
+    from stylist_worker.stages.tag import _confidence
+
+    assert _confidence({"subcategory": 95, "material": 55}) == {
+        "subcategory": 0.95,
+        "material": 0.55,
+    }
+    assert _confidence({"a": 0, "b": 100}) == {"a": 0.0, "b": 1.0}
+    # Out of range, wrong type, and booleans are dropped rather than coerced.
+    assert _confidence({"a": 101, "b": -1, "c": "high", "d": True}) == {}
+    assert _confidence("not a dict") == {}
 
 
 def test_only_vlm_tier_fields_are_requested() -> None:

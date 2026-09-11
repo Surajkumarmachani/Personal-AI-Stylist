@@ -19,18 +19,39 @@
 model_list:
   # ---- the paid tier: garment tagging -------------------------------------
   #
-  # api_key comes from the environment and is UNSET by default. That is
-  # deliberate: Phase 0.3's DPA is still outstanding, and a config that
-  # silently works without one would let pixels reach a provider we have no
-  # agreement with. With no key, calls fail and the ingest pipeline degrades to
-  # DEGRADED_TAGGED — which is exactly the behaviour we want to have already
-  # tested before the key exists.
+  # api_key comes from the environment and may be UNSET. That is deliberate:
+  # with no key, calls fail and the ingest pipeline degrades to
+  # DEGRADED_TAGGED — the behaviour we want tested before a key exists.
+  #
+  # PROVIDER IS GEMINI, AND THE ROW KEEPS THE NAME `vlm-tagger`. Swapping the
+  # model inside this row rather than adding a `vlm-tagger-gemini` row is what
+  # keeps the fallback working: `fallbacks` below is keyed on model_name, so a
+  # new name would silently have no backup provider.
+  #
+  # `gemini/` IS GOOGLE AI STUDIO, NOT VERTEX. AI Studio's free tier permits
+  # Google to train on submitted content, and what we submit is photographs of
+  # users' clothes. That is fine for dev and eval against the golden set; it is
+  # NOT the production posture. Production moves this to `vertex_ai/`, whose
+  # enterprise terms are what the Phase 0.3 DPA is about — the prefix is the
+  # only line that changes.
   - model_name: vlm-tagger
     litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
+      # 2.5-flash is closed to new API keys; Google's own 404 points here.
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
       # 12MB images, batched 6 to a grid; the grid is what is actually sent.
-      max_tokens: 2048
+      #
+      # 4096, NOT 2048. Gemini 3.x thinks by default and those reasoning tokens
+      # are charged against max_tokens before a single character of JSON is
+      # emitted — a measured 758 reasoning tokens against 4 of text. At 2048 a
+      # six-cell grid truncates mid-object and the whole batch is discarded as
+      # unparseable, which presents as the model failing rather than the
+      # ceiling being too low.
+      max_tokens: 4096
+      # Tagging is extraction against a fixed vocabulary, not a problem to
+      # reason about. Low keeps the thinking budget small so the ceiling above
+      # is spent on the answer.
+      reasoning_effort: low
       temperature: 0.0 # tagging is extraction, not generation
     model_info:
       mode: chat
@@ -60,9 +81,9 @@ model_list:
       # A SCHEMA-VALID response, not an empty one. An empty payload means
       # the tag stage's parse/validate/write path never runs locally, so
       # the first time it executes is against a paid provider. `material`
-      # is deliberately below its 0.60 review threshold so the
+      # is deliberately below its 0.60 review threshold (55 -> 0.55) so the
       # needs_review gate is exercised too.
-      mock_response: '{"items": [{"cell": "A1", "subcategory": "kurta", "material": "cotton", "formality": 3, "dress_code": "festive_ethnic", "warmth": 2, "fit": "relaxed", "confidence": {"subcategory": 0.82, "material": 0.55, "formality": 0.78, "dress_code": 0.71, "warmth": 0.8, "fit": 0.62}}, {"cell": "A2", "subcategory": "jeans", "material": "denim", "formality": 2, "dress_code": "casual", "warmth": 3, "fit": "slim", "confidence": {"subcategory": 0.91, "material": 0.88, "formality": 0.84, "dress_code": 0.86, "warmth": 0.75, "fit": 0.69}}]}'
+      mock_response: '{"items": [{"cell": "A1", "subcategory": "kurta", "material": "cotton", "formality": 3, "dress_code": "festive_ethnic", "warmth": 2, "fit": "relaxed", "confidence": {"subcategory": 82, "material": 55, "formality": 78, "dress_code": 71, "warmth": 80, "fit": 62}}, {"cell": "A2", "subcategory": "jeans", "material": "denim", "formality": 2, "dress_code": "casual", "warmth": 3, "fit": "slim", "confidence": {"subcategory": 91, "material": 88, "formality": 84, "dress_code": 86, "warmth": 75, "fit": 69}}]}'
       input_cost_per_token: 0
       output_cost_per_token: 0
     model_info:

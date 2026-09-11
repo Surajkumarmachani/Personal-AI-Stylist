@@ -49,7 +49,10 @@ logger = logging.getLogger(__name__)
 # Bump when the model, the prompt or the schema changes — all three change the
 # output distribution, and §D1 makes this the trigger for a re-extraction
 # backfill.
-EXTRACTOR_VERSION = "tag-vlm-v1"
+# v2: provider switched from openai/gpt-4o-mini to gemini/gemini-2.5-flash.
+# A different model is a different output distribution, so v1 rows are not
+# comparable to v2 rows and the §D1 backfill re-extracts them.
+EXTRACTOR_VERSION = "tag-vlm-v2"
 
 
 async def _run(ctx: JobContext) -> dict[str, Any]:
@@ -194,6 +197,28 @@ def _hint(record: dict[str, Any]) -> str:
     return ", ".join(parts) or "unknown"
 
 
+def _confidence(raw: Any) -> dict[str, float]:
+    """Integer percent from the model -> the 0-1 floats everything else uses.
+
+    The VLM schema asks for 0-100 integers because floats make Gemini's
+    decoder run away (see vlm_schema.MAX_SCHEMA_ENUM's neighbour comment), so
+    this is the one place the two representations meet.
+
+    A value of 0 or 1 is read as a PERCENT, not as an already-normalised
+    float — 1 becomes 0.01, not 1.0. That is deliberate: the two are genuinely
+    ambiguous, and being wrong in this direction under-states confidence and
+    sends the field to the user for review, while the other direction would
+    silently present a 1%-confident guess as certain.
+    """
+    if not isinstance(raw, dict):
+        return {}
+    return {
+        k: float(v) / 100.0
+        for k, v in raw.items()
+        if isinstance(v, int | float) and not isinstance(v, bool) and 0 <= v <= 100
+    }
+
+
 def _parse(
     content: str, taxonomy: Any, cell_to_garment: dict[str, str]
 ) -> list[dict[str, Any]] | None:
@@ -257,11 +282,7 @@ def _parse(
             {
                 "garment_id": garment_id,
                 "values": values,
-                "confidence": {
-                    k: float(v)
-                    for k, v in confidence.items()
-                    if isinstance(v, int | float) and 0 <= v <= 1
-                },
+                "confidence": _confidence(confidence),
                 "dropped": dropped,
                 "missing_required": sorted(missing),
                 "raw_item": item,
