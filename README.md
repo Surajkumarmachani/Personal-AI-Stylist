@@ -5,25 +5,45 @@ Western mixed wardrobes. Photograph your clothes, get them catalogued
 automatically, get outfit suggestions that account for weather, occasion and
 what you actually wear.
 
-**Status:** Phase 6 built — a photo is split into garments, cut out, coloured,
+**Status:** Phase 9 (partial) — a photo is split into garments, cut out, coloured,
 moderated in-VPC, tagged through the LiteLLM gateway, embedded in pgvector,
 checked for duplicates, and every field is correctable with the correction
 locked against future backfills. You can log wears, track laundry and
 cost-per-wear, and search or filter the wardrobe.
 
-It now also suggests outfits: weather and occasion resolve to warmth,
+Suggestions are now **reranked by an LLM behind a hard validator** (Phase 7).
+Six assertions from the architecture's §C3 sit between the model and the user —
+the load-bearing one checks output garment ids against input ids as an exact
+set, so a model cannot dress you in a garment you do not own, or in one
+belonging to somebody else. Every rejection falls back to the deterministic
+ranking, so killing the provider degrades the rationale and never the ranking.
+
+The model call happens in the **nightly job, not on your request**: a rerank
+takes 3-6s against a 1500ms budget, so rationales are precomputed into a cache
+and the morning request reads them in ~7-22ms.
+
+It also suggests outfits deterministically: weather and occasion resolve to warmth,
 formality and dress-code targets, candidates are assembled against
 table-driven slot rules (a saree needs a blouse; a dress and trousers is two
 outfits), and a six-term deterministic scorer ranks them with **zero model
 calls**. `GET /suggestions` serves the nightly precompute in ~7ms, or generates
 live in ~58ms when the requested context was never precomputed.
 
-Three things still need something other than code: **20 real users** and
-**≥2,000 real garments** for Phase 5's go/no-go, and a **provider key** (DPA
-outstanding) for a real cost-per-garment number, a correction rate that means
-anything, and the outfit blind eval — tags currently come from a deterministic
-mock, so suggestion *quality* is not yet measurable even though the pipeline is.
-See [build status](docs/implementation-plan.md#build-status).
+Tagging now runs against **real Gemini**, not the mock, so cost per garment is a
+real number (~$0.0023 per call, batch-of-1) and corrections mean something.
+
+Two things still need something other than code: **the owner's wardrobe
+photographed** — which is what Phase 5's go/no-go, the correction rate, the
+monthly cost and the outfit blind eval are all waiting on — and the **golden
+set**, which is labelled data rather than users and still does not exist, so
+accuracy remains unmeasured and the eval harness exits 2.
+
+This is a **single-user** product and the plan was revised to match on
+2026-09-15: the bar was 20 users and ≥2,000 garments, and it is now one real
+wardrobe, catalogued in full. That measures whether the pipeline is correct, not
+whether it generalises — see
+[build status](docs/implementation-plan.md#build-status) for what that buys and
+what it costs.
 
 ## Quickstart
 
@@ -84,8 +104,14 @@ onboarding flow ("start with your 20 most-worn") is built on.
 **A caveat worth knowing:** without a provider key, tagging runs against a
 deterministic mock that answers `kurta` for everything. Colours, cutouts,
 segmentation, embeddings and dedupe are all real work on your photos — only the
-category-ish fields are placeholders. Set `OPENAI_API_KEY` and
-`VLM_MODEL=vlm-tagger` in `.env` for real tags.
+category-ish fields are placeholders. Set `GEMINI_API_KEY` and
+`VLM_MODEL=vlm-tagger` in `.env` for real tags; the stack still starts, and the
+whole gateway path still runs, with neither.
+
+Note that `vlm-tagger` points at `gemini/`, which is Google AI Studio, whose
+free-tier terms permit training on what you submit — and what you submit is
+photographs of your clothes. Fine for development; production moves the row to
+`vertex_ai/`, which is what the outstanding DPA is about.
 
 Or drive it from the command line against the running stack:
 
@@ -97,7 +123,7 @@ make verify
 ### Development
 
 ```bash
-make test          # full suite — sets its own DB/redis/S3 env (192 tests)
+make test          # full suite — sets its own DB/redis/S3 env (332 tests)
 make test-strict   # same, but surfaces anything SKIPPED (a skip exits 0)
 make check         # taxonomy + lint + typecheck + test
 make logs          # follow all container logs

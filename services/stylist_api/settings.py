@@ -71,6 +71,35 @@ class Settings(BaseSettings):
     # `vlm-tagger-mock` locally: exercises the whole gateway path with no
     # credentials, which matters because Phase 0.3's DPA is outstanding.
     vlm_model: str = Field(default="vlm-tagger-mock")
+    # Phase 7's reranker. Points at the real row, which has NO mock twin — see
+    # the long note in litellm/config.yaml. Without a provider key the call
+    # fails and the suggestion degrades to deterministic order, so the degrade
+    # ladder is the uncredentialed default; with a key it actually reranks.
+    # A mock here would counterfeit `validator.reject{rule="unknown_id"}` on
+    # every request, because a fixed response cannot echo per-request uuids.
+    rerank_model: str = Field(default="outfit-reranker")
+    # §C3 assertion 6. Below this the model's outfit is kept but ranked under
+    # the deterministic order — an unsure model is not a lying model.
+    rerank_min_confidence: float = Field(default=0.5)
+
+    # ---- Google Calendar (Phase 8) ----
+    # Unset by default, exactly like the provider keys: the calendar feature
+    # degrades to "not connected" and every other path works untouched. A
+    # missing credential must never be a startup failure.
+    google_client_id: str = Field(default="")
+    google_client_secret: str = Field(default="")
+    # Must match a redirect URI registered on the OAuth client EXACTLY —
+    # Google compares the string, so a trailing slash is a different URI and
+    # produces `redirect_uri_mismatch` with no hint about which part differs.
+    google_redirect_uri: str = Field(default="http://localhost:8080/calendar/callback")
+
+    # ---- push notifications (Phase 8) ----
+    # PATH to a Firebase service-account JSON, never the key itself. A
+    # multi-line PEM inside an env var is mangled differently by every shell,
+    # .env parser and CI secret store, and the usual "fix" — stripping the
+    # newlines — produces an unparseable key and a stack trace three layers
+    # down. Unset disables push; nothing else changes.
+    firebase_credentials_file: str = Field(default="")
     # Free-tier monthly LLM+VLM budget per tenant (§B3). Enforced by LiteLLM as
     # a hard budget on the virtual key, not by feature code.
     free_tier_monthly_budget_usd: float = Field(default=0.15)

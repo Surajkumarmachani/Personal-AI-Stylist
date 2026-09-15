@@ -174,9 +174,23 @@ async def facets(user: CurrentUser, db: TenantDB) -> dict[str, Any]:
 
     A filter list built from the taxonomy alone offers 144 subcategories to a
     user with nine garments, and every click but a few returns nothing.
+
+    `subcategory`, `fit` and `pattern` are here for the PREFERENCE FACTS UI
+    rather than for search filtering. Same argument, higher stakes: a
+    preference picker listing all 144 subcategories invites a user to set a
+    rule about a garment type they do not own, which then does nothing and
+    teaches them the whole feature is decorative.
     """
     out: dict[str, Any] = {}
-    for column in ("slot", "primary_colour", "dress_code", "material"):
+    for column in (
+        "slot",
+        "primary_colour",
+        "dress_code",
+        "material",
+        "subcategory",
+        "fit",
+        "pattern",
+    ):
         rows = await db.execute(
             text(
                 f"""

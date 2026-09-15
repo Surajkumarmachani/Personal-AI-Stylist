@@ -63,6 +63,13 @@ API_5XX_CEILING = 0.01  # 1% of requests
 # Below this, a rate is noise: 2 failures out of 3 requests is 67% and means
 # nothing. Alerting on it teaches people the alert is wrong.
 MIN_SAMPLE_FOR_RATE = 20
+# Phase 7. "Rationale cache hit rate >= 50%" and "`validator.reject` rate < 2%".
+RATIONALE_HIT_FLOOR = 0.50
+VALIDATOR_REJECT_CEILING = 0.02
+# Both criteria are written over a week ("after a week of real traffic",
+# "overall"), which is why these read day buckets rather than the minute
+# buckets the 5xx rate uses.
+RERANK_WINDOW_DAYS = 7
 
 
 async def _dlq_age(session: Any) -> dict[str, Any]:
@@ -151,6 +158,116 @@ async def _api_5xx(cache: Any, window_minutes: int) -> dict[str, Any]:
         "counts": counts,
         "window_minutes": window_minutes,
         "response": "check the api container logs for tracebacks",
+    }
+
+
+async def _rerank_metrics(cache: Any, days: int) -> tuple[dict[str, int], dict[str, int]]:
+    """Sum the Phase 7 day buckets.
+
+    Key construction comes from `stylist_suggest.rerank.metric_keys`, shared
+    with the writer on purpose. A reader that builds its own key format is how
+    the Phase 5 alerts ended up querying an empty set while reporting healthy.
+    """
+    from stylist_suggest.rerank import CACHE_BUCKET, VALIDATOR_BUCKET, metric_keys
+
+    cache_keys = metric_keys(CACHE_BUCKET, days=days)
+    validator_keys = metric_keys(VALIDATOR_BUCKET, days=days)
+    buckets = await cache.read_buckets(cache_keys + validator_keys)
+
+    def merge(raw: list[dict[str, str]]) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for bucket in raw:
+            for field, value in (bucket or {}).items():
+                try:
+                    out[field] = out.get(field, 0) + int(value)
+                except (TypeError, ValueError):
+                    continue
+        return out
+
+    return merge(buckets[: len(cache_keys)]), merge(buckets[len(cache_keys) :])
+
+
+async def _rationale_cache_hit_rate(counts: dict[str, int], days: int) -> dict[str, Any]:
+    """§7.3: alert below a 50% hit rate.
+
+    Counted per LOOKUP, not per request. The first version incremented each of
+    `hit` and `miss` once per request, so a request finding 1 of 5 reported a
+    50% hit rate against a true 20% — landing exactly on the threshold this
+    alert is built to detect.
+    """
+    hits, misses = counts.get("hit", 0), counts.get("miss", 0)
+    total = hits + misses
+    rate = (hits / total) if total else None
+    return {
+        "alert": "rationale_cache_hit_rate",
+        "firing": bool(
+            total >= MIN_SAMPLE_FOR_RATE and rate is not None and rate < RATIONALE_HIT_FLOOR
+        ),
+        "rate": round(rate, 4) if rate is not None else None,
+        "threshold": RATIONALE_HIT_FLOOR,
+        "lookups": total,
+        "measured": total >= MIN_SAMPLE_FOR_RATE,
+        "window_days": days,
+        "response": (
+            "check that the nightly precompute ran and that /suggestions and the "
+            "precompute agree on outfit order (score DESC, garment_set_hash)"
+        ),
+    }
+
+
+async def _validator_reject_rate(counts: dict[str, int], days: int) -> dict[str, Any]:
+    """§C3/§7: alert above a 2% reject rate, broken down by rule.
+
+    The breakdown is the point. `unknown_id` climbing means the prompt or model
+    regressed; `inactive` climbing means the precompute is serving stale
+    outfits. One number cannot distinguish them, and the response differs.
+    """
+    attempts = counts.get("attempts", 0)
+    rejected = counts.get("rejected", 0)
+    rate = (rejected / attempts) if attempts else None
+    return {
+        "alert": "validator_reject_rate",
+        "firing": bool(
+            attempts >= MIN_SAMPLE_FOR_RATE and rate is not None and rate > VALIDATOR_REJECT_CEILING
+        ),
+        "rate": round(rate, 4) if rate is not None else None,
+        "threshold": VALIDATOR_REJECT_CEILING,
+        "attempts": attempts,
+        "accepted": counts.get("accepted", 0),
+        "rejected": rejected,
+        "measured": attempts >= MIN_SAMPLE_FOR_RATE,
+        "by_rule": {k[5:]: v for k, v in sorted(counts.items()) if k.startswith("rule:")},
+        "window_days": days,
+        "response": "unknown_id -> prompt/model regression; inactive -> stale precompute",
+    }
+
+
+@router.get("/ops/rerank")
+async def rerank_health(
+    user: CurrentUser,
+    cache: CacheRedisDep,
+    days: Annotated[int, Query(ge=1, le=14)] = RERANK_WINDOW_DAYS,
+) -> dict[str, Any]:
+    """Phase 7's two rate criteria, as data.
+
+    Separate from `/ops/alerts` because that endpoint carries the four alerts
+    §D3 specifies and "resist adding more" is written into the plan next to
+    them. These are exit criteria being tracked toward a threshold, not pages
+    someone should be woken for.
+    """
+    cache_counts, validator_counts = await _rerank_metrics(cache, days)
+    checks = [
+        await _rationale_cache_hit_rate(cache_counts, days),
+        await _validator_reject_rate(validator_counts, days),
+    ]
+    return {
+        "checks": checks,
+        "firing": sum(1 for c in checks if c["firing"]),
+        # An unmeasured criterion is NOT a passing one. Reporting `ok: true`
+        # over three samples is how "not measured" quietly becomes "measured
+        # and fine" — the exact failure the eval harness exits 2 to avoid.
+        "measured": all(c["measured"] for c in checks),
+        "ok": all(not c["firing"] for c in checks),
     }
 
 

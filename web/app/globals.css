@@ -229,3 +229,56 @@ button.ghost { background: transparent; color: var(--ink); }
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all;
 }
 .prov .provwarn { color: #8a5a12; }
+
+/* ---- preference facts ------------------------------------------------
+   Colour carries the MEANING here, not decoration: `never` and `avoids` do
+   different things to your suggestions, and a user scanning the list should
+   be able to tell them apart without reading the group heading again. */
+.pref-add {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: flex-end;
+  margin: 12px 0;
+}
+.pref-add label { display: flex; flex-direction: column; gap: 3px; font-size: 13px; }
+.pref-add select { min-width: 140px; }
+
+.pref-groups { display: flex; flex-direction: column; gap: 14px; margin-top: 8px; }
+.pref-group h3 { margin: 0 0 6px; font-size: 14px; font-weight: 600; }
+.pref-list { display: flex; flex-wrap: wrap; gap: 8px; list-style: none; padding: 0; margin: 0; }
+
+.pref-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 6px 4px 10px;
+  border-radius: 999px;
+  border: 1px solid;
+  font-size: 13px;
+}
+/* Red for "never" and amber for "avoids" — the same severity ordering the
+   pipeline applies, so the colour is not a separate thing to learn. */
+.pref-never  { border-color: #e6b3b3; background: #fdf3f3; }
+.pref-avoids { border-color: #f0d3a8; background: #fffaf2; }
+.pref-prefers{ border-color: #c7dcc7; background: #f4f9f4; }
+
+.pref-field { color: var(--muted); font-size: 12px; }
+.pref-inferred {
+  font-size: 11px;
+  color: var(--muted);
+  border: 1px dashed currentColor;
+  border-radius: 4px;
+  padding: 0 4px;
+}
+.pref-remove {
+  border: none;
+  background: transparent;
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 4px;
+  color: var(--muted);
+}
+.pref-remove:hover:not(:disabled) { color: #b00020; }
+.small { font-size: 12px; }

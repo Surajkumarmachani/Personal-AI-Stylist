@@ -156,6 +156,26 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
                     w.last_worn IS NULL
                  OR w.last_worn < CURRENT_DATE - make_interval(days => :recent_days)
               )
+              -- PREFERENCE FACTS, kind='never'. A hard exclusion, because that
+              -- is what the word means: "never yellow" is not "yellow ranks
+              -- lower". `avoids` is applied in Python below, where it can be
+              -- relaxed rather than emptying a slot.
+              --
+              -- `preference_fact` is RLS-scoped like every other tenant table,
+              -- so this needs no user_id predicate and cannot read anyone
+              -- else's rules.
+              AND NOT EXISTS (
+                SELECT 1 FROM preference_fact pf
+                WHERE pf.kind = 'never'
+                  AND (
+                       (pf.field_name = 'subcategory' AND pf.field_value = g.subcategory::text)
+                    OR (pf.field_name = 'primary_colour'
+                        AND pf.field_value = g.primary_colour::text)
+                    OR (pf.field_name = 'material' AND pf.field_value = g.material::text)
+                    OR (pf.field_name = 'fit'      AND pf.field_value = g.fit::text)
+                    OR (pf.field_name = 'pattern'  AND pf.field_value = g.pattern::text)
+                  )
+              )
             """
         ),
         {
@@ -186,6 +206,8 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
         )
         pool.by_slot.setdefault(item.slot, []).append(item)
 
+    await _apply_avoids(session, pool)
+
     # Fail fast and SAY WHY. A wardrobe with no footwear can produce no valid
     # outfit at all, and discovering that after scoring 400 candidates is both
     # wasted work and an unexplained empty screen.
@@ -199,6 +221,63 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
         readable = " or ".join("+".join(s) for s in base_structures())
         pool.notes.append(f"no complete base structure available ({readable})")
     return pool
+
+
+# The garment attributes a preference fact can name. Kept in sync with
+# `FACT_FIELDS` in the feedback router, which refuses to store a fact about
+# anything else — a fact the pipeline cannot apply is a promise to the user
+# that nothing keeps.
+FACT_ATTRS = ("subcategory", "primary_colour", "material", "fit", "pattern")
+
+
+async def _apply_avoids(session: Any, pool: CandidatePool) -> None:
+    """Apply `avoids` facts per slot, RELAXING rather than emptying a slot.
+
+    `never` is enforced in SQL because it is absolute. `avoids` is softer by
+    design — "I avoid crop tops" means "not usually", not "I would rather have
+    no outfit" — so it is applied here, where the pool is visible and the rule
+    can be dropped for a slot it would otherwise empty.
+
+    That relaxation is the whole reason this is not another SQL predicate. A
+    wardrobe of nine shirts, six of which the user avoids, should still produce
+    an outfit; a hard filter would return an empty screen and the user would
+    have no way to connect it to a preference they set weeks ago. When it
+    happens the pool SAYS SO, so the UI can explain rather than just showing
+    less.
+    """
+    rows = await session.execute(
+        text("SELECT field_name, field_value FROM preference_fact WHERE kind = 'avoids'")
+    )
+    avoids = [(r["field_name"], r["field_value"]) for r in rows.mappings()]
+    if not avoids:
+        return
+
+    def matches(item: ScoredGarment) -> bool:
+        return any(
+            field in FACT_ATTRS and getattr(item, field, None) == value for field, value in avoids
+        )
+
+    relaxed: list[str] = []
+    applied = 0
+    for slot, items in pool.by_slot.items():
+        kept = [i for i in items if not matches(i)]
+        if not kept and items:
+            # Dropping this rule beats returning nothing. Recorded so the
+            # caller can tell the user their preference was overridden — a
+            # silently ignored rule is how a legible system stops being
+            # trusted.
+            relaxed.append(slot)
+            continue
+        applied += len(items) - len(kept)
+        pool.by_slot[slot] = kept
+
+    if applied:
+        pool.notes.append(f"{applied} garment(s) hidden by your 'avoids' preferences")
+    for slot in relaxed:
+        pool.notes.append(
+            f"your 'avoids' preference was relaxed for {slot} — "
+            f"nothing else in your wardrobe fits today's outfit"
+        )
 
 
 def _pick_anchors(

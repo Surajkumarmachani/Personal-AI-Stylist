@@ -1,0 +1,120 @@
+# Calendar event title -> occasion (Phase 8).
+#
+# WHY THIS IS DATA AND NOT CODE
+# -----------------------------
+# These are product decisions that will be argued about ("is 'lunch' a
+# casual_outing or a dinner_date?") and tuned against real calendars. Encoding
+# them in Python would make every adjustment a deploy and a code review of
+# logic rather than of vocabulary. Same argument as `outfit_rules` in
+# taxonomy.yaml and the weights in scoring.yaml.
+#
+# WHY NOT taxonomy.yaml
+# ---------------------
+# taxonomy.yaml is FROZEN at v1.0.0 and its enums generate Postgres types.
+# Calendar keywords are neither an enum nor a type — they are a heuristic that
+# will churn — so mixing them in would make a volatile file out of a stable
+# one. `occasion` values here are validated against the taxonomy at load.
+#
+# WHY KEYWORDS AND NOT A MODEL
+# ----------------------------
+# An LLM would classify better and could not explain itself in a way the UI can
+# show. The plan requires that a below-threshold match "fall back to default AND
+# SAY SO", which means the user has to be told what was matched and why —
+# "matched 'standup' -> office_casual" is answerable from a keyword; "the model
+# said 0.62" is not. This also keeps a calendar sync off the paid path entirely.
+#
+# Event titles are user data. Nothing here is logged with the title attached.
+
+version: 1
+
+# Below this, we do NOT claim an occasion. The plan: "A confidently wrong
+# occasion is worse than asking." Deliberately high — most calendar entries are
+# "Sync", "1:1", "Lunch", which say nothing about clothes, and a system that
+# guesses office_formal from "1:1 w/ Anita" is worse than one that says
+# "couldn't tell".
+confidence_floor: 0.60
+
+# What we fall back to, reported explicitly rather than silently assumed.
+default_occasion: office_casual
+
+# Each rule: the occasion, the phrases that imply it, and the confidence a
+# match earns. Matching is case-insensitive on WORD BOUNDARIES — substring
+# matching turns "reinterview" and "winterview" into interviews, and
+# "gymnastics class" into a workout.
+#
+# Confidence reflects how strongly the phrase implies CLOTHING, not how common
+# the event is. "Interview" is near-certain; "lunch" is a coin flip between a
+# desk sandwich and a restaurant, so it sits under the floor on its own and
+# only clears it in combination.
+rules:
+  - occasion: interview
+    confidence: 0.95
+    phrases: [interview, "panel interview", "hiring loop", "onsite interview"]
+
+  - occasion: client_meeting
+    confidence: 0.85
+    phrases: [client, customer visit, "client call", pitch, "board meeting", investor]
+
+  - occasion: office_formal
+    confidence: 0.75
+    phrases: [presentation, keynote, offsite, "all hands", "town hall", "review board"]
+
+  - occasion: office_casual
+    confidence: 0.70
+    phrases: [standup, "stand-up", sprint, retro, retrospective, "1:1", sync, "team meeting"]
+
+  - occasion: wfh
+    confidence: 0.80
+    phrases: [wfh, "work from home", "remote day", "focus time", "no meetings"]
+
+  - occasion: workout
+    confidence: 0.90
+    phrases: [gym, workout, yoga, pilates, run, "training session", swim, cycling]
+
+  - occasion: dinner_date
+    confidence: 0.75
+    phrases: [dinner, date night, anniversary, "dinner with"]
+
+  - occasion: party_night
+    confidence: 0.80
+    phrases: [party, birthday, "night out", drinks, celebration, farewell]
+
+  - occasion: travel_day
+    confidence: 0.85
+    phrases: [flight, airport, train, "travel to", departure, "pick up from"]
+
+  - occasion: wedding_ceremony
+    confidence: 0.90
+    phrases: [wedding, nikah, "muhurtham", vivah, "baraat"]
+
+  - occasion: wedding_reception
+    confidence: 0.85
+    phrases: [reception, walima]
+
+  - occasion: mehendi
+    confidence: 0.92
+    phrases: [mehendi, mehndi, haldi]
+
+  - occasion: sangeet
+    confidence: 0.92
+    phrases: [sangeet]
+
+  - occasion: festival_day
+    confidence: 0.85
+    phrases: [diwali, holi, eid, onam, pongal, navratri, dussehra, ganesh, christmas]
+
+  - occasion: temple_visit
+    confidence: 0.85
+    phrases: [temple, puja, pooja, darshan, aarti, mandir]
+
+  - occasion: funeral
+    confidence: 0.95
+    phrases: [funeral, memorial, "prayer meet", cremation]
+
+  - occasion: black_tie_event
+    confidence: 0.90
+    phrases: [black tie, gala, "awards night", "formal dinner"]
+
+  - occasion: casual_outing
+    confidence: 0.55 # under the floor on its own, and that is intentional
+    phrases: [coffee, lunch, brunch, catch up, "meet up", shopping, movie]

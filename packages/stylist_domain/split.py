@@ -20,6 +20,36 @@ FOUR RULES, EACH EARNING ITS PLACE
    unpredictable mix of Skirt + Dress + Scarf. Emitting three wrong garments
    from one saree is worse than asking, because the user then has to find and
    delete two phantoms.
+5. DO NOT SPLIT A FLAT-LAY. See below — this is the rule that matters most in
+   practice, because flat-lays are how people actually photograph clothes.
+
+THE MODEL PARSES PEOPLE, AND MOST PHOTOS HAVE NO PERSON IN THEM
+----------------------------------------------------------------
+`segformer_b2_clothes` is a HUMAN PARSING model: it assigns every pixel of a
+photo of a PERSON to a body-or-garment region. Give it a flat-lay — a garment
+on a bed or a white background, no person — and it has nothing to parse. It
+does not decline; it carves the image into regions and labels each with
+whichever ATR class the shape resembles.
+
+Measured on three flat-lay photos of jeans:
+
+    photo A -> "Upper-clothes" + "Bag"   (2 garments from one pair of jeans)
+    photo B -> "Dress"                   (slot full_body)
+    photo C -> "Upper-clothes"           (slot upper_base)
+
+Not one produced `Pants`. The masks were also fragmentary — the cutouts came
+out punched full of holes, because the model was splitting one garment across
+regions it was not confident about.
+
+So when no person is detected, the whole photo is ONE garment and the mask is
+the matte, not a parse. That is both more accurate and strictly cheaper. The
+`skin_pct` signal this needs was already being computed and reported; nothing
+branched on it until now.
+
+The cost of being wrong is asymmetric, which sets the direction of the
+threshold: treating a worn photo as a flat-lay yields one garment the user can
+correct, while treating a flat-lay as worn yields several phantom garments they
+must find and delete — and a torn cutout that looks like a broken product.
 """
 
 from __future__ import annotations
@@ -142,6 +172,33 @@ def split_masks(masks: list[MaskInfo], *, skin_pct: float = 0.0) -> SplitResult:
     """
     is_worn = skin_pct >= WORN_SKIN_THRESHOLD
     dropped: list[str] = []
+
+    # RULE 5: a flat-lay is one garment, not a parse.
+    #
+    # No person in frame means the human-parsing model had nothing to parse and
+    # its class labels are shape guesses. Emitting one whole-frame candidate
+    # with NO slot hint is the honest result: we know there is a garment here,
+    # we do not know from this model what kind, and the VLM — which looks at
+    # the actual garment rather than at body regions — answers that far better.
+    if not is_worn:
+        return SplitResult(
+            outcome=SplitOutcome.OK,
+            candidates=(
+                GarmentCandidate(
+                    # None, NOT the model's guess. `upper_base` on a pair of
+                    # jeans is worse than an honest unknown, because a wrong
+                    # slot silently excludes the garment from every outfit that
+                    # needs a `lower`.
+                    slot_hint=None,
+                    atr_labels=("flat_lay",),
+                    area_pct=1.0,
+                    bbox=(0, 0, 0, 0),  # whole frame; the matte defines the edges
+                    mask_indices=(),
+                ),
+            ),
+            dropped=tuple(f"{m.atr_label} (flat-lay: not split)" for m in masks),
+            is_worn=False,
+        )
 
     kept = []
     for mask in masks:

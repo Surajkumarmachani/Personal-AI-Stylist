@@ -239,6 +239,19 @@ services:
       S3_SECRET_KEY: minioadmin
       LITELLM_BASE_URL: http://litellm:4000
       LITELLM_MASTER_KEY: sk-master-local-only
+      # The API does not TAG, but it REPORTS which model tagging uses, and a
+      # service that does not know cannot report honestly. Without this the
+      # eval page read the `vlm-tagger-mock` default and warned that tagging
+      # was a stand-in while the worker was calling real Gemini — a banner
+      # lying in the direction that makes people distrust correct output.
+      VLM_MODEL: ${VLM_MODEL:-vlm-tagger-mock}
+      # Phase 8 calendar link, read from .env. Unset by default: the feature
+      # reports "not connected" and every other path is untouched. The redirect
+      # URI must match one registered on the OAuth client EXACTLY — Google
+      # compares the string, so a trailing slash is a different URI.
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8080/calendar/callback}
     ports:
       - "8080:8000"
     command: uvicorn stylist_api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -246,8 +259,19 @@ services:
       - ../../packages:/app/packages
       - ../../services:/app/services
       - ../../config:/app/config
+    # /readyz, NOT /healthz.
+    #
+    # Measured during the 2026-09-15 game day: with Postgres stopped, every
+    # request returned 500 for the whole outage while this container reported
+    # `Up (healthy)` — because /healthz is LIVENESS and deliberately touches no
+    # dependency. That is correct for a restart policy and useless as the
+    # thing a human glances at, which is what compose's status column is.
+    #
+    # /readyz is safe to use here now that only Postgres and redis_queue are
+    # fatal to it: a cache or ml outage reports in `dependencies` and does not
+    # flip the container unhealthy.
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')\""]
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/readyz')\""]
       interval: 3s
       timeout: 3s
       retries: 20
@@ -281,11 +305,16 @@ services:
       # whole gateway path runs without credentials; `vlm-tagger` once a
       # provider key and a signed DPA exist.
       VLM_MODEL: ${VLM_MODEL:-vlm-tagger-mock}
+      # Phase 8 push. A PATH inside the container; the file is mounted
+      # read-only below from ./secrets, which is gitignored.
+      FIREBASE_CREDENTIALS_FILE: ${FIREBASE_CREDENTIALS_FILE:-}
     command: arq stylist_worker.main.WorkerSettings
     volumes:
       - ../../packages:/app/packages
       - ../../services:/app/services
       - ../../config:/app/config
+      # Read-only: the worker sends push, it never writes credentials.
+      - ../../secrets:/app/secrets:ro
     # Without a healthcheck, `compose up --wait` only waits for the container
     # to be RUNNING — so a worker that starts and immediately dies reports as
     # started and the failure is invisible. This reads the health record arq

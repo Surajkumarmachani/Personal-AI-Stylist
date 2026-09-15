@@ -26,6 +26,9 @@ from sqlalchemy import text
 from stylist_api.settings import get_settings
 from stylist_db.session import dispose_engine, init_engine, system_session
 from stylist_obs import configure_tracing
+from stylist_worker.erasure import drain_erasures
+from stylist_worker.export import build_export, sweep_expired_exports
+from stylist_worker.notify import hourly_digest
 from stylist_worker.precompute import nightly_precompute
 from stylist_worker.relay import relay_outbox
 from stylist_worker.stages import INGEST_STAGES
@@ -83,7 +86,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions = [ingest_photo, ping]
+    functions = [ingest_photo, build_export, ping]
 
     # The relay tick. 1s rather than the plan's 250ms: at 250ms this is 4
     # queries/second/replica against Postgres forever, and the ingest UX
@@ -99,6 +102,28 @@ class WorkerSettings:
         # max_tries=1: a failed nightly run should wait for tomorrow, not
         # retry into the morning traffic it was scheduled to avoid.
         cron(nightly_precompute, hour={3}, minute={15}, max_tries=1),
+        # EVERY HOUR, on purpose. The plan says "07:00 local", and there is no
+        # single moment that is 07:00 — it happens 24+ times a day across
+        # zones. Each run sends only to tenants for whom it is currently 07:00
+        # where they are; a daily cron at a fixed UTC hour would notify
+        # everyone at 07:00 in one arbitrary place, i.e. the middle of the
+        # night for most of them.
+        #
+        # No advisory lock, unlike the precompute: `push_send`'s unique index
+        # on (user_id, kind, sent_on) already makes a duplicate run a no-op,
+        # and it does so PER TENANT, which is stronger than a job-wide lock
+        # that would have to be held for the whole sweep.
+        cron(hourly_digest, minute={0}, max_tries=1),
+        # Erasure has a 30-day LEGAL deadline, so it retries often rather than
+        # nightly: a provider outage at 03:15 must not cost a whole day of a
+        # deadline nobody can extend. Resumption is free — completed steps are
+        # recorded and skipped — so a run with nothing to do is one query.
+        cron(drain_erasures, minute={10, 40}, max_tries=1),
+        # Hourly, not daily: an export is a complete second copy of a
+        # wardrobe, and §C5 gives it 7 days. A daily sweep would leave one
+        # sitting up to 24 hours past its stated life — a window that exists
+        # for no reason anyone could defend.
+        cron(sweep_expired_exports, minute={25}, max_tries=1),
     ]
 
     on_startup = startup

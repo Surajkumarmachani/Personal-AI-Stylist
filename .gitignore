@@ -17,3 +17,14 @@ models/*
 web/.next/
 web/next-env.d.ts
 *.tsbuildinfo
+
+# Service-account credentials. A Firebase/GCP service account JSON carries a
+# PRIVATE KEY that can act as the project — committing one is the single most
+# common way these leak, and git history makes it unrecoverable without a
+# rewrite. Broad patterns on purpose: the default download name is
+# `<project>-firebase-adminsdk-<hash>-<id>.json`, which matches nothing
+# obvious, so the directory is ignored wholesale rather than by filename.
+secrets/
+*service-account*.json
+*adminsdk*.json
+*-firebase-*.json

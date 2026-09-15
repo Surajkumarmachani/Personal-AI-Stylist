@@ -66,11 +66,25 @@ TEST_ENV := MIGRATION_DATABASE_URL="$(TEST_OWNER_DSN)" \
             U2NET_HOME="$(PWD)/models/u2net"
 
 test:
-	$(TEST_ENV) pytest -v
+	$(TEST_ENV) pytest -v $(PYTEST_ARGS)
 
 test-strict:       ## fail if anything SKIPPED — catches a misconfigured env
 	$(TEST_ENV) pytest -q -rs --strict-markers
 	@echo "note: review the 's' lines above; a skip is not a pass"
+
+# The LIVE database, not $(TEST_ENV)'s. Backing up `stylist_test` would
+# produce a file that restores cleanly and contains none of the data — a
+# backup that passes every check except the one that matters.
+OWNER_DSN := postgresql://stylist_owner:stylist_owner_local_only@localhost:55432/stylist
+
+backup:            ## logical dump of the live DB to object storage
+	MIGRATION_DATABASE_URL="$(OWNER_DSN)" S3_BUCKET=stylist-local \
+	  S3_ENDPOINT_URL=http://localhost:9000 S3_ACCESS_KEY=minioadmin \
+	  S3_SECRET_KEY=minioadmin PYTHONPATH=scripts:packages:services python scripts/backup.py
+
+restore-drill:     ## restore into a scratch DB and VERIFY it (records the RTO floor)
+	MIGRATION_DATABASE_URL="$(OWNER_DSN)" PYTHONPATH=scripts:packages:services \
+	  python scripts/restore_drill.py
 
 lint:
 	ruff check packages services tests scripts

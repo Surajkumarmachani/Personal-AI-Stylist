@@ -89,6 +89,47 @@ model_list:
     model_info:
       mode: chat
 
+  # ---- the reranker: Phase 7, and a DIFFERENT policy to tagging -----------
+  #
+  # Tagging is async-plane work nobody waits for: 180s, two retries, batched.
+  # The reranker sits on a user-facing GET with a 1500ms SLO, so it gets the
+  # opposite of all three. The timeout (1200ms) and `num_retries: 0` are sent
+  # PER REQUEST by the client rather than set here, because `num_retries: 2` in
+  # litellm_settings below is global — a retry inside a 1200ms budget cannot
+  # make the SLO, it can only turn one slow response into a breach.
+  #
+  # Text in, text out. No images ever reach this row: eight outfits of pixels
+  # cannot be done in 1200ms, and the tags already ARE the extraction.
+  - model_name: outfit-reranker
+    litellm_params:
+      model: gemini/gemini-3.6-flash
+      api_key: os.environ/GEMINI_API_KEY
+      # ~1.2k in / 300 out per §7.1, plus headroom for Gemini's reasoning
+      # tokens, which are charged against max_tokens before any JSON appears.
+      max_tokens: 2048
+      reasoning_effort: low
+      temperature: 0.0
+    model_info:
+      mode: chat
+
+  # THERE IS DELIBERATELY NO `outfit-reranker-mock`, and the reason is worth
+  # recording because tagging DOES have one.
+  #
+  # A mock answers with a fixed string. The reranker's response must echo the
+  # GARMENT IDS it was sent — uuids generated per request — so a static mock
+  # response can only ever contain ids that are not in the input set. Every
+  # local request would then fail §C3 assertion 2, and `validator.reject` would
+  # sit at 100% with `rule="unknown_id"`. That metric is this phase's earliest
+  # quality signal and has a <2% exit criterion; pinning it at 100% locally
+  # would bury the real thing it exists to detect under noise we manufactured.
+  #
+  # So the local posture is Phase 4's, not Phase 4's mock: with no key the row
+  # below fails, the client raises `LiteLLMUnavailable`, and the suggestion
+  # degrades to deterministic order with a template rationale — the DEGRADE
+  # ladder as the default, exercised on every request rather than in a drill,
+  # and with no counterfeit rejections. The ACCEPT path is covered by
+  # tests/test_rerank.py against a fake gateway, where ids can be echoed.
+
   # ---- self-hosted, priced at zero ---------------------------------------
   #
   # Routed through the gateway for uniform observability, and priced at zero so

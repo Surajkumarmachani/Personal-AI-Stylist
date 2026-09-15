@@ -28,7 +28,7 @@ P0 taxonomy + golden set --+--> P1 skeleton + tenancy --> P2 ingest (no AI)
                                         P4 VLM + correction UI
                                                   |
                                                   v
-                                          P5 MVP SHIP -- 20 users
+                                       P5 MVP SHIP -- owner's wardrobe
                                                   |
                                                   v
                                  P6 suggest pipeline (deterministic)
@@ -485,7 +485,16 @@ Replace the Phase 2 stub. NSFW + non-garment classifier, local. Flag → `QUARAN
 
 # PHASE 5 — MVP ship (week 5)
 
-Goal: 20 real users cataloguing real wardrobes. No recommendations yet.
+Goal: one real wardrobe — the owner's — catalogued in full. No recommendations yet.
+
+**REVISED 2026-09-15: single-user, from 20.** This was written as a startup
+validation bar, and the product is a personal stylist for its owner. Twenty
+strangers' wardrobes answered "will this work for people who are not me", which
+is not a question this project is asking. The honest consequence is recorded in
+the exit criteria below: n=1 measures whether the pipeline is CORRECT, never
+whether it GENERALISES. Any accuracy number from here describes one person's
+clothes, one camera and one reading of the taxonomy, and must be quoted that
+way.
 
 - **Dedupe**: perceptual hash + embedding cosine > 0.95 within tenant → `DUPLICATE_SUSPECT`, ask the user. Never auto-merge.
 - **Wear log + laundry state**: `worn_on`, `needs_wash`, cost-per-wear.
@@ -494,9 +503,9 @@ Goal: 20 real users cataloguing real wardrobes. No recommendations yet.
 - **Onboarding**: "start with your 20 most-worn" flow. Every comparison review says this is what separates users who stick from users who abandon.
 
 **PHASE 5 EXIT CRITERIA**
-- [ ] 20 users, ≥2,000 garments ingested
-- [ ] p95 ingest-to-`CLASSIFIED` < 60s under real load
-- [ ] Correction rate per field measured on real data (compare to golden set — a big gap means your golden set isn't representative)
+- [ ] 1 user (the owner), **entire real wardrobe** ingested — not a sample. The count is whatever you own; "all of it" is the bar, because a wardrobe cherry-picked for photogenic items is the same self-selection that made 20 strangers worth asking for in the first place.
+- [ ] p95 ingest-to-`CLASSIFIED` < 60s **on a real burst** — "under real load" is not measurable at n=1. Substitute: ingest the wardrobe in one sitting and read p95 off `/ops/dashboards`. This tests the queue, not concurrent tenants; RLS and multi-tenancy stay covered by the test suite, which does not need users.
+- [ ] Correction rate per field measured on the owner's real wardrobe (compare to golden set — a big gap means the golden set isn't representative). **At n=1 this is a signal, not a statistic:** it catches a field that is systematically wrong, which is what the ≈20% trigger is for. It cannot distinguish "the model is bad at sarees" from "I own unusual sarees."
 - [ ] Zero cross-tenant incidents
 - [ ] Cost per user per month measured
 
@@ -560,7 +569,7 @@ Materialise the top ~200 scored outfits into `outfits`. Invalidation on wardrobe
 - [ ] Slot-rule property tests green, including composite ethnic garments
 - [ ] Nightly precompute: 3 cron replicas → exactly 1 execution
 - [ ] Candidate generation < 100ms for a 400-item wardrobe
-- [ ] Internal blind eval: you and 2 others rate 50 outfits; ≥60% "would wear." Below that, fix the scorer — the LLM will not save a bad candidate set.
+- [ ] Internal blind eval: 50 outfits, ≥60% "would wear." Below that, fix the scorer — the LLM will not save a bad candidate set. _Revised 2026-09-15 with Phase 5: the raters were "you and 2 others". **Keep the 2 others.** This is the one place the single-user decision should NOT propagate — the rater is judging whether an outfit is wearable, not whose wardrobe it came from, and one rater grading suggestions built from their own clothes has no way to separate "this is a good outfit" from "this is what I would have picked anyway", which is exactly the bias the eval exists to detect. Two outside raters cost an hour and are the cheapest input in this project._
 
 ---
 
@@ -607,7 +616,7 @@ Key: `(garment_set_hash, occasion_bucket, temp_bucket, precip_bool)`. **Bucket t
 - **Daily push**: 07:00 local, `w-notify`.
 
 **PHASE 8 EXIT CRITERIA**
-- [ ] 200 users on V1
+- [ ] V1 in daily use by the owner for **4 consecutive weeks** — was "200 users", revised 2026-09-15 with Phase 5. Sustained daily use is the single-user substitute for a user count: it is the only way the feedback loop below accumulates enough events to mean anything, and it fails honestly if the product is not actually useful. Note this makes the bar SLOWER, not weaker — 200 users generate 5k feedback events in days, one user takes weeks, and Phase 11 gates on exactly that.
 - [ ] Boards render < 200ms p95 from CDN
 - [ ] `rebuild_style_vectors.py` reproduces live vectors from the event log (assert equality)
 - [ ] **Wear-through rate measured** (suggested → actually worn) — the only quality metric that matters
@@ -652,6 +661,17 @@ Then: consent flow (separate record, timestamped, independently revocable) → `
 
 Only now, with ≥5k feedback events: Thompson-sampling bandit (85/15 exploit/explore), then a learned compatibility model (OutfitTransformer or MCN fine-tuned on Polyvore then on your feedback) replacing `colour_harmony + formality_coherence`, gated by feedback-replay eval. Trends last, on licensed or first-party sources only, capped at ≤10% of score.
 
+**The 5k gate does not move for n=1, and this is the phase the single-user
+decision hurts most.** One person generating a handful of feedback events a day
+reaches 5k in a couple of years, not a couple of weeks. The number is not
+arbitrary padding — a learned compatibility model fitted to a few hundred events
+memorises one person's recent choices and reports it as taste, and the
+feedback-replay eval that is supposed to catch that is fitted on the same thin
+data. So the realistic reading is that **Phase 11 is out of reach at n=1**, and
+the deterministic scorer from Phase 6 is the long-term answer rather than a
+placeholder. Revisit only if the user count ever changes; do not compensate by
+lowering the gate.
+
 ---
 
 ## Weekly operating cadence
@@ -677,7 +697,8 @@ Only now, with ≥5k feedback events: Thompson-sampling bandit (85/15 exploit/ex
 
 ## Build status
 
-_Last updated 2026-09-09._
+_Last updated 2026-09-15 — Phases 7-8 built; real Gemini tags live, and the user-count bar
+revised from 20 users to the owner alone. See the dated entry at the end._
 
 ### Phase 0 — Decide and prepare · COMPLETE (0.1) / IN PROGRESS (0.2, 0.3)
 
@@ -1035,15 +1056,19 @@ stage would duplicate that with worse information.
 Dedupe (phash + cosine > 0.95), wear log, search and filters, minimum-viable
 observability, and the "start with your 20 most-worn" onboarding flow.
 
-**Phase 5's exit criteria are the first that cannot be faked at all**: 20 real
-users, ≥2,000 garments, and correction rate measured on real wardrobes. The
-plan calls that "the real go/no-go" — if correction rate exceeds ~20% on any
-field, ingestion gets fixed before anything is built on those tags. The
+**Phase 5's exit criteria are the first that cannot be faked at all**: a real
+wardrobe, fully catalogued, and correction rate measured on it. The plan calls
+that "the real go/no-go" — if correction rate exceeds ~20% on any field,
+ingestion gets fixed before anything is built on those tags. The
 `/ops/correction-rate` endpoint and the in-app rate strip built in this phase
 are what that decision will be read from.
 
-Three things now sit on the critical path and none of them is code: the **500
-golden-set images**, a **provider key + signed DPA**, and **20 users**.
+_Revised 2026-09-15: the bar was 20 users and ≥2,000 garments. See Phase 5's
+goal above for what n=1 does and does not buy._
+
+Two things now sit on the critical path and neither is code: the
+**golden-set images**, and the **owner's wardrobe photographed**. The provider
+key is no longer one of them — see the 2026-09-15 entry below.
 
 ---
 
@@ -1334,25 +1359,40 @@ cross-phase pass.
 came from the same two traps documented in the cross-phase pass. They are in
 the docs because knowing about them did not stop me repeating them.
 
-### Exit criteria — three of five cannot be met by code
+### Exit criteria — revised to n=1 on 2026-09-15
+
+The user-count bar moved from 20 users to the owner alone; see Phase 5's goal
+for the reasoning and the limits. What that changed and what it did not:
 
 - [x] **Zero cross-tenant incidents** — RLS covers `wear_log`, verified by
       mutation (disabling FORCE fails the suite), and search is tenant-scoped.
-- [ ] **20 users, ≥2,000 garments** — needs users.
-- [ ] **p95 ingest-to-CLASSIFIED < 60s under real load** — measurable now via
-      `/ops/dashboards`, but "under real load" needs real load. Current p95 on
-      synthetic traffic is polluted by the contention experiments described in
-      the cross-phase pass; single-photo latency is ~6.1s.
-- [ ] **Correction rate per field measured on real data** — the endpoint and
-      the in-app strip exist. The number is currently meaningless because tags
-      come from the mock: `subcategory` reads 67% because the mock answers
-      "kurta" for everything.
-- [ ] **Cost per user per month** — still needs a provider key.
+      **Unaffected by n=1**, and deliberately so: tenancy is proven by the test
+      suite, not by having tenants, which is why it was built that way in
+      Phase 1.
+- [ ] **Owner's entire wardrobe ingested** — needs photographs. This is now the
+      single largest open item in the project.
+- [ ] **p95 ingest-to-CLASSIFIED < 60s on a real burst** — the criterion was
+      re-scoped from "under real load", which n=1 cannot produce. Measurable
+      the moment the wardrobe is ingested in one sitting. Reference points on
+      synthetic traffic: single photo **5.1s**, a burst of 10 drains in ~21.5s
+      median.
+- [ ] **Correction rate per field, owner's wardrobe** — endpoint and in-app
+      strip exist. **No longer blocked on the provider key** (real Gemini tags
+      landed 2026-09-15), only on the wardrobe. The old reading of 67% on
+      `subcategory` was an artefact of the mock answering "kurta" for
+      everything and should be discarded, not compared against.
+- [ ] **Cost per user per month** — the per-call number is now REAL:
+      **~$0.0023 per VLM call** measured against Gemini, at batch-of-1, which
+      is the worst case since a 6-cell grid amortises the prompt. The monthly
+      figure still needs a wardrobe to multiply it by. Note this number only
+      became trustworthy after the `cache_hit` fix below — 40% of recorded
+      spend was cached responses the provider never charged for.
 
-**The correction-rate criterion is now gated on the DPA, not just on users.**
-Search and filters consume `subcategory` and `dress_code`; with mock tags they
-will look broken to real users. That makes the provider key a prerequisite for
-Phase 5 being *usable*, not merely for closing Phase 4.
+**The correction-rate criterion is no longer gated on the DPA.**
+Search and filters consume `subcategory` and `dress_code`, and with mock tags
+they looked broken — every garment a `kurta`. That made the provider key a
+prerequisite for Phase 5 being *usable*, not merely for closing Phase 4, and it
+is the reason the key was the first thing unblocked. It is now live; see below.
 
 ---
 
@@ -1505,6 +1545,12 @@ that was fed noise.
 The eval needs real tags, which needs the provider key. Everything else in
 Phase 6 is done and measured.
 
+**Update 2026-09-15: the provider key is live and this is now blocked on one
+thing only — a real wardrobe to suggest from.** Real tags are landing (see
+below), but tagging the *seeded* wardrobe would not help: `seed_demo.py`
+garments have no photographs, so there is nothing for a VLM to look at. The
+eval runs when the owner's own clothes are in the database, and not before.
+
 
 ### A bug Phase 6's gate run surfaced in Phase 5 (and Phase 4)
 
@@ -1537,3 +1583,824 @@ unreachable there — verified by mutation: reverting the fix leaves them green.
 The real guard is the e2e script, which crosses a socket from another process.
 A test that looks like a guard and is not is worse than no test, so the
 limitation is written down rather than assumed away.
+
+---
+
+## Real tags, and the scope change to n=1 (2026-09-15)
+
+Two things happened on the same day: the provider key went in and started
+working, and the user-count bar dropped from 20 to one. They are recorded
+together because the second is only defensible given the first — without real
+tags, n=1 would have meant measuring nothing at all.
+
+### The provider key is live
+
+`GEMINI_API_KEY` is set, `VLM_MODEL=vlm-tagger`, and the `vlm-tagger` row routes
+to `gemini/gemini-3.6-flash`. Verified end to end rather than assumed: a photo
+ingests through `validate → sanitise → moderate → segment → matte → classify →
+tag → embed → dedupe → persist` in **3.9s**, and the tags come back from Gemini.
+
+`extractor_version` separates the eras cleanly, which is why it exists:
+
+| version | rows | what |
+|---|---|---|
+| `seed-demo-v1` | 2420 | random attributes — never eval on these |
+| `tag-vlm-v1` | 179 | the mock: `kurta` for everything |
+| `tag-vlm-v2` | 34 | real Gemini |
+
+**The DPA is still outstanding and this is still `gemini/`, not `vertex_ai/`.**
+AI Studio's terms permit training on submitted content, and what is submitted is
+photographs of someone's clothes. That is acceptable for development and for
+eval against the golden set — it is NOT the production posture, and the note in
+`litellm/config.yaml` stands: production changes the prefix, and the prefix is
+the only line that changes.
+
+### Two bugs that only real tags could expose
+
+Both had been latent since Phase 4, both were invisible against the mock, and
+both were found by looking at what the first real run actually wrote.
+
+**1. Every garment was flagged for review — 17 of 17.** The VLM schema's
+`confidence` object listed `properties` for all six fields but no `required`.
+`properties` constrains the shape of a key that IS present; it does not demand
+one. Gemini duly returned confidences for `subcategory` and `warmth` only, while
+still emitting VALUES for all six. The review gate reads a missing confidence as
+`0.0` — below every threshold — so everything routed to review.
+
+A review queue containing the entire wardrobe is not a review queue, and the
+correction rate read through it, which is Phase 5's go/no-go, would have been
+noise. Fixed by requiring every key, derived from `vlm_fields()` so re-tiering a
+field cannot silently drop it. Measured on identical input: **100% → 0%** review
+rate, all six confidences present in all 17 rows.
+
+The gate's conservative default is still correct — a missing confidence SHOULD
+mean review — but it is no longer silent. `_parse` now reports `unscored` and
+logs it, because the failure here was never the default; it was that nothing
+anywhere said why the whole wardrobe was in the queue.
+
+**2. `cache_hit` was false on every call ever made.** The client read
+`x-litellm-cache-hit`; LiteLLM (1.100.1) does not emit that header. Measured
+against the running gateway, the real signal is the presence of
+`x-litellm-cache-key`:
+
+    fresh call   3066ms   no  x-litellm-cache-key
+    repeat       1.3ms    has x-litellm-cache-key
+
+This mattered twice. **Cost:** a cached response still carries a full
+`x-litellm-response-cost`, so hits were mirrored into `model_calls` at list
+price — 21 real calls and 13 hits in one run, with **40% of recorded spend
+attributed to calls the provider never charged for.** "Cost per garment
+ingested" was measuring the wrong thing in the only phase that asks for it.
+**And the Phase 7.3 SLI:** the rationale-cache hit rate alerts below 50%;
+against a constant `false` it would have sat at 0% forever.
+
+**This is the third monitoring signal in this project that was structurally
+incapable of firing**, after the Phase 5 ops alerts (RLS returning zero rows to
+a counting query) and the nightly precompute's tenant query (same cause). All
+three share one shape: *a value read from an external system that silently
+defaults to the reading that means "fine".* RLS returns no rows rather than
+erroring; a missing header reads as `""` rather than raising. That is a class,
+not three coincidences, and it is worth a rule — when a signal's absence and its
+healthy value are the same value, assert the signal can fire, in the direction
+that fires.
+
+289 tests (was 286); `ruff`, `ruff format` and `mypy --strict` clean across 83
+source files; `make verify` 24/24. All three new tests were checked by mutation:
+reverting either fix fails the corresponding test.
+
+### Why n=1
+
+The 20-user bar was written as startup validation — "will this work for people
+who are not me". This project is a personal stylist for its owner and is not
+asking that question, so the bar now is the owner's own wardrobe, catalogued in
+full.
+
+**What this costs, stated plainly.** n=1 measures whether the pipeline is
+CORRECT. It cannot measure whether it GENERALISES, and every accuracy or
+correction number from here describes one person's clothes, one camera, and one
+reading of the taxonomy. The ≈20%-correction-rate trigger still works for what
+it was really for — catching a field that is systematically wrong — but it can
+no longer distinguish "the model is bad at sarees" from "I own unusual sarees."
+
+**What it does not change.** Tenancy is proven by the test suite and not by
+having tenants, which is why RLS was built that way in Phase 1; the
+cross-tenant criterion is unaffected. And the blind eval keeps its two outside
+raters: a single rater grading outfits built from their own wardrobe cannot
+separate "this is a good outfit" from "this is what I would have picked
+anyway", which is the exact bias that eval exists to detect.
+
+### What is actually left
+
+Two things, and neither is code:
+
+1. **Photograph the wardrobe.** This is now the largest open item in the
+   project. It unblocks, in one step: Phase 5's ingest criterion, the
+   correction rate, cost per month, and Phase 6's blind eval.
+2. **The golden set.** Unchanged and still independent of user count — it is
+   labelled data, not users, and `eval/golden/labels.jsonl` still does not
+   exist. All three eval entry points still exit **2**.
+
+---
+
+## Phase 7 — LLM rerank and validator (built 2026-09-15)
+
+All three steps built. **323 tests** (was 289); `ruff`, `ruff format` and
+`mypy --strict` clean across 86 source files.
+
+### 7.2 first, not 7.1
+
+The plan lists the reranker first. The validator was built first anyway,
+because it is what makes an LLM on a user-facing path acceptable at all —
+building the caller first leaves a window where model output flows through
+unguarded, and the validator is pure so it needs nothing that does not exist
+yet.
+
+`packages/stylist_domain/validator.py` implements §C3's six assertions in
+order, stopping at the first failure. Order is part of the contract, not an
+implementation detail: a response that breaks assertions 2 and 5 must report
+`unknown_id`, because the reject metric is a regression signal and one that
+reports whichever rule happened to be checked last says nothing about what
+changed.
+
+**The test that defines the phase** passes in both halves: a fabricated garment
+id is rejected with `rule="unknown_id"` and the user gets the deterministic
+ranking; a real, active, well-formed id belonging to **another tenant** fails at
+the same assertion, because the input id set is per-request and another
+tenant's garment was never in it. One assertion covers both, so there is no
+separate cross-tenant path to forget, and RLS is not asked to do the
+validator's job.
+
+Three decisions worth recording:
+
+- **Assertion 6 demotes, it does not reject.** An unsure model is not a lying
+  model. Discarding five good rerank decisions because the sixth scored 0.4
+  punishes honesty; demoted outfits keep their place but rank below the
+  deterministic order.
+- **Slot legality re-uses `slots.evaluate()`.** A second implementation could
+  disagree with the generator's, and then the validator would reject outfits
+  the deterministic path itself produced — a fallback that rejects its own
+  fallback.
+- **A seventh check the plan does not list: `unknown_outfit`.** Assertion 2
+  stops invented garments but not novel COMBINATIONS of real ones. A
+  recombination passes every id check and is often slot-legal, yet has never
+  been through the scorer. Reranking reorders; it does not design.
+
+Body-shaming terms (assertion 5) deliberately include `slimming`, `flattering`
+and `hides` — ordinary fashion copy, every one of which presupposes the
+wearer's body is a problem the garment solves. The classifier half of §C3's
+"regex + small classifier" is **not built**, and that is a real gap rather than
+a decision: a term list cannot catch a sentence that is cruel without using a
+listed word.
+
+### 7.1 — and the budget that does not exist
+
+§7.1 specifies a 1200ms hard timeout inside §B1's 1500ms SLO. **It is not
+reachable.** Measured against `gemini-3.6-flash`, three runs each:
+
+| shape | latency | tokens |
+|---|---|---|
+| top-8, ids echoed, `reasoning_effort: low` | 5273-6369ms | ~2550 |
+| same, `reasoning_effort: none` | 3930-5178ms | ~2470 |
+| top-8, referenced by index (the plan's own token budget) | **2974-3618ms** | 1085 in / 370 out |
+
+Reasoning is not the bottleneck; generation is. Even cut to exactly the
+plan's "~1.2k in / 300 out", the floor is ~3.2s — 2.7x the budget.
+
+**Resolution: the model call moved off the request path.** The nightly
+precompute (6.4) now also reranks and writes rationales into the 7.3 cache, so
+the morning request is a cache read. Measured end to end: `ranking_source:
+"cache"`, **6.4-22ms**, real model rationales, zero provider calls. The
+1200ms live path remains for contexts nobody precomputed, where it is a
+DEGRADE SWITCH rather than a deadline — a user picking an unusual occasion
+gets deterministic order in 1.3s instead of an empty screen.
+
+`reasoning_effort: none` and index-based referencing are both measured wins
+(~40% fewer output tokens) and are **not implemented** — they matter for cost
+rather than for the request path now that the call is nightly, and echoing ids
+keeps the validator's assertion 2 checking what it actually claims to check.
+
+### Four bugs, three of them silent
+
+**1. The tie-break that made the whole cache unreachable.** `suggest()` sorts
+by `(-score, garment_set_hash)` precisely so the nightly job and the request
+path agree — Phase 6 wrote that rule down. The SQL reading its output ordered
+by `score DESC` alone. On real data scores tie constantly (five outfits at
+0.717), so Postgres returned an arbitrary set: the nightly job reranked one
+arbitrary top-8 and the request read a different arbitrary top-5. **Every**
+rationale lookup missed, and §7.3's "hit rate ≥ 50%" would have been
+unreachable for a reason no dashboard could show.
+
+**2. Outfits the model omits were silently dropped.** The validator checks that
+everything returned was sent; nothing checked the reverse. A model answering
+with three of the eight it was given is schema-valid, passes all six
+assertions, and deleted five wearable outfits from the user's list with no
+error anywhere. Found only because a test fixture was accidentally larger than
+the fake model's reply.
+
+**3. `max_tokens` truncation, for the second time in this project.** A uuid
+costs ~22 tokens, so eight outfits of three garments is ~530 tokens of pure id
+echo before a word of rationale. At 1024 the JSON truncated mid-object and the
+whole rerank was discarded as unparseable — presenting as the MODEL failing
+rather than the ceiling being too low. `litellm/config.yaml` carries the
+identical note for tagging at 2048.
+
+**4. Requiring a FULL cache hit meant never using the cache.** The model
+returns rationales for only ~3 of 8 outfits, so a context is never fully
+cached; every request missed and made a live call. It only looked fast because
+LiteLLM's own response cache was absorbing the repeat — a 7-day gateway TTL we
+do not control, propping up a design that was quietly not working. The request
+path now serves on ANY hit and templates the gaps; the nightly path passes
+`serve_partial_cache=False` so it still fills them, or coverage would freeze
+forever at whatever the first run produced.
+
+### There is deliberately no reranker mock
+
+Tagging has one. The reranker cannot: its response must echo per-request uuids,
+so a fixed `mock_response` can only ever contain ids outside the input set.
+Every local request would fail assertion 2 and pin `validator.reject` at 100%
+with `rule="unknown_id"` — burying this phase's earliest quality signal, which
+has a <2% exit criterion, under noise we manufactured. With no key the real row
+simply fails and the suggestion degrades, so the ladder is the uncredentialed
+default. The ACCEPT path is covered by 20 tests against a fake gateway.
+
+### Cost, and why the nightly job checks the cache first
+
+Four occasions x 30 nights x ~$0.003 is **~$0.36/tenant/month** against a
+`free_tier_monthly_budget_usd` of **0.15**. Re-reranking nightly would exceed
+the per-tenant budget by 2.4x and turn a feature into an outage (§B3). Because
+`rerank()` reads the cache before calling, a tenant whose wardrobe and outfits
+are unchanged costs zero provider calls until the 7-day TTL expires.
+
+### Exit criteria
+
+- [x] **Kill the reranker provider → suggestions still return, non-5xx,
+      template rationale** — asserted for each failure mode separately
+      (provider down, read timeout, unparseable JSON, fabricated id), because
+      they reach the fallback through different code.
+- [x] **Fabricated-ID and wrong-tenant-ID tests both pass** — and the metric
+      increments with `rule="unknown_id"`.
+- [x] **p95 `/suggestions` ≤ 1500ms warm** — **6.4-22ms** from cache. Cold,
+      un-precomputed context: **1.2-1.5s**, degrading rather than reranking.
+- [ ] **Rationale cache hit rate ≥ 50% after a week of real traffic** —
+      NOW MEASURABLE, and currently **FAILING at 0.45 over 92 lookups**, which
+      is the SLI doing its job on the first day it could. Cause: the model
+      returns rationales for only ~3 of the 8 outfits it is sent, so the top-N
+      a request reads is never fully covered. Fix the coverage, not the
+      threshold. A week of real traffic still needs a real wardrobe.
+- [ ] **`validator.reject` rate < 2% overall** — NOW COMPUTABLE. Reads
+      `attempts=2 accepted=2 rejected=0` against a live stack; before, only
+      rejections were counted and the rate had no denominator at all.
+      Unmeasured until 20 samples, and reported as `measured: false` rather
+      than as a pass.
+- [ ] **Load test: 10x projected peak, no SLO breach** — deferred to P9 with
+      the rest of the capacity work, which is where the plan puts retuning
+      against real traffic. Not solvable now for a second reason: "projected
+      peak" for one user is not a number that exists.
+
+### The fourth instance, and this time I wrote it
+
+Both rate criteria above were unmeasurable when first shipped, in two distinct
+ways, and both are the shape this project has now recorded four times — a
+signal that is live, green, and structurally incapable of answering its own
+question.
+
+**The reject rate had no denominator.** Only rejections were counted. That can
+report a tally and never a RATE, and "< 2% overall" is a rate — so the
+criterion could not have been evaluated however much traffic arrived. Every
+validation is now counted, accepted ones included.
+
+**The cache SLI counted requests, not lookups.** `hit` and `miss` were each
+incremented once per request, so one request looking up 5 outfits and finding 1
+reported a 50% hit rate against a true 20% — landing exactly on the threshold
+the alert fires at. Both are now incremented BY COUNT, which is why
+`incr_bucketed` gained an `amount`.
+
+**And nothing read either counter.** No endpoint, no alert; the SLI existed
+only in Redis. `GET /ops/rerank` now reads both over day buckets, shares its
+key construction with the writer (`metric_keys`) so reader and writer cannot
+drift, applies the same fewer-than-20-samples guard as the Phase 5 alerts, and
+reports `measured: false` rather than `ok: true` over thin data — because
+letting "not measured" become "measured and fine" is the exact failure the eval
+harness exits 2 to avoid.
+
+Kept separate from `/ops/alerts` deliberately: that endpoint carries the four
+alerts §D3 specifies, with "resist adding more" written next to them. These are
+exit criteria tracked toward a threshold, not pages anyone should be woken for.
+
+`tests/test_rerank_metrics.py` (9 tests) asserts the FIRING direction and a
+correct RATE for each, not merely that a counter moved — including that 1 hit
+in 5 lookups reads as 0.2 and not 0.5.
+
+---
+
+## Phase 8 — Boards, feedback, style vectors (built 2026-09-15)
+
+Four of six deliverables built. **370 tests** (was 323); `ruff`, `ruff format`
+and `mypy --strict` clean across 91 source files; migration `0009` reverses
+cleanly.
+
+| Deliverable | State |
+|---|---|
+| Feedback capture | built — `POST /outfits/feedback`, append-only log |
+| Style vector + rebuild script | built — replay verified against live state |
+| Preference facts | built (API); **no UI yet** |
+| Compositor / boards | built — 45ms compose, warm request 6-11ms |
+| Calendar → occasion | **not built** — needs Google OAuth |
+| Daily push | **not built** — needs a notification provider |
+
+### The event log is the truth, and the database enforces it
+
+`outfit_feedback` is append-only: `stylist_app` holds SELECT and INSERT and
+nothing else, asserted in the failing direction by `tests/test_feedback_append_only.py`.
+
+**The first version of that guarantee was fake.** Migration 0001 sets
+`ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE
+ON TABLES TO stylist_app`, so every table created afterwards arrives with the
+full set attached. `GRANT SELECT, INSERT` adds nothing and removes nothing — it
+READS like a restriction and is a no-op, and `UPDATE outfit_feedback` succeeded
+as `stylist_app` with it in place. It needs a REVOKE. This matters beyond
+tidiness: the style vector, the wear-through rate and everything Phase 11 will
+learn are replays of this table, and one silent UPDATE makes the replay
+disagree with live state for a reason nobody can reconstruct, because the
+evidence is the thing that got overwritten.
+
+A second correctness fix in the same migration: `feedback_reason` originally
+carried an `other` value, which `tests/test_taxonomy_enums.py` forbids across
+every enum in the database. The rule is right — an `other` bucket absorbs
+everything that does not fit and then tells you nothing, while `reason` is
+already nullable and NULL is the honest encoding of "unspecified".
+
+### The style vector, and the exit criterion
+
+`apply_event` is pure. The live handler and `scripts/rebuild_style_vectors.py`
+are not two implementations that must agree; they are one called twice, which
+is the only reason "the rebuild reproduces live vectors" is achievable at all.
+
+Verified against the live stack: three events posted over HTTP, then
+`rebuild_style_vectors.py --check` → *all 1 tenant(s) match the event log*.
+Then the stored vector was corrupted to prove the check can fail:
+
+    --check   DIVERGED (max abs diff 1.29e-01, 3 events in log)   exit 1
+    rebuild   rebuilt 1 tenant(s) (1 had diverged before this run)
+    --check   all match                                           exit 0
+
+**One deviation from the plan's wording.** It says "assert equality"; this
+compares with a **1e-5 tolerance**. The live vector round-trips through
+pgvector's float4 once per event while the replay holds float64 throughout, so
+they differ in the last bits BY CONSTRUCTION — bit equality would fail for a
+non-bug, and a criterion that cannot pass teaches everyone to ignore it. 1e-5
+is far tighter than any real divergence; the deliberate corruption above
+registered 1.29e-01.
+
+`feedback_tenants()` is a SECURITY DEFINER function for the same reason
+`precompute_tenants()` is: the script enumerates tenants BEFORE it can set a
+tenant context, and as `stylist_app` against FORCE RLS a plain
+`SELECT DISTINCT user_id` returns zero rows with no error. It would have
+reported "0 tenants, all consistent". Third instance of that trap here.
+
+### Boards
+
+`stylist_domain/board.py` is pure — bytes in, bytes out — so the layout is
+testable without a bucket and the domain stays importable without
+infrastructure. Slot-aware rather than a grid: an outfit reads as an outfit
+when the top sits above the bottom and the shoes under both, and
+`upper_layer` sits BESIDE `upper_base` rather than over it, because a board
+whose job is "show me what I am wearing" must not conceal one of the things
+being worn.
+
+Deterministic, which is what makes caching by `garment_set_hash` sound: a cache
+hit is not merely fresh enough, it is byte-identical to what a re-render would
+produce.
+
+A garment with a missing or corrupt cutout raises rather than being skipped.
+Omitting it produces a PLAUSIBLE wrong answer — a three-garment outfit drawn as
+two looks like a layout choice, so nobody investigates — and the board's entire
+claim is accuracy to what you own.
+
+Measured on the live stack:
+
+| | |
+|---|---|
+| compose only (4 garments) | **45ms** (plan budgets ~80ms) |
+| cold request (fetch cutouts + compose + store) | 629ms |
+| warm request (cached) | **6-11ms** |
+| PNG fetch, i.e. what a CDN serves | 4-47ms, ~69KB |
+
+### The ordering bug, in its third and subtlest form
+
+Boards and rationales are warmed nightly so the request path is a lookup. The
+first version warmed the top-8 of `suggest()`'s in-memory ranking — and covered
+only **3 of the 8** the endpoint actually serves.
+
+`suggest()` ranks by a Python float; `outfits.score` is `NUMERIC(8,6)`. Two
+outfits differing at the 7th decimal are DISTINCT in memory (so ordered by
+score) and EQUAL once stored (so ordered by the hash tie-break). The two
+sequences diverge, so five of every eight requests paid a 629ms cold render for
+a board the nightly job had already rendered under a different hash.
+
+Both warms now read the top-N back through `TOP_N_SQL` — the same query and
+ORDER BY the request uses — so the two agree by construction rather than by two
+orderings happening to coincide. After the fix: **8 of 8**, and the rationale
+cache hit rate moved from **0.45 (firing)** to **0.50 over 72 lookups from a
+cold cache**.
+
+This is the same family as the Phase 7 tie-break bug and the Phase 6 note in
+`suggest()` about ranking identically across runs. The lesson that generalises:
+**anything that pre-computes for a reader must order by the reader's query, not
+by its own.**
+
+### A claim I made and had to withdraw
+
+I reported ~2,273 garments with dangling `cutout_key`s, having compared 3,158
+garments-with-a-key against 885 stored objects. That was wrong: `seed_demo.py`
+SHARES cutout keys across garments, so there are only **746 distinct keys and
+every one resolves**. Zero dangling. The compositor's fail-loudly behaviour is
+still right, but it is justified by robustness rather than by a broken dataset,
+and the code comments were corrected to say so.
+
+### Exit criteria
+
+- [x] **`rebuild_style_vectors.py` reproduces live vectors from the event log**
+      — verified both directions, including that the check FAILS on a corrupted
+      vector (exit 1) and passes after a rebuild (exit 0).
+- [~] **Boards render < 200ms p95 from CDN** — warm request **6-11ms**, PNG
+      fetch 4-47ms, both far inside the budget. Marked partial rather than met
+      because "from CDN" is not measurable without a CDN; there is none in this
+      stack, and MinIO is standing in for one.
+- [ ] **Wear-through rate measured** — `GET /me/wear-through` computes it from
+      the event log (distinct suggested outfits, not events, so indecision
+      cannot inflate it) and returns `None` rather than `0.0` when nothing was
+      suggested. Needs real use to produce a number.
+- [ ] **V1 in daily use by the owner for 4 consecutive weeks** — needs the
+      wardrobe photographed, still the largest open item in the project.
+- [ ] **Wardrobe coverage trending up week over week** — not built; it is a
+      time series over feedback and needs weeks of it to mean anything.
+
+### Calendar → occasion (built once credentials arrived)
+
+`config/calendar_rules.yaml` maps event titles to occasions as REVIEWED DATA,
+not code — the same argument as `outfit_rules` and `scoring.yaml`. Deliberately
+keywords rather than a model: the plan requires that a below-threshold match
+"fall back to default AND SAY SO", which means the UI must show WHY. "Matched
+'standup' → office_casual" is showable and correctable; "the model said 0.62"
+is not. It also keeps calendar sync off the paid path and out of the 1500ms
+budget entirely.
+
+`GET /calendar/today` never returns a bare occasion: occasion, confidence,
+`confident`, `is_fallback` and a renderable explanation arrive TOGETHER, so a
+client cannot show the answer without the caveat in hand. The floor is 0.60 and
+`casual_outing` sits at 0.55 on purpose — "Lunch" must not decide what you
+wear. Several events in a day resolve to the DRESSIEST confident match, because
+nobody changes between a standup and a wedding and being overdressed is the
+recoverable error.
+
+Security decisions worth keeping:
+
+- **`state` is a signed, expiring, audience-scoped JWT.** The callback carries
+  no bearer token — a browser arriving from Google has none — so `state` is the
+  only thing identifying the user. All four rejection paths (forged, wrong key,
+  expired, wrong audience) are asserted. The audience check matters
+  specifically because our own access tokens share the signing secret.
+- **Only titles leave Google.** The `fields` parameter requests `summary` and
+  attendance status and nothing else, so attendees, descriptions and locations
+  are never transmitted rather than received and discarded. The API returns
+  `events_seen: 3`, never the titles.
+- **Revocation records whether Google CONFIRMED it.** "We deleted our token" is
+  not the same claim as "our access is gone", and §C5 asks the second one.
+- **Scope is verified on return, not assumed** — Google lets a user uncheck
+  scopes on the consent screen, and a narrower grant would otherwise surface as
+  a 403 mid-sync with nothing pointing at the cause.
+
+### Daily push (`w-notify`)
+
+FCM HTTP v1, written against the API directly rather than via `firebase-admin`
+(~20 transitive dependencies and a credential-discovery layer that reads
+ambient environment). `pyjwt[crypto]` is the one dependency added, for the
+RS256 service-account assertion.
+
+**"07:00 local" is the whole design problem.** There is no single moment that is
+07:00 — it happens 24+ times a day across zones — so the cron runs EVERY HOUR
+and each run sends only to tenants for whom it is currently 07:00 where they
+are. The zone comes from the DEVICE, falling back to `user_profile.timezone`:
+local is a property of where the phone is, so a user who flies to London should
+get their digest at 07:00 there.
+
+**Sending twice is unforgivable, so the guard is in the database.** `push_send`
+has a unique index on `(user_id, kind, sent_on)` with `sent_on` as the user's
+LOCAL date, and the row is inserted BEFORE the send. A crash after the insert
+costs one missed digest; a crash after sending but before recording costs a
+duplicate. Only one of those gets the app uninstalled. The table is append-only
+by REVOKE for the same reason `outfit_feedback` is — and for the same reason a
+narrower GRANT would not have worked.
+
+A token FCM reports as `UNREGISTERED` is disabled with the reason recorded,
+not deleted and not retried: retrying costs quota every morning for a device
+that no longer exists, and a deleted row cannot answer "why did my
+notifications stop".
+
+`push_tenants()` is the fourth SECURITY DEFINER function in this project for
+the fourth instance of the same trap — a cross-tenant `SELECT` as `stylist_app`
+against FORCE RLS returns zero rows with no error, so the sender would have
+reported "nobody to notify", indistinguishable from success.
+
+### Credential handling, after a near miss
+
+A Firebase service-account JSON was pasted into a chat during this work. That
+key was rotated. Two things changed as a result, both of which should have been
+in place first:
+
+1. `.gitignore` now covers `secrets/`, `*service-account*.json`,
+   `*adminsdk*.json` and `*-firebase-*.json`. Google's default download name is
+   `<project>-firebase-adminsdk-<hash>-<id>.json`, which matches no obvious
+   pattern — verified that the exact filename is now ignored at the repo root.
+2. The credential is referenced by PATH (`FIREBASE_CREDENTIALS_FILE`), never
+   pasted into an env var. A multi-line PEM in an env var is mangled
+   differently by every shell, .env parser and CI secret store, and the usual
+   "fix" of stripping newlines produces an unparseable key and a stack trace
+   three layers from the cause.
+
+The refresh token in `calendar_link` and the service-account file are both
+KNOWN GAPS for production: plaintext under RLS and a mounted file respectively.
+Encrypting them needs a KMS and a key-rotation story, which is P9.
+
+### What is still not built
+
+**The preference-facts UI.** The API is there. The plan's argument is that
+"legibility buys trust faster than accuracy does", and an endpoint nobody can
+see buys neither — this is now the last unbuilt piece of Phase 8.
+
+---
+
+## Phase 9 — erasure, export, and the restore drill (built 2026-09-15)
+
+Four of Phase 9's six exit criteria are engineering rather than traffic, and
+three of those are now done. **456 tests**; `ruff`, `ruff format` and
+`mypy --strict` clean across 104 source files; migrations 0012 and 0013 both
+reverse cleanly.
+
+### Erasure (§C5) — and it cannot be a `DELETE CASCADE`
+
+A user's data is in Postgres, in object storage with versioning ON, in a model
+provider's cache, in a Google Calendar grant and in Firebase's device registry.
+No transaction spans those, so `erasure_request` is a resumable saga: seven
+steps, each separately durable, completed steps recorded and SKIPPED on retry.
+
+`DELETE /me?confirm=DELETE` returns 202 and the account is **already dead** —
+`deleted_at` is set inside the request and `current_user` returns 410 from the
+next call. Verified live. Steps 2-7 run against a 30-day SLA, retried twice an
+hour, because the deadline is legal rather than operational.
+
+Rows are deleted LAST: every earlier step reads them to find the objects,
+tokens and keys to purge elsewhere. Deleting them first strands the objects
+permanently — unreferenced, unerasable, invisible to the next audit.
+
+**`delete_all_versions` is the load-bearing piece.** The bucket is versioned
+(Phase 1 turned it on so a bad migration could not destroy a wardrobe), so
+`delete_object` writes a delete MARKER and leaves the bytes recoverable. That
+reads as deletion in review and is not erasure. It also aborts orphaned
+multipart uploads, which `list_objects_v2` cannot see and storage bills for.
+
+**`unpurgeable` is what makes the record honest.** No provider in this stack
+offers a per-user cache purge, so every erasure discloses that rather than
+claiming a clean sweep. §C5's words are "record what could NOT be purged (and
+disclose it)"; a saga reporting success while a provider still holds the data
+is worse than one that says so.
+
+### Four bugs the erasure tests caught
+
+**1. Step 2 silently did nothing.** `_purge_providers` reads `user_profile`,
+`calendar_link` and `device_token` — all FORCE RLS — from a system session with
+no tenant context. Every read returned ZERO ROWS WITH NO ERROR, so the virtual
+key, the calendar token and the device tokens were all left LIVE while the saga
+reported success. **Sixth instance** of that trap in this codebase.
+
+**2. Append-only collided with Art. 17.** `outfit_feedback` (0009) and
+`push_send` (0011) have DELETE revoked from `stylist_app` because they are the
+logs every derived thing replays. Erasure must delete them. Granting DELETE
+back would dissolve the guarantee for every code path to serve one, so row
+deletion goes through a single SECURITY DEFINER `erase_user_rows()` — named,
+auditable, and the only exception.
+
+**3. A storage outage would have been recorded as permanent.** The first
+version caught per-prefix failures and filed them as `unpurgeable`, confirming
+an erasure with the objects still in the bucket. "Storage was down" is
+transient and belongs in the retry path; conflating it with genuinely
+unreachable data turns an outage into a documented lie.
+
+**4. `processed_keys` has no user column at all** — it is
+`(idempotency_key, consumer, created_at)`, and the key is a value the CLIENT
+generated. It cannot be scoped and carries no personal data, so it is excluded
+and REPORTED as `not_user_scoped` rather than silently skipped.
+
+### Export, made asynchronous
+
+The first version built the ZIP in memory inside the request. That works at
+nine garments and cannot work at two thousand: the archive is every cutout the
+user owns, so it grows with the wardrobe while the request timeout does not.
+
+Now `POST /me/export` writes an `export_request` and an outbox event in ONE
+transaction; the worker builds the archive **on disk** and uploads it;
+`GET /me/export/{id}` mints a presigned link per request. Measured on the real
+wardrobe: **19.7 MB, 418 entries, 400 images, CRC clean**.
+
+  - **Credentials are redacted.** An export lands in a downloads folder, and a
+    calendar refresh token or FCM registration token STILL WORKS. Asserted by
+    checking the raw values appear nowhere in the archive bytes.
+  - **Exports expire for real.** §C5 says "7-day link", but a presigned URL
+    expiring only stops new downloads — the ZIP stays in the bucket, a complete
+    second copy of the wardrobe, i.e. exactly what erasure works to remove. An
+    hourly sweep deletes the object (all versions). A failed sweep leaves the
+    record so the next run retries; marking it deleted would mean nothing ever
+    tries again.
+  - **One in flight per user**, enforced by a partial unique index rather than
+    a handler check, because a double-tap on a slow connection is two
+    concurrent requests and a handler check races itself.
+
+### The aborted-transaction trap, three times in one day
+
+After a constraint violation or a failed statement, the Postgres transaction is
+dead and every subsequent command raises `InFailedSQLTransactionError`. Three
+separate places recovered from an error by querying inside the session that had
+just failed:
+
+  - the erasure saga's error handler (masked every real error with a confusing
+    one about transaction state)
+  - the export builder's failure path
+  - `POST /me/export`'s duplicate lookup — which returned **500 instead of
+    409**, measured against the running stack
+
+All three now use a fresh session. The rule: *recovery must not depend on the
+transaction that failed.*
+
+### The restore drill — the number, and what it is not
+
+    make backup          logical dump -> object storage
+    make restore-drill   restore into a scratch DB and VERIFY it
+
+Measured, twice, on the live 47 MB database:
+
+| | |
+|---|---|
+| dump | 9.0 MB in **1.3s** |
+| **restore** | **2.8s** |
+| verified | 20,421 rows / 21 tables, 14 policies, 132 functions, 12 enums, 2 extensions, 14 FORCE RLS tables |
+
+**A drill that only restores proves nothing.** `pg_restore` exiting 0 means the
+file was replayed, not that the database works, so the drill compares the
+scratch database against the source object by object. Row counts are the
+obvious check and the least likely to catch a real problem; the ones that
+matter are the policies (a restore that drops them yields a database where
+every tenant sees every other tenant, and it looks completely healthy) and the
+SECURITY DEFINER functions the precompute, the erasure saga and the ops alerts
+all depend on.
+
+**Mutation-checked, because a drill that cannot fail is a ritual.** Dropping one
+policy and emptying one table from a restored copy:
+
+    wear_log: 10963 -> 0
+    policies: 14 -> 13
+
+Both detected.
+
+**The drill also found a real DR hazard.** `pg_restore` exited 1 with
+`unrecognized configuration parameter "transaction_timeout"` — the host's
+`pg_dump` is **17.10** against a **16.15** server. Benign in that direction (one
+ignored SET) and data-losing in the reverse. Nobody checks tool versions during
+an incident, so the drill now prints them every run and warns on a major
+mismatch.
+
+### What the number is NOT
+
+2.8s is a **floor on the RTO, not the RTO**. The drill restores from local
+storage, on the same machine, into the same Postgres instance. It does not
+exercise a second region, a cold instance, DNS, or — the largest term by far —
+the time to NOTICE. It is reported as a floor in the script's own output so it
+cannot be quoted as an RTO by someone reading only the number.
+
+**The backup is in the same blast radius as the data.** §C5 says "nightly
+logical dump to the SECOND CLOUD ACCOUNT"; there is one account, so this
+survives a bad migration and not a compromised or deleted account. That is a
+real gap, printed by `make backup` on every run rather than left in a document.
+
+### Exit criteria
+
+- [x] **Erasure verified absent across systems** — asserted by querying back,
+      not by the saga reporting success. Rows, object versions, provider grants
+      and the audit record are each checked independently.
+- [x] **Restore drill completed, time recorded** — **2.8s**, verified, and
+      mutation-checked so the verification can fail.
+- [x] **Every paging alert has a runbook** — `docs/runbooks.md`, one per
+      alert, each with symptom / three likely causes / verification query /
+      mitigation / rollback / escalation.
+
+      **Every query and command in it was executed against the live stack**, by
+      exit code rather than by eye. A runbook whose query errors at 03:00 is
+      worse than no runbook: it costs the minutes you had and teaches whoever
+      hit it that the document is decoration.
+
+      It was also walked against a LIVE FIRING alert rather than a hypothetical
+      one — `dlq_age` and `ingest_success` were both firing during the write-up
+      — and step 1 ("read `stage_attempts`, it names the stage") produced the
+      cause in one query: `{"segment": 3}` /
+      `IndexError: tuple index out of range`, the flat-lay bug fixed earlier
+      the same day.
+
+      Five runbooks, not four. The fifth is `erasure_sla`, which is not one of
+      §D3's alerts and pages louder than any of them: the others cost money or
+      latency, that one has a regulator behind it. §C5's "alert at 7 days, page
+      at 25" is the only deadline in this product that is not ours to move.
+
+      `/ops/rerank`'s two SLIs are deliberately NOT pages, and the runbook says
+      so. §D3's instruction is "resist adding more; unactionable alerts train
+      people to ignore pages", and a cache hit rate does not need anyone woken
+      up.
+- [x] **Game day run; findings ticketed** — six scenarios against the live
+      stack on 2026-09-15. Three passed as designed; three produced findings,
+      two of which are real and one of which is a judgement call. All services
+      restored, 456 tests green afterwards.
+
+      **Passed as designed**
+
+      - **ml killed.** `/readyz` reported `ml: unreachable` and still returned
+        **200** — deliberately non-fatal, because failing readiness would turn
+        a designed degradation into a total API outage. Suggestions and
+        wardrobe reads unaffected. An ingest started during the outage waited
+        at `sanitised` with `attempt 1 not consumed`, did NOT enter the DLQ,
+        and **resumed to `classified` on its own** when ml came back. That is
+        the whole backpressure design working end to end.
+      - **LiteLLM killed.** Suggestions returned 200 with the ranking degraded.
+        The paid path going down costs a rationale, not a screen.
+      - **Three poison images.** All three reached `rejected` with **0 in the
+        DLQ** and a user-visible reason ("file is not a JPEG, PNG, WebP or HEIF
+        image (checked by magic bytes)"). Healthy work kept flowing. Confirms
+        the Phase 2 decision to reject a corrupt file after ONE attempt rather
+        than burning three.
+
+      **FINDING 1 — a database outage is indistinguishable from a bug.**
+      With postgres stopped, `/readyz` correctly returned **503**, but every
+      request returned **500**: `/suggestions`, `/auth/login`, all of it. A
+      dependency being down is a 503 — "try again" — while a 500 says "we have
+      a bug". They are different instructions to a client, to a retry policy
+      and to whoever is paged. Worse, the `api_5xx` alert cannot tell them
+      apart, so a database outage and a bad deploy produce the identical
+      signal. The runbook anticipated the symptom ("5xx on every endpoint at
+      once") but the status code should carry that distinction itself.
+
+      **FINDING 2 — the compose healthcheck reports healthy while every
+      request fails.** It probes `/healthz`, which does not touch the database.
+      With postgres down the container stayed `Up (healthy)` for the entire
+      outage. `/readyz` does the right thing, so a Kubernetes readiness probe
+      would pull the pod — but nothing in the compose stack is watching it, and
+      "healthy" is what a human glances at first.
+
+      **FINDING 3 (judgement call) — `redis-cache` is fatal to readiness and
+      probably should not be.** With it stopped, `/readyz` returned **503**
+      while `/suggestions` returned **200** — the rationale cache is an
+      optimisation and the endpoint degrades to template text without it. This
+      is the exact argument already made for ml and recorded in the
+      cross-phase pass: failing readiness on a degradable dependency converts a
+      degradation into a total outage. `redis-queue` is arguable the other way
+      (without it no ingest can be enqueued, though presign still returns 200,
+      which is its own half-working state worth a look).
+
+      **All three findings are FIXED and re-tested against live outages**
+      (`tests/test_game_day_fixes.py`):
+
+      | | before | after |
+      |---|---|---|
+      | Postgres down | every request **500** | **503** + `Retry-After: 5` |
+      | Postgres down | container `Up (healthy)` | container `Up (unhealthy)` |
+      | redis-cache down | `/readyz` **503** | `/readyz` **200**, cache in `dependencies` |
+
+      **And fixing finding 1 produced a finding of its own.** Registering the
+      handler for SQLAlchemy's `OperationalError` and `InterfaceError` looked
+      correct, passed a structural test, and STILL returned 500 to every
+      request. Re-testing against a stopped Postgres showed why: the exception
+      reaching the handler was a raw
+      `socket.gaierror: [Errno -2] Name or service not known` — DNS failing
+      before a connection exists, so there was nothing for SQLAlchemy to wrap.
+      `socket.gaierror` and `ConnectionError` are now registered too;
+      `OSError` deliberately is not, because a missing file or a full disk is
+      not "retry shortly".
+
+      That is the game day's real lesson in miniature: the structural test
+      passed, and only re-running the outage showed the fix did not work.
+
+      **Finding 2's re-test also needed patience rather than a fix.** The
+      healthcheck is 3s x 20 retries, so it takes 60s to flip; a 35s
+      observation reported it as still broken when it was already correct.
+
+      **A seventh finding, about the process rather than the system:** the
+      `zsh` unquoted-scalar trap that the cross-phase pass and Phase 5 both
+      already document bit again during this exercise — `DC="docker compose
+      ..."; $DC ps` fails silently. Knowing about it has now failed to prevent
+      it three times, which is an argument for a checked-in helper rather than
+      a note.
+- [ ] **Error budget policy signed off** — needs a human decision, not code.
+- [ ] **All `# PROVISIONAL` markers resolved or re-dated** — 21 of them, all
+      set against invented traffic. "Re-dated" is the honest option until there
+      is real load; resolving them needs the wardrobe.
+
+**Kubernetes is deliberately not started.** The plan's own warning is that
+deploying it before there is traffic is "the most common way this project dies
+at 80% done", and nothing in the remaining criteria needs it.

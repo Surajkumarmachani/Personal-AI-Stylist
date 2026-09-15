@@ -239,6 +239,61 @@ def test_confidence_is_an_integer_percent() -> None:
         assert (spec["minimum"], spec["maximum"]) == (0, 100)
 
 
+def test_every_confidence_key_is_required_not_merely_described() -> None:
+    """`properties` constrains a key that IS present; it does not demand one.
+
+    Without `required`, Gemini returned `subcategory` and `warmth` and omitted
+    the other four while still emitting VALUES for them. The review gate reads
+    a missing confidence as 0.0, so every garment was flagged: 17 of 17 on the
+    first real run. A review queue containing the whole wardrobe is not a
+    review queue, and the correction rate measured through it — Phase 5's
+    go/no-go — would have been noise.
+
+    Asserted against `vlm_fields` rather than a hardcoded list so that
+    re-tiering a field in taxonomy.yaml cannot quietly drop it from the set
+    the model must score.
+    """
+    taxonomy = load_taxonomy()
+    schema = build_schema(taxonomy, cells=["A1"])
+    conf = schema["json_schema"]["schema"]["properties"]["items"]["items"]["properties"][
+        "confidence"
+    ]
+    assert set(conf["required"]) == set(vlm_fields(taxonomy))
+    # OpenAI's strict mode requires `required` to list every key in
+    # `properties`; equality here is what keeps the schema valid against the
+    # `vlm-tagger-backup` row and not just the provider that was lenient.
+    assert set(conf["required"]) == set(conf["properties"])
+
+
+def test_a_value_without_a_confidence_is_reported_not_silently_zeroed() -> None:
+    """The gate's conservative default (missing -> 0.0 -> review) is correct;
+    being SILENT about it was the bug. With nothing logged, "every garment
+    needs review" is indistinguishable from a genuinely uncertain model."""
+    from stylist_worker.stages import tag as tag_stage
+
+    taxonomy = load_taxonomy()
+    gid = str(uuid.uuid4())
+    item: dict[str, Any] = {
+        "cell": "A1",
+        "subcategory": "t_shirt",
+        "material": "cotton",
+        "formality": 1,
+        "dress_code": "casual",
+        "warmth": 2,
+        "fit": "regular",
+        # Only two of six scored — exactly what Gemini returned in practice.
+        "confidence": {"subcategory": 95, "warmth": 90},
+    }
+    parsed = tag_stage._parse(json.dumps({"items": [item]}), taxonomy, {"A1": gid})
+    assert parsed is not None and len(parsed) == 1
+    assert parsed[0]["unscored"] == ["dress_code", "fit", "formality", "material"]
+
+    # A fully-scored response reports nothing, so the warning means something.
+    item["confidence"] = dict.fromkeys(vlm_fields(taxonomy), 90)
+    scored = tag_stage._parse(json.dumps({"items": [item]}), taxonomy, {"A1": gid})
+    assert scored is not None and scored[0]["unscored"] == []
+
+
 def test_confidence_percent_is_normalised_to_unit_interval() -> None:
     """The database, the review thresholds and the API all speak 0-1."""
     from stylist_worker.stages.tag import _confidence
@@ -442,6 +497,59 @@ async def test_the_raw_response_is_stored_for_reprocessing(owner_engine) -> None
         assert raw["extractor_version"]
     finally:
         await cleanup(owner_engine, user_id)
+
+
+def test_a_cache_hit_is_detected_by_the_header_litellm_actually_sends() -> None:
+    """The client read `x-litellm-cache-hit`, which LiteLLM never sends.
+
+    `cache_hit` was therefore False on every call since the client was written,
+    and nothing caught it because the gateway is faked AT the client boundary
+    everywhere else in this file — the header parsing had no test at all.
+
+    Two things rode on the flag. Cost: a cached response still carries a full
+    `x-litellm-response-cost`, so hits were mirrored into `model_calls` at list
+    price and "cost per garment ingested" measured money the provider never
+    charged. And Phase 7.3's cache-hit SLI alerts below 50%, which against a
+    constant False would have sat at 0% forever — a third monitoring signal
+    structurally unable to fire, after the Phase 5 ops alerts and the nightly
+    precompute's tenant query.
+
+    The header sets below are copied from a live gateway (LiteLLM 1.100.1):
+    a fresh call carries no cache key, a repeat of the same request does.
+    """
+    import httpx
+
+    from stylist_clients.litellm_client import _cache_hit
+
+    fresh = httpx.Response(
+        200,
+        headers={
+            "x-litellm-call-id": "8e262431-26f9-4e51-80ef-133f946f9e03",
+            "x-litellm-model-name": "gemini/gemini-3.6-flash",
+            "x-litellm-response-cost": "0.000369",
+            "x-litellm-response-duration-ms": "3066.231",
+        },
+    )
+    cached = httpx.Response(
+        200,
+        headers={
+            "x-litellm-call-id": "8e262431-26f9-4e51-80ef-133f946f9e03",
+            "x-litellm-model-name": "gemini/gemini-3.6-flash",
+            "x-litellm-cache-key": "f35e8b4ee2176d243a2c850193b4c21db42c7bde",
+            # A HIT STILL REPORTS A FULL COST. This is why the flag has to be
+            # right: without it the cost is indistinguishable from a real call.
+            "x-litellm-response-cost": "0.000369",
+            "x-litellm-response-duration-ms": "1.269",
+        },
+    )
+
+    assert _cache_hit(fresh) is False
+    assert _cache_hit(cached) is True
+
+    # The header the client used to read does not appear in either set; a test
+    # asserting only the False case would have passed against the bug.
+    assert "x-litellm-cache-hit" not in fresh.headers
+    assert "x-litellm-cache-hit" not in cached.headers
 
 
 async def test_spend_is_mirrored_into_model_calls(owner_engine) -> None:
@@ -755,5 +863,108 @@ async def test_a_user_correction_is_never_overwritten_by_tagging(owner_engine) -
         # not a blanket freeze on the whole garment.
         assert row["formality"] == 3
         assert row["dress_code"] == "festive_ethnic"
+    finally:
+        await cleanup(owner_engine, user_id)
+
+
+# ------------------------------- slot correction from the VLM's subcategory
+
+
+def test_a_confident_subcategory_corrects_the_segmentation_slot() -> None:
+    """THE BUG THIS FIXES, from real output.
+
+    `slot` comes from segmentation, which is a HUMAN PARSING model. On a
+    flat-lay it has no person to parse and guesses from shape: three photos of
+    jeans produced `upper_base`, `full_body` and `bag` — never `Pants`. The VLM
+    looked at the garment and said "jeans" at 95-98%, and taxonomy.yaml groups
+    jeans under `lower`.
+
+    A wrong slot is SILENTLY expensive: jeans filed as `upper_base` are
+    excluded from every outfit needing a `lower`, and nothing says why.
+    """
+    from stylist_worker.stages.tag import _slot_from_subcategory
+
+    taxonomy = load_taxonomy()
+    assert _slot_from_subcategory(taxonomy, "jeans", {"subcategory": 0.95}) == "lower"
+    assert _slot_from_subcategory(taxonomy, "t_shirt", {"subcategory": 0.90}) == "upper_base"
+    assert _slot_from_subcategory(taxonomy, "sneakers", {"subcategory": 0.85}) == "feet"
+
+
+def test_an_unconfident_subcategory_leaves_the_slot_alone() -> None:
+    """Overriding on a 55%-confident guess trades one silent error for another.
+    The threshold sits above the taxonomy's `review_below` values on purpose."""
+    from stylist_worker.stages.tag import SLOT_OVERRIDE_MIN_CONFIDENCE, _slot_from_subcategory
+
+    taxonomy = load_taxonomy()
+    low = SLOT_OVERRIDE_MIN_CONFIDENCE - 0.01
+    assert _slot_from_subcategory(taxonomy, "jeans", {"subcategory": low}) is None
+    assert _slot_from_subcategory(taxonomy, "jeans", {}) is None, "no confidence is not confidence"
+
+
+def test_a_missing_or_unknown_subcategory_leaves_the_slot_alone() -> None:
+    """A subcategory the taxonomy does not group means taxonomy.yaml and the
+    schema have drifted. That is worth a warning, not a guessed slot."""
+    from stylist_worker.stages.tag import _slot_from_subcategory
+
+    taxonomy = load_taxonomy()
+    assert _slot_from_subcategory(taxonomy, None, {"subcategory": 0.99}) is None
+    assert _slot_from_subcategory(taxonomy, "", {"subcategory": 0.99}) is None
+    assert _slot_from_subcategory(taxonomy, "not_a_real_garment", {"subcategory": 0.99}) is None
+
+
+def test_every_vlm_subcategory_maps_to_a_slot() -> None:
+    """If the schema can return a value the taxonomy does not group, the
+    override silently never fires for it — the exact shape of bug that made
+    this fix necessary in the first place."""
+    taxonomy = load_taxonomy()
+    ungrouped = [s for s in taxonomy.subcategories if _slot_or_none(taxonomy, s) is None]
+    assert not ungrouped, f"subcategories with no slot in taxonomy.yaml: {ungrouped}"
+
+
+def _slot_or_none(taxonomy, subcategory: str) -> str | None:
+    try:
+        return str(taxonomy.default_slot_for(subcategory))
+    except KeyError:
+        return None
+
+
+async def test_a_user_corrected_slot_is_never_overwritten(owner_engine) -> None:
+    """`slot` joins the columns `user_verified_fields` protects. A slot the
+    user fixed by hand must survive a re-tag, or the correction UI is a
+    suggestion box."""
+    user_id, job_id, garment_ids = await seed_garments(owner_engine, 1)
+    try:
+        from sqlalchemy.ext.asyncio import async_sessionmaker
+
+        maker = async_sessionmaker(owner_engine, expire_on_commit=False)
+        async with maker() as session, session.begin():
+            await session.execute(
+                text("SELECT set_config('app.user_id', :uid, true)"), {"uid": str(user_id)}
+            )
+            await session.execute(
+                text(
+                    "UPDATE garments SET slot = 'lower', "
+                    "user_verified_fields = ARRAY['slot'] WHERE id = :g"
+                ),
+                {"g": uuid.UUID(garment_ids[0])},
+            )
+
+        store = FakeStore()
+        store.put(f"cutouts/{user_id}/{garment_ids[0]}.png", cutout())
+        gateway = FakeGateway(response=tag_payload(["A1"]))
+        ctx = make_ctx(user_id, job_id, garment_ids[0], {"store": store, "litellm": gateway})
+        from stylist_worker.stages.tag import tag_stage
+
+        await tag_stage.run(ctx)
+
+        async with maker() as session:
+            await session.execute(
+                text("SELECT set_config('app.user_id', :uid, true)"), {"uid": str(user_id)}
+            )
+            row = await session.execute(
+                text("SELECT slot::text AS slot FROM garments WHERE id = :g"),
+                {"g": uuid.UUID(garment_ids[0])},
+            )
+            assert row.scalar_one() == "lower", "the user's slot survived a re-tag"
     finally:
         await cleanup(owner_engine, user_id)

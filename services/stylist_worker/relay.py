@@ -42,8 +42,13 @@ BATCH_LIMIT = 100
 # outbox event_type -> the arq function that handles it.
 EVENT_HANDLERS: dict[str, str] = {
     "garment.ingested": "ingest_photo",
-    # Phase 6+ will add: feedback.recorded -> invalidate_precompute,
-    # user.erasure_requested -> run_erasure_saga.
+    # An export is queued through the OUTBOX rather than enqueued directly by
+    # the API, so the request that asked for it and the job that does it share
+    # one transaction. A direct enqueue can succeed and then have its
+    # transaction roll back, leaving a job for a row that does not exist — the
+    # exact failure the outbox exists to prevent.
+    "export.requested": "build_export",
+    # Phase 6+ will add: feedback.recorded -> invalidate_precompute.
 }
 
 

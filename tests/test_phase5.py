@@ -247,7 +247,6 @@ async def test_eval_view_labels_mock_tagging_as_not_real(api: AsyncClient, regis
     """With the mock configured, nothing may claim to be real model output."""
     with _vlm_model("vlm-tagger-mock"):
         body = (await api.get("/garments/eval", headers=registered.auth)).json()
-    assert body["tagging_is_mock"] is True, body["tagging_model"]
     for item in body["items"]:
         assert item["tag_is_real"] is False, item["tag_source"]
         assert (
@@ -258,14 +257,96 @@ async def test_eval_view_labels_mock_tagging_as_not_real(api: AsyncClient, regis
 
 
 @pytest.mark.asyncio
-async def test_eval_view_does_not_call_a_real_model_mock(api: AsyncClient, registered) -> None:
-    """The converse, which is what actually ships: with a real provider
-    configured the view must NOT label its output as mock, or every genuine
-    prediction gets discounted in QA and the eval measures nothing."""
+async def test_nothing_tagged_yet_is_not_the_same_as_tags_are_real(
+    api: AsyncClient, registered
+) -> None:
+    """`tagging_is_mock` is None, not False, before anything has been tagged.
+
+    Collapsing the two would tell a brand-new user their tags are real before
+    any exist — a reassurance about output that does not yet exist.
+    """
     with _vlm_model("vlm-tagger"):
         body = (await api.get("/garments/eval", headers=registered.auth)).json()
-    assert body["tagging_is_mock"] is False, body["tagging_model"]
-    assert body["tagging_model"] == "vlm-tagger"
+    assert body["tagging_is_mock"] is None
+    assert body["tagging_model_configured"] == "vlm-tagger"
+
+
+@pytest.mark.asyncio
+async def test_the_banner_follows_what_ran_not_what_is_configured(
+    api: AsyncClient, registered, owner_engine
+) -> None:
+    """THE BUG THIS REPLACES.
+
+    The label was derived from this service's own `VLM_MODEL`. But the API does
+    not tag — the WORKER does — and the two drifted: the API was missing the
+    variable while the worker had it, so the eval page warned that tagging was
+    a deterministic stand-in while real Gemini was producing the tags. A
+    warning wrong in that direction teaches people to distrust correct output.
+
+    It now reads `model_calls`, which records what was actually called, and
+    reports a disagreement rather than silently trusting either side.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import text as _text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    maker = async_sessionmaker(owner_engine, expire_on_commit=False)
+    async with maker() as session, session.begin():
+        row = await session.execute(
+            _text("SELECT id FROM users WHERE email = :e"), {"e": registered.email}
+        )
+        user_id = row.scalar_one()
+        await session.execute(
+            _text(
+                "INSERT INTO model_calls (id, user_id, model_name, purpose) "
+                "VALUES (:i, :u, 'vlm-tagger', 'tag')"
+            ),
+            {"i": _uuid.uuid4(), "u": user_id},
+        )
+
+    # Configured for the MOCK, but a real call is on record.
+    with _vlm_model("vlm-tagger-mock"):
+        body = (await api.get("/garments/eval", headers=registered.auth)).json()
+
+    assert body["tagging_model"] == "vlm-tagger", "reports what ran"
+    assert body["tagging_model_configured"] == "vlm-tagger-mock"
+    assert body["tagging_is_mock"] is False, "a real call was made; no mock warning"
+    assert body["tagging_config_disagrees"] is True, "and the drift is surfaced"
+
+
+@pytest.mark.asyncio
+async def test_another_tenants_model_calls_do_not_leak_into_the_report(
+    api: AsyncClient, registered, second_tenant, owner_engine
+) -> None:
+    """`model_calls` has NO row-level security — verified against the schema,
+    unlike every other tenant table here. So this query carries an explicit
+    user_id predicate, and without it the first version reported a DIFFERENT
+    tenant's model name on this tenant's page.
+    """
+    import uuid as _uuid
+
+    from sqlalchemy import text as _text
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    maker = async_sessionmaker(owner_engine, expire_on_commit=False)
+    async with maker() as session, session.begin():
+        other = await session.execute(
+            _text("SELECT id FROM users WHERE email = :e"), {"e": second_tenant.email}
+        )
+        await session.execute(
+            _text(
+                "INSERT INTO model_calls (id, user_id, model_name, purpose) "
+                "VALUES (:i, :u, 'someone-elses-model', 'tag')"
+            ),
+            {"i": _uuid.uuid4(), "u": other.scalar_one()},
+        )
+
+    with _vlm_model("vlm-tagger"):
+        body = (await api.get("/garments/eval", headers=registered.auth)).json()
+
+    assert body["tagging_model"] != "someone-elses-model"
+    assert body["tagging_is_mock"] is None, "we have tagged nothing; their call is not ours"
 
 
 @pytest.mark.asyncio

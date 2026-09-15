@@ -131,6 +131,27 @@ class LiteLLMClient:
         resp.raise_for_status()
         return dict(resp.json())
 
+    async def delete_virtual_key(self, key: str) -> bool:
+        """Revoke a tenant's virtual key. Used by the erasure saga (§C5 step 2).
+
+        Deleting the KEY is what stops the gateway from being able to spend or
+        attribute anything further for this user. It does NOT reach the
+        provider's own cache — no provider in this stack offers a per-user
+        purge — which is why the saga records that separately as unpurgeable
+        rather than letting a successful revoke imply more than it means.
+
+        Returns whether the gateway confirmed it. A key that is already gone
+        counts as success: the desired state is "this key cannot be used", and
+        it having been deleted earlier satisfies that.
+        """
+        async with httpx.AsyncClient(timeout=self._timeout(ADMIN_TIMEOUT)) as client:
+            resp = await client.post(
+                f"{self._base}/key/delete",
+                json={"keys": [key]},
+                headers={"Authorization": f"Bearer {self._master_key}"},
+            )
+        return resp.status_code in (200, 404)
+
     async def health(self) -> bool:
         try:
             async with httpx.AsyncClient(timeout=self._timeout(5.0)) as client:
@@ -149,11 +170,23 @@ class LiteLLMClient:
         api_key: str,
         response_format: dict[str, Any] | None = None,
         max_tokens: int = 2048,
+        timeout: float | None = None,
+        num_retries: int | None = None,
     ) -> ChatResult:
         """One model call on a TENANT'S key.
 
         `api_key` is the tenant's virtual key, never the master key: that is
         what makes the budget enforceable and the spend attributable.
+
+        `timeout` and `num_retries` exist for the Phase 7 reranker, which sits
+        on a USER-FACING request and needs the opposite policy to tagging.
+        Tagging is async-plane work nobody is waiting for, so it gets 180s and
+        the gateway's two retries. The reranker gets 1200ms and ZERO retries:
+        a retry inside a request cannot make the SLO, it can only turn one slow
+        response into two and blow the budget the user is actually waiting on.
+        `num_retries` is sent in the body because the gateway's `num_retries`
+        is configured globally in litellm/config.yaml — without overriding it
+        per request, "no retry" would be a comment rather than a behaviour.
         """
         import time
 
@@ -165,16 +198,29 @@ class LiteLLMClient:
         }
         if response_format is not None:
             body["response_format"] = response_format
+        if num_retries is not None:
+            body["num_retries"] = num_retries
 
         started = time.monotonic()
         try:
-            async with httpx.AsyncClient(timeout=self._timeout(CHAT_TIMEOUT)) as client:
+            async with httpx.AsyncClient(timeout=self._timeout(timeout or CHAT_TIMEOUT)) as client:
                 resp = await client.post(
                     f"{self._base}/v1/chat/completions",
                     json=body,
                     headers={"Authorization": f"Bearer {api_key}"},
                 )
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
+        except (
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.PoolTimeout,
+            # A READ timeout is backpressure too, and it was previously
+            # uncaught. That was harmless while the only caller was tagging at
+            # 180s — nothing realistically hits it — but the reranker sets
+            # 1200ms deliberately and EXPECTS to hit it, and an uncaught
+            # ReadTimeout there would propagate out of a user-facing request as
+            # a 500. The whole point of the short timeout is to degrade.
+            httpx.ReadTimeout,
+        ) as exc:
             raise LiteLLMUnavailable(f"{type(exc).__name__}: {exc}") from exc
         latency_ms = int((time.monotonic() - started) * 1000)
 
@@ -207,8 +253,37 @@ class LiteLLMClient:
             # gateway is the authority on price, not us.
             cost_usd=_header_float(resp, "x-litellm-response-cost"),
             latency_ms=latency_ms,
-            cache_hit=resp.headers.get("x-litellm-cache-hit", "").lower() == "true",
+            cache_hit=_cache_hit(resp),
         )
+
+
+def _cache_hit(resp: httpx.Response) -> bool:
+    """Whether the gateway served this from its response cache.
+
+    THE SIGNAL IS THE PRESENCE OF `x-litellm-cache-key`, NOT A BOOLEAN HEADER.
+    This previously read `x-litellm-cache-hit` and compared it to "true";
+    LiteLLM (1.100.1) never emits that header, so `cache_hit` was False on
+    every call since the client was written. Measured against the running
+    gateway:
+
+        fresh call   3066ms   no  x-litellm-cache-key
+        repeat       1.3ms    has x-litellm-cache-key
+
+    Two things depended on the broken flag, which is why it is worth a named
+    function and a test rather than an inline expression:
+
+      - COST. A cached response still carries a full `x-litellm-response-cost`,
+        so cache hits were mirrored into `model_calls` at full price. "Cost per
+        garment ingested" — a Phase 4 exit criterion — was measuring list price
+        for calls the provider never charged for.
+      - THE CACHE SLI. Phase 7.3 alerts when the rationale cache hit rate falls
+        below 50%. Reading a permanently-False flag, it would have sat at 0%
+        forever: an alert that cannot distinguish a cold cache from a broken
+        one. That is the third time in this project a monitoring signal has
+        been structurally incapable of firing, after the Phase 5 ops alerts and
+        the nightly precompute's tenant query.
+    """
+    return "x-litellm-cache-key" in resp.headers
 
 
 def _header_float(resp: httpx.Response, name: str) -> float | None:

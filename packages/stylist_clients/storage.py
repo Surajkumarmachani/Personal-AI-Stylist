@@ -188,3 +188,64 @@ class ObjectStore:
             self._client.put_bucket_versioning(
                 Bucket=self.bucket, VersioningConfiguration={"Status": "Enabled"}
             )
+
+    def delete_all_versions(self, prefix: str) -> int:
+        """Delete every object under `prefix`, INCLUDING ALL VERSIONS.
+
+        THIS IS NOT `delete_object` IN A LOOP, and the difference is the whole
+        point of §C5 step 4. The bucket has versioning ON (Phase 1 turned it on
+        deliberately, so a bad migration cannot destroy a user's photos), which
+        means `delete_object` writes a DELETE MARKER and leaves the bytes
+        recoverable. To a developer reading the code that looks like deletion.
+        To a regulator it is not erasure, and to anyone with console access the
+        photos are two clicks away.
+
+        So this enumerates `list_object_versions` — both `Versions` and
+        `DeleteMarkers`, because a marker left behind still records that an
+        object existed at that key — and deletes each by VersionId.
+
+        Also aborts multipart uploads: an interrupted upload leaves parts that
+        belong to no object, are invisible to `list_objects_v2`, and are billed
+        and retained until someone notices.
+
+        Returns the number of versions removed, so the caller can record a
+        count rather than asserting success.
+        """
+        removed = 0
+        paginator = self._client.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            targets = [
+                {"Key": obj["Key"], "VersionId": obj["VersionId"]}
+                for kind in ("Versions", "DeleteMarkers")
+                for obj in page.get(kind, [])
+            ]
+            # delete_objects caps at 1000 keys per call.
+            for chunk in (targets[i : i + 1000] for i in range(0, len(targets), 1000)):
+                if not chunk:
+                    continue
+                self._client.delete_objects(
+                    Bucket=self.bucket, Delete={"Objects": chunk, "Quiet": True}
+                )
+                removed += len(chunk)
+
+        # Orphaned multipart parts: not objects, not listed, still stored.
+        uploads = self._client.list_multipart_uploads(Bucket=self.bucket, Prefix=prefix)
+        for upload in uploads.get("Uploads", []):
+            self._client.abort_multipart_upload(
+                Bucket=self.bucket, Key=upload["Key"], UploadId=upload["UploadId"]
+            )
+            removed += 1
+
+        return removed
+
+    def count_versions(self, prefix: str) -> int:
+        """How many versions exist under `prefix`. Used to VERIFY an erasure.
+
+        The exit criterion is "erasure verified absent", not "erasure ran". A
+        count read back after the purge is the difference between the two.
+        """
+        total = 0
+        paginator = self._client.get_paginator("list_object_versions")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=prefix):
+            total += len(page.get("Versions", [])) + len(page.get("DeleteMarkers", []))
+        return total

@@ -28,6 +28,7 @@ import {
 import Link from "next/link";
 
 import GarmentEditor from "./GarmentEditor";
+import PreferenceFacts from "./PreferenceFacts";
 import WardrobeTools from "./WardrobeTools";
 
 // jobs.state -> what the user is told.
@@ -317,6 +318,8 @@ export default function Home() {
           </div>
 
           <WardrobeTools onChanged={() => void refresh()} />
+
+          <PreferenceFacts />
 
           {garments.length === 0 ? (
             <div className="empty">Nothing here yet. Add a photo above.</div>

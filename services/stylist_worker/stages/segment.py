@@ -85,12 +85,26 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
     records: list[dict[str, Any]] = []
     for position, candidate in enumerate(decision.candidates):
         garment_id = ctx.garment_id if position == 0 else uuid.uuid4()
-        mask_png = seg.masks[candidate.mask_indices[0]].mask_png
-        if len(candidate.mask_indices) > 1:
-            mask_png = _union_masks([seg.masks[i].mask_png for i in candidate.mask_indices])
 
-        key = mask_key(ctx.user_id, garment_id)
-        store.put_bytes(key, mask_png, content_type="image/png")
+        # A FLAT-LAY CANDIDATE CARRIES NO MASK, and must not.
+        #
+        # `split_masks` returns one whole-frame candidate with no mask indices
+        # when there is no person in the photo, because the human-parsing
+        # model's regions are shape guesses there. Writing one of those regions
+        # as the mask is what produced the torn cutouts: matting widens its
+        # alpha with the mask, so a fragmentary mask punches holes in an
+        # otherwise clean matte.
+        #
+        # `matte` already treats a missing mask as "use rembg's own alpha",
+        # which is the correct answer for a flat-lay and demonstrably clean on
+        # real photos.
+        key: str | None = None
+        if candidate.mask_indices:
+            mask_png = seg.masks[candidate.mask_indices[0]].mask_png
+            if len(candidate.mask_indices) > 1:
+                mask_png = _union_masks([seg.masks[i].mask_png for i in candidate.mask_indices])
+            key = mask_key(ctx.user_id, garment_id)
+            store.put_bytes(key, mask_png, content_type="image/png")
         records.append(
             {
                 "garment_id": str(garment_id),

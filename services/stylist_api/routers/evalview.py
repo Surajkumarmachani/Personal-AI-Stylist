@@ -178,12 +178,51 @@ async def eval_view(
         text(f"SELECT count(*) FROM garments WHERE {' AND '.join(where)}"),
         {k: v for k, v in params.items() if k not in ("lim", "off")},
     )
+    # WHAT ACTUALLY TAGGED, not what config says. `vlm_model` is the API's own
+    # setting, and the API does not tag — the worker does. When the two drifted
+    # (the API missing VLM_MODEL while the worker had it) this page warned that
+    # tagging was a stand-in while real Gemini was running, which is the worst
+    # direction for a warning to be wrong in: it teaches people to distrust
+    # correct output.
+    #
+    # `model_calls` is the record of calls that were actually made, so it
+    # answers the question the banner is really asking. Config is still
+    # reported alongside it, because a DISAGREEMENT between the two is itself
+    # worth seeing rather than silently resolving in favour of either.
+    # EXPLICIT user_id, because `model_calls` IS NOT RLS-PROTECTED.
+    #
+    # Every other tenant table in this schema is ENABLE + FORCE ROW LEVEL
+    # SECURITY; this one has no policy at all (verified: relrowsecurity = f).
+    # So a query here that relied on RLS the way the rest of the codebase does
+    # reads EVERY tenant's calls — which is how the first version of this
+    # reported another tenant's model name on this tenant's page.
+    #
+    # The predicate is the fix for this endpoint. The missing policy is a
+    # SEPARATE, pre-existing gap: `model_calls` carries user_id, job_id and
+    # cost, and the Phase 5 ops aggregates go through SECURITY DEFINER
+    # functions precisely because they expect to be reading past a policy that
+    # turns out not to exist.
+    last_call = await db.execute(
+        text(
+            "SELECT model_name FROM model_calls "
+            "WHERE purpose = 'tag' AND user_id = CAST(:uid AS uuid) "
+            "ORDER BY created_at DESC LIMIT 1"
+        ),
+        {"uid": str(user.id)},
+    )
+    used = last_call.scalar_one_or_none()
+
     return {
         "items": items,
         "total": int(total.scalar_one()),
         "limit": limit,
         "offset": offset,
         # Stated once at the top so the whole page can be read in context.
-        "tagging_model": vlm_model,
-        "tagging_is_mock": bool(vlm_model and "mock" in vlm_model),
+        "tagging_model": used or vlm_model,
+        "tagging_model_configured": vlm_model,
+        # None when nothing has been tagged yet: "we have not run" and "we ran
+        # a mock" are different facts, and collapsing them into False would
+        # tell a new user their tags are real before any exist.
+        "tagging_is_mock": (("mock" in used) if used else None),
+        "tagging_config_disagrees": bool(used and vlm_model and used != vlm_model),
     }

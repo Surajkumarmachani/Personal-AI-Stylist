@@ -298,6 +298,10 @@ export type Facets = {
   primary_colour: Array<{ value: string; count: number }>;
   dress_code: Array<{ value: string; count: number }>;
   material: Array<{ value: string; count: number }>;
+  // Present for the preference picker rather than for search filtering.
+  subcategory: Array<{ value: string; count: number }>;
+  fit: Array<{ value: string; count: number }>;
+  pattern: Array<{ value: string; count: number }>;
   flags: {
     needs_wash: number;
     needs_review: number;
@@ -458,8 +462,14 @@ export type EvalPage = {
   total: number;
   limit: number;
   offset: number;
+  // What ACTUALLY tagged, read from `model_calls`, not from config — the two
+  // can drift and the banner was wrong because of it.
   tagging_model: string;
-  tagging_is_mock: boolean;
+  tagging_model_configured: string;
+  // null = nothing tagged yet. "we have not run" and "we ran a mock" are
+  // different facts and must not collapse into false.
+  tagging_is_mock: boolean | null;
+  tagging_config_disagrees: boolean;
 };
 
 export async function evalView(opts: {
@@ -477,4 +487,60 @@ export async function evalView(opts: {
       cache: "no-store",
     }),
   );
+}
+
+// ---------------------------------------------------------- preference facts
+//
+// The plan's argument for this feature is that "legibility buys trust faster
+// than accuracy does" — a user who can SEE what the system believes about
+// them, and correct it, forgives a wrong suggestion. That only holds while
+// what is shown is also what is ENFORCED, which is why `never` is a hard
+// filter in the candidate pool and `avoids` is a relaxable one.
+
+export type PreferenceFact = {
+  id: string;
+  kind: "avoids" | "never" | "prefers";
+  field_name: string;
+  field_value: string;
+  // "user" (they said so) or "inferred" (we guessed). Rendered differently:
+  // presenting a guess as the user's own words is how you lose their trust in
+  // one screen.
+  source: string;
+  created_at: string;
+};
+
+export const FACT_FIELDS = [
+  "subcategory",
+  "primary_colour",
+  "material",
+  "fit",
+  "pattern",
+] as const;
+
+export async function listPreferences(): Promise<{ facts: PreferenceFact[] }> {
+  return json(
+    await fetch(`${API_BASE}/me/preferences`, { headers: authHeaders(), cache: "no-store" }),
+  );
+}
+
+export async function addPreference(
+  kind: PreferenceFact["kind"],
+  fieldName: string,
+  fieldValue: string,
+): Promise<PreferenceFact> {
+  return json(
+    await fetch(`${API_BASE}/me/preferences`, {
+      method: "POST",
+      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      body: JSON.stringify({ kind, field_name: fieldName, field_value: fieldValue }),
+    }),
+  );
+}
+
+export async function deletePreference(id: string): Promise<void> {
+  const resp = await fetch(`${API_BASE}/me/preferences/${id}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
 }

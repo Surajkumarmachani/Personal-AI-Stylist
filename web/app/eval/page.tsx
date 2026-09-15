@@ -96,15 +96,45 @@ export default function EvalPageView() {
 
       {error && <div className="err">{error}</div>}
 
-      {page?.tagging_is_mock && (
+      {/* Driven by what ACTUALLY tagged (from `model_calls`), not by this
+          service's own config. The two drifted once — the API was missing
+          VLM_MODEL while the worker had it — and this banner told people their
+          real Gemini tags were a stand-in. A warning that is wrong in that
+          direction teaches users to distrust correct output. */}
+      {page?.tagging_is_mock === true && (
         <div className="panel warn">
           <strong>Tagging is not running a real model.</strong>
           <p className="hint" style={{ margin: "6px 0 0" }}>
             <code>{page.tagging_model}</code> is a deterministic stand-in that answers{" "}
             <code>kurta</code> for everything. Segmentation, cutout, colour, moderation,
             embeddings and dedupe below are all real work on your photos — only the
-            category-ish fields are placeholders. Set <code>OPENAI_API_KEY</code> and{" "}
+            category-ish fields are placeholders. Set <code>GEMINI_API_KEY</code> and{" "}
             <code>VLM_MODEL=vlm-tagger</code> in <code>.env</code> for real tags.
+          </p>
+        </div>
+      )}
+
+      {/* Nothing tagged yet is NOT the same as "tags are real", so it gets its
+          own message rather than silently showing no banner. */}
+      {page?.tagging_is_mock === null && (
+        <div className="panel">
+          <strong>No garments have been tagged yet.</strong>
+          <p className="hint" style={{ margin: "6px 0 0" }}>
+            Tagging is configured to use <code>{page.tagging_model_configured}</code>. Upload a
+            photo to see real tags here.
+          </p>
+        </div>
+      )}
+
+      {/* A disagreement between what ran and what is configured is worth
+          seeing rather than resolving silently in favour of either. */}
+      {page?.tagging_config_disagrees && (
+        <div className="panel warn">
+          <strong>Config and reality disagree.</strong>
+          <p className="hint" style={{ margin: "6px 0 0" }}>
+            The last tag call used <code>{page.tagging_model}</code>, but this service is
+            configured for <code>{page.tagging_model_configured}</code>. Tags below were
+            produced by the first; new ones may use the second.
           </p>
         </div>
       )}

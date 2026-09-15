@@ -23,6 +23,20 @@ ml is reported but NOT fatal to readiness: the ingest pipeline degrades
 deliberately when ml is down (Unavailable backpressure, then DEGRADED_TAGGED),
 and the API still serves reads, corrections and boards. Failing readiness would
 pull the whole API out of rotation over a degradation it is designed to absorb.
+
+WHAT IS FATAL, AND WHY redis_cache IS NOT
+------------------------------------------
+Fatal: Postgres and redis_queue. Without Postgres nothing works; without the
+queue an upload is accepted and then never processed, which is worse than
+refusing it.
+
+NOT fatal: ml, and redis_cache. The cache holds rationales and rate counters —
+`GET /suggestions` degrades to template text without it and keeps serving.
+Measured during the 2026-09-15 game day: with redis_cache stopped, `/readyz`
+returned 503 while `/suggestions` returned 200. A load balancer reading that
+probe would have pulled a working instance out of rotation and turned a cache
+outage into a total one — the exact failure the ml decision above exists to
+prevent, applied inconsistently to the dependency next to it.
 """
 
 from __future__ import annotations
@@ -64,12 +78,21 @@ async def readyz(
     except Exception as exc:
         checks["postgres"] = f"error: {type(exc).__name__}"
 
-    for name, client in (("redis_queue", queue), ("redis_cache", cache)):
-        try:
-            await client.ping()
-            checks[name] = "ok"
-        except Exception as exc:
-            checks[name] = f"error: {type(exc).__name__}"
+    # FATAL. An upload accepted into a queue nobody can read is worse than an
+    # upload refused: the user believes it worked.
+    try:
+        await queue.ping()
+        checks["redis_queue"] = "ok"
+    except Exception as exc:
+        checks["redis_queue"] = f"error: {type(exc).__name__}"
+
+    # NOT fatal — see the module docstring. Probed and reported, because a cold
+    # cache is worth knowing about; it just is not worth an outage.
+    try:
+        await cache.ping()
+        cache_status = "ok"
+    except Exception as exc:
+        cache_status = f"error: {type(exc).__name__}"
 
     # Over DNS, on the worker's path. Reported separately from `checks` so it
     # never gates readiness (see the module docstring).
@@ -86,7 +109,7 @@ async def readyz(
     except Exception as exc:
         # The failure that was previously invisible to every probe.
         ml_status = f"unreachable: {type(exc).__name__}"
-    dependencies: dict[str, str] = {"ml": ml_status}
+    dependencies: dict[str, str] = {"ml": ml_status, "redis_cache": cache_status}
 
     ready = all(v == "ok" for v in checks.values())
     if not ready:

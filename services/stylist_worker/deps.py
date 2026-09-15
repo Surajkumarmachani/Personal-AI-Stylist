@@ -14,11 +14,13 @@ from __future__ import annotations
 from stylist_api.settings import get_settings
 from stylist_clients.litellm_client import LiteLLMClient
 from stylist_clients.ml_client import MLClient
+from stylist_clients.redis_client import CacheRedis
 from stylist_clients.storage import ObjectStore
 
 _store: ObjectStore | None = None
 _ml: MLClient | None = None
 _litellm: LiteLLMClient | None = None
+_cache: CacheRedis | None = None
 
 
 def get_object_store() -> ObjectStore:
@@ -55,9 +57,24 @@ def get_litellm_client() -> LiteLLMClient:
     return _litellm
 
 
+def get_cache() -> CacheRedis:
+    """The rationale cache (Phase 7.3).
+
+    The worker WRITES it nightly and the API READS it, which is the whole point
+    of precomputing rationales: the model call happens where nobody is waiting,
+    and the morning request is an indexed cache read rather than a 3-second
+    provider round trip.
+    """
+    global _cache
+    if _cache is None:
+        _cache = CacheRedis(get_settings().redis_cache_url)
+    return _cache
+
+
 def reset() -> None:
     """For tests, so a fake does not leak between cases."""
-    global _store, _ml, _litellm
+    global _store, _ml, _litellm, _cache
     _store = None
     _ml = None
     _litellm = None
+    _cache = None

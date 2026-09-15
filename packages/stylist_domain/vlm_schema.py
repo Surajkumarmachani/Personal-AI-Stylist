@@ -157,13 +157,26 @@ def build_schema(taxonomy: Taxonomy, *, cells: list[str]) -> dict[str, Any]:
             # The tag stage divides by 100 on the way in, so the database, the
             # review thresholds and the API keep the 0-1 floats they always had.
             "description": (
-                "Per-field confidence as an INTEGER 0-100 (95 means 0.95). "
-                "Drives the review gate."
+                "Per-field confidence as an INTEGER 0-100 (95 means 0.95). Drives the review gate."
             ),
             "properties": {
                 name: {"type": "integer", "minimum": 0, "maximum": 100}
                 for name in vlm_fields(taxonomy)
             },
+            # EVERY key is required, and the omission of this line was a real
+            # bug. `properties` alone constrains the SHAPE of a key that is
+            # present and says nothing about whether it must be; Gemini duly
+            # returned `subcategory` and `warmth` and dropped the other four
+            # while still emitting values for them. The review gate then read a
+            # missing confidence as 0.0 and flagged EVERY garment for review —
+            # 17 of 17 on the first real run — which makes the review queue the
+            # whole wardrobe and destroys the correction-rate signal.
+            #
+            # OpenAI's strict mode already demands that `required` list every
+            # key in `properties`, so this is also what makes the schema
+            # portable to the `vlm-tagger-backup` row rather than only valid
+            # against the provider that happened to be lenient.
+            "required": list(vlm_fields(taxonomy)),
             "additionalProperties": False,
         },
     }

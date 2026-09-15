@@ -278,6 +278,22 @@ def _parse(
 
         missing = required - set(values)
         confidence = item.get("confidence") or {}
+
+        # A field we took a VALUE for but got no CONFIDENCE for. The review gate
+        # below treats that as 0.0 and flags the garment, which is the right
+        # conservative call — we genuinely do not know how sure the model was —
+        # but it must not be SILENT. It was, and the result was every garment in
+        # the review queue with nothing anywhere saying why. The schema now marks
+        # these keys required, so a warning here means the provider ignored it.
+        unscored = sorted((set(values) & set(fields)) - set(confidence))
+        if unscored:
+            logger.warning(
+                "garment %s returned values with no confidence: %s "
+                "(routing to review; the provider ignored the schema's `required`)",
+                garment_id,
+                unscored,
+            )
+
         out.append(
             {
                 "garment_id": garment_id,
@@ -285,10 +301,42 @@ def _parse(
                 "confidence": _confidence(confidence),
                 "dropped": dropped,
                 "missing_required": sorted(missing),
+                "unscored": unscored,
                 "raw_item": item,
             }
         )
     return out
+
+
+def _slot_from_subcategory(
+    taxonomy: Any, subcategory: str | None, confidence: dict[str, float]
+) -> str | None:
+    """Which slot the VLM's subcategory implies, if we trust it enough.
+
+    `slot` normally comes from segmentation — a HUMAN PARSING model that, on a
+    flat-lay, has no person to parse and guesses from shape. Measured: three
+    photos of jeans produced `upper_base`, `full_body` and `bag`, never
+    `Pants`, while the VLM said "jeans" at 95-98% and the taxonomy groups jeans
+    under `lower`.
+
+    Returns None rather than a guess in three cases, because the slot decides
+    which outfits a garment can ever appear in and a wrong one is silent:
+
+      - the model gave no subcategory
+      - it was not confident enough (see SLOT_OVERRIDE_MIN_CONFIDENCE)
+      - the subcategory is not grouped into any slot in taxonomy.yaml, which
+        means the taxonomy and the schema have drifted and this is not the
+        place to paper over it
+    """
+    if not subcategory:
+        return None
+    if confidence.get("subcategory", 0.0) < SLOT_OVERRIDE_MIN_CONFIDENCE:
+        return None
+    try:
+        return str(taxonomy.default_slot_for(subcategory))
+    except KeyError:
+        logger.warning("subcategory %r has no slot in taxonomy.yaml", subcategory)
+        return None
 
 
 async def _write_tags(
@@ -318,9 +366,17 @@ async def _write_tags(
                 for name, threshold in review_below.items()
             ) or bool(entry["missing_required"])
 
+            # The slot implied by what the VLM actually saw, or None to leave
+            # segmentation's answer alone. None when the model was not
+            # confident enough, or named a subcategory the taxonomy does not
+            # group into a slot — guessing on either would replace a known
+            # unreliable source with an unknown one.
+            slot = _slot_from_subcategory(taxonomy, values.get("subcategory"), entry["confidence"])
+
             await session.execute(
                 text(_TAG_UPDATE_SQL),
                 {
+                    "slot": slot,
                     "subcategory": values.get("subcategory"),
                     "material": values.get("material"),
                     "dress_code": values.get("dress_code"),
@@ -366,9 +422,32 @@ def _keep_if_verified(column: str, cast: str | None = None) -> str:
     )
 
 
+# Confidence below which we do NOT let the VLM override the segmentation slot.
+#
+# The slot decides which outfits a garment can appear in, so a wrong one is
+# silently expensive: a pair of jeans filed as `upper_base` is excluded from
+# every outfit that needs a `lower` and nothing surfaces the reason. Overriding
+# on a 55%-confident subcategory would trade one silent error for another, so
+# this sits above the taxonomy's `review_below` thresholds.
+SLOT_OVERRIDE_MIN_CONFIDENCE = 0.80
+
 _TAG_UPDATE_SQL = f"""
     UPDATE garments SET
       {_keep_if_verified("subcategory", "subcategory")},
+      -- SLOT, CORRECTED FROM THE SUBCATEGORY THE VLM ACTUALLY SAW.
+      --
+      -- `slot` comes from segmentation, and segmentation is a HUMAN PARSING
+      -- model. On a flat-lay it has no person to parse and its class labels are
+      -- shape guesses: three photos of jeans produced `upper_base`, `full_body`
+      -- and `bag`, never `Pants`. The VLM looked at the garment and said
+      -- "jeans" at 95-98%, and taxonomy.yaml knows jeans are `lower`.
+      --
+      -- So the more reliable source wins, under two guards. It only applies
+      -- when the VLM cleared SLOT_OVERRIDE_MIN_CONFIDENCE (passed as NULL
+      -- otherwise), and `slot` is subject to the same `user_verified_fields`
+      -- rule as every other column — a slot the user fixed by hand is never
+      -- overwritten by a model, which is the whole point of that column.
+      {_keep_if_verified("slot", "slot")},
       {_keep_if_verified("material", "material")},
       {_keep_if_verified("dress_code", "dress_code")},
       {_keep_if_verified("fit", "fit")},

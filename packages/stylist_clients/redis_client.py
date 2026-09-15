@@ -123,10 +123,19 @@ class CacheRedis:
     # by design so that telemetry can never fail a request. The counters read
     # as empty, and the alert built on them could not fire.
 
-    async def incr_bucketed(self, key: str, field: str, *, ttl_seconds: int) -> None:
-        """Increment one field of a bucketed hash, refreshing its expiry."""
+    async def incr_bucketed(
+        self, key: str, field: str, *, ttl_seconds: int, amount: int = 1
+    ) -> None:
+        """Increment one field of a bucketed hash, refreshing its expiry.
+
+        `amount` exists because a counter that can only step by 1 forces the
+        caller to record EVENTS when the SLI is about ITEMS. The Phase 7
+        rationale cache hit its exact trap: one request looking up 5 outfits
+        and finding 1 incremented `hit` once and `miss` once, so a true 20% hit
+        rate read as 50% — the one number the alert exists to detect.
+        """
         pipe = self._r.pipeline()
-        pipe.hincrby(key, field, 1)
+        pipe.hincrby(key, field, amount)
         pipe.expire(key, ttl_seconds)
         await pipe.execute()
 
