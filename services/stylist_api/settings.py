@@ -27,7 +27,9 @@ class Settings(BaseSettings):
     database_url: str = Field(
         default="postgresql+asyncpg://stylist_app:stylist_app_local_only@localhost:5432/stylist"
     )
-    # PROVISIONAL: retune in P9. The RATIO (api 20 > workers 10 > ml 5) is a
+    # PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+    # Resolves when: peak concurrent connections per service under real load.
+    # The RATIO (api 20 > workers 10 > ml 5) is a
     # deliberate bulkhead so a worker burst cannot exhaust Postgres and take
     # down the API (§C2). The absolute numbers are invented against imagined
     # traffic and mean nothing until measured in Phases 5-8.
@@ -100,12 +102,47 @@ class Settings(BaseSettings):
     # newlines — produces an unparseable key and a stack trace three layers
     # down. Unset disables push; nothing else changes.
     firebase_credentials_file: str = Field(default="")
+
+    # ---- try-on (Phase 10) ----
+    # EMPTY, and that is the current correct value. Phase 10 opens with
+    # ---- Virtual try-on ----
+    # "Benchmark before you build" — a 10-body x 16-garment grid including
+    # sarees, kurtas and a sherwani — because "the published benchmark used
+    # Western garments; your routing table must come from your own grid".
+    #
+    # That grid gates the ROUTING TABLE (which model per category), not the
+    # render path itself: there is no way to run the grid without a working
+    # provider call, so exactly ONE provider is configurable here and there is
+    # deliberately no fallback chain and no per-category selection. Those are
+    # the parts that need the data. See stylist_clients.vton_client.
+    #
+    # One of: leffa | idm-vton | ootdiffusion. Unset degrades
+    # `POST /outfits/{hash}/tryon` to the board, which is the exit criterion's
+    # required behaviour anyway.
+    vton_provider: str = Field(default="")
+    # A Hugging Face token. NOT optional in practice: all three candidate
+    # Spaces run on ZeroGPU, which rejects anonymous programmatic calls in
+    # under a second with an empty error body. Without this, try-on degrades
+    # to the board on every request and the reason is unobvious.
+    vton_api_token: str = Field(default="")
+    # Overrides the public Space URL for a self-hosted or dedicated Inference
+    # Endpoint. The Gradio protocol is identical; only the host changes.
+    vton_base_url: str = Field(default="")
+    # Wall-clock ceiling for one render. 30-120s is normal on shared ZeroGPU
+    # hardware and the queue is other people's traffic, so this is generous by
+    # design — it exists to stop an abandoned stream holding a worker, not to
+    # enforce a latency target we do not control.
+    # PROVISIONAL — set 2026-09-17 with no measured render on this account.
+    # Resolves when: p95 render latency over the benchmark grid.
+    vton_timeout_s: float = Field(default=900.0)
     # Free-tier monthly LLM+VLM budget per tenant (§B3). Enforced by LiteLLM as
     # a hard budget on the virtual key, not by feature code.
     free_tier_monthly_budget_usd: float = Field(default=0.15)
 
     # ---- SSE progress stream ----
-    # PROVISIONAL: retune in P9. 500ms is invisible inside a 10s ingest budget;
+    # PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+    # Resolves when: measured SSE connection counts. 500ms is invisible
+    # inside a 10s ingest budget;
     # the 300s cap stops a phone that backgrounds mid-upload from pinning a
     # connection (and its DB session) indefinitely. Configurable mainly so
     # tests can shrink the cap — a test that waits out the production cap makes

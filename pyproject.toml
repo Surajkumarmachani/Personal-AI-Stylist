@@ -98,7 +98,7 @@ mypy_path = "packages:services"
 explicit_package_bases = true
 # Third-party packages without shipped stubs.
 [[tool.mypy.overrides]]
-module = ["arq.*", "boto3.*", "botocore.*", "rembg.*", "onnxruntime.*"]
+module = ["arq.*", "boto3.*", "botocore.*", "rembg.*", "onnxruntime.*", "scipy.*"]
 ignore_missing_imports = true
 
 

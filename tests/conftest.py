@@ -181,12 +181,21 @@ class FakeObjectStore:
         self.presign_ttl_seconds = 900
 
     def presign_upload(
-        self, *, user_id: uuid.UUID | str, content_type: str, max_bytes: int = 12 * 1024 * 1024
+        self,
+        *,
+        user_id: uuid.UUID | str,
+        content_type: str,
+        max_bytes: int = 12 * 1024 * 1024,
+        # Mirrors the real signature. A fake that silently ignores a new
+        # parameter would let `prefix="body"` pass tests while every body photo
+        # landed under `originals/` in production — exactly the separation that
+        # consent, revocation and erasure all depend on.
+        prefix: str = "originals",
     ) -> PresignedUpload:
         if content_type not in ALLOWED_CONTENT_TYPES:
             raise ValueError(f"content_type not allowed: {content_type}")
         upload_id = str(uuid.uuid4())
-        key = f"originals/{user_id}/{upload_id}"
+        key = f"{prefix}/{user_id}/{upload_id}"
         return PresignedUpload(
             upload_id=upload_id,
             key=key,
@@ -195,6 +204,22 @@ class FakeObjectStore:
             expires_at=datetime.now(UTC) + timedelta(seconds=900),
             max_bytes=max_bytes,
         )
+
+    def delete_all_versions(self, prefix: str) -> int:
+        """Mirrors the real method, INCLUDING that it takes a prefix.
+
+        The real one exists because the bucket is versioned, so `delete_object`
+        writes a delete marker and leaves the bytes recoverable. A fake that
+        did not implement it at all turned every body-photo revocation into a
+        502 — which is how it was noticed.
+        """
+        matched = [k for k in self.objects if k.startswith(prefix)]
+        for key in matched:
+            del self.objects[key]
+        return len(matched)
+
+    def count_versions(self, prefix: str) -> int:
+        return sum(1 for k in self.objects if k.startswith(prefix))
 
     def complete_upload(self, key: str) -> None:
         """Simulate the client's direct-to-storage PUT succeeding."""

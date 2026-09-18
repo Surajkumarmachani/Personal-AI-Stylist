@@ -1,0 +1,37 @@
+#!/usr/bin/env bash
+# docker compose for this project, with --env-file wired in.
+#
+# WHY THIS EXISTS
+# ---------------
+# Two separate traps, both of which have bitten more than once and are both
+# documented in docs/implementation-plan.md:
+#
+#   1. --env-file IS LOAD-BEARING. Compose takes its project directory from the
+#      compose FILE's location, so it looks for infra/compose/.env and never
+#      reads the .env at the repo root. Without it GEMINI_API_KEY interpolates
+#      to "", VLM_MODEL falls back to the mock, and the stack comes up healthy
+#      while silently tagging every garment with the stand-in model.
+#
+#   2. IN ZSH, AN UNQUOTED SCALAR IS NOT WORD-SPLIT. The obvious workaround —
+#      DC="docker compose -f ... --env-file .env"; $DC ps — tries to execute
+#      the whole string as one filename and fails, often with its stderr
+#      filtered out of whatever pipeline it was in. That trap is recorded in
+#      the cross-phase pass AND in Phase 5, and it still recurred during the
+#      Phase 9 game day. Knowing about it has now failed to prevent it three
+#      times, which is the argument for a file rather than a fourth note.
+#
+#   scripts/dc ps
+#   scripts/dc logs worker
+#   scripts/dc exec -T postgres psql -U stylist_owner -d stylist -c '\dt'
+set -euo pipefail
+
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+compose="$root/infra/compose/docker-compose.yml"
+
+# Passed only when the file exists, so a fresh clone with no .env still works —
+# compose errors on a missing --env-file path rather than ignoring it.
+if [[ -f "$root/.env" ]]; then
+  exec docker compose -f "$compose" --env-file "$root/.env" "$@"
+else
+  exec docker compose -f "$compose" "$@"
+fi

@@ -102,7 +102,21 @@ class ObjectStore:
         user_id: uuid.UUID | str,
         content_type: str,
         max_bytes: int = MAX_UPLOAD_BYTES,
+        prefix: str = "originals",
     ) -> PresignedUpload:
+        """Presign one upload.
+
+        `prefix` separates DATA CLASSES in storage, and body photos are the
+        reason it exists. A photograph of a person is a different kind of thing
+        from a photograph of a shirt: it needs its own consent, its own
+        revocation, and its own answer to "is this gone yet". Filing both under
+        `originals/` would make them indistinguishable to every prefix
+        operation, including the erasure saga's.
+
+        Anything added here MUST also be added to the erasure saga's prefix
+        list (`stylist_worker.erasure._delete_objects`), or account deletion
+        walks straight past it. `tests/test_erasure.py` asserts the two agree.
+        """
         if content_type not in ALLOWED_CONTENT_TYPES:
             raise ValueError(f"content_type not allowed: {content_type}")
         if not (MIN_UPLOAD_BYTES < max_bytes <= MAX_UPLOAD_BYTES):
@@ -111,7 +125,7 @@ class ObjectStore:
         upload_id = str(uuid.uuid4())
         # Tenant-prefixed key. Makes the erasure saga's "delete all objects for
         # this user" a prefix operation rather than a table scan (§C5 step 4).
-        key = f"originals/{user_id}/{upload_id}"
+        key = f"{prefix}/{user_id}/{upload_id}"
 
         post = self._signer.generate_presigned_post(
             Bucket=self.bucket,

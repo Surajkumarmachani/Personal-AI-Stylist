@@ -22,15 +22,26 @@ settled samples never fires**, because 2 failures in 3 requests is 67% and
 means nothing. And `/ops/*` requests are excluded from the 5xx counters, so a
 monitoring loop cannot dilute the rate it measures.
 
-A shell for the database, used throughout:
+**Use `scripts/dc`, not `docker compose` directly.** It wires in
+`--env-file .env`, which is load-bearing: compose takes its project directory
+from the compose FILE's location, so a bare invocation looks for
+`infra/compose/.env`, finds nothing, interpolates every `${VAR}` to empty, and
+brings the stack up configured differently from how you think it is. The helper
+also exists because assigning the command to a shell variable does not work in
+zsh — an unquoted scalar is not word-split — which has caught people here three
+times.
 
 ```bash
-PSQL='docker compose -f infra/compose/docker-compose.yml --env-file .env exec -T postgres psql -U stylist_owner -d stylist'
+scripts/dc ps
+scripts/dc logs worker
+scripts/dc exec -T postgres psql -U stylist_owner -d stylist -c '\dt'
 ```
 
-`--env-file .env` is load-bearing. Without it compose reads `infra/compose/.env`
-(which does not exist), every `${VAR}` interpolates to empty, and you will debug
-a service that is not configured the way you think it is.
+A shell alias for the database, used throughout:
+
+```bash
+psql() { scripts/dc exec -T postgres psql -U stylist_owner -d stylist "$@"; }
+```
 
 ---
 
@@ -47,11 +58,18 @@ for at least one user and they have no idea why.
 2. **A poison image.** A corrupt file fails identically on every attempt. These
    should reach `rejected` after ONE attempt rather than the DLQ — if one is in
    the DLQ, the classification of the error is wrong, not the retry count.
-3. **Head-of-line blocking.** `Unavailable` sleeps IN-PROCESS, so at
-   `WORKER_MAX_JOBS=2` two jobs waiting on down infrastructure stall the whole
-   queue. This is a KNOWN, UNFIXED issue (cross-phase pass, 2026-09-10): the fix
-   is to release the slot and re-enqueue with a delay. Symptom is jobs DLQ'ing
-   in sequence ~240s apart rather than together.
+3. **Head-of-line blocking — FIXED 2026-09-18.** `Unavailable` used to sleep
+   IN-PROCESS for up to 180s, so at `WORKER_MAX_JOBS=2` two jobs waiting on
+   down infrastructure stalled the whole queue. A job now waits in-process only
+   up to `IN_PROCESS_WAIT_BUDGET_SECONDS` (10s) and then RE-ENQUEUES itself with
+   a delay, releasing the slot.
+
+   If you see this symptom again, check `deferrals` and `dependency_wait_s` on
+   the job: a job that is deferring is working correctly and its wait is
+   accumulating toward the same 180s budget. A job stuck with `deferrals = 0`
+   and a rising `updated_at` is the old behaviour and means the worker is
+   running stale code — `up -d` on an unchanged container does NOT restart the
+   process, use `scripts/dc restart worker`.
 
 **Verify:**
 
@@ -59,6 +77,18 @@ for at least one user and they have no idea why.
 SELECT id, state, dlq_at, stage_attempts, left(last_error, 160) AS err
 FROM jobs WHERE dlq_at IS NOT NULL ORDER BY dlq_at LIMIT 10;
 ```
+
+Jobs that are DEFERRING rather than stuck — waiting out a dependency outage in
+the queue instead of in a worker slot:
+
+```sql
+SELECT id, state, deferrals, round(dependency_wait_s) AS waited_s,
+       left(last_error, 80) AS err
+FROM jobs WHERE deferrals > 0 AND dlq_at IS NULL ORDER BY dependency_wait_s DESC;
+```
+
+`waited_s` climbing toward 180 with `deferrals` rising is correct behaviour
+during an outage. `waited_s` at 180 means the next round DLQs.
 
 `stage_attempts` names the stage that failed. That is the answer most of the
 time — read it before anything else.
@@ -68,8 +98,8 @@ time — read it before anything else.
   this — stages derive their inputs from object keys, so any worker can pick up
   any job with no handover.
 - Poison image: the job is correctly terminal. Tell the user; do not retry.
-- Head-of-line blocking: restart the worker to clear in-process sleeps.
-  `docker compose ... restart worker`. This is a mitigation, not a fix.
+- Head-of-line blocking: no longer expected (see cause 3). If it recurs,
+  `scripts/dc restart worker` still clears in-process sleeps.
 
 **Rollback.** Nothing to roll back — the DLQ is a symptom. If a deploy caused
 it, roll that back and re-enqueue.
@@ -163,8 +193,7 @@ GROUP BY 1 ORDER BY 2 DESC;
 Per-stage timings, which answer "is it slow or is it broken":
 
 ```bash
-docker compose -f infra/compose/docker-compose.yml --env-file .env \
-  logs worker | grep pipeline_done | tail -5
+scripts/dc logs worker | grep pipeline_done | tail -5
 ```
 
 **Mitigate.** A single failing stage usually means its dependency. Check
@@ -200,8 +229,7 @@ least 20 requests.
 **Verify:**
 
 ```bash
-docker compose -f infra/compose/docker-compose.yml --env-file .env \
-  logs api | grep -A 20 Traceback | tail -40
+scripts/dc logs api | grep -A 20 Traceback | tail -40
 ```
 
 Then the counters, which are a property of the SERVICE rather than of whichever
@@ -221,7 +249,7 @@ curl -s localhost:8080/readyz | jq
 count before restarting anything — restarting the API while the pool is
 exhausted makes it worse.
 
-**Rollback.** `docker compose ... up -d` on the previous image. Migrations are
+**Rollback.** `scripts/dc up -d` on the previous image. Migrations are
 expand-then-contract, so the previous version runs against the current schema.
 
 **Escalate** if 5xx persists after a rollback. That is infrastructure.
@@ -266,8 +294,7 @@ from `completed_steps` and skips what is done, so there is nothing to undo
 before retrying. To force a run:
 
 ```bash
-docker compose -f infra/compose/docker-compose.yml --env-file .env exec -T worker \
-  python -c "import asyncio,os;from stylist_db.session import init_engine;
+scripts/dc exec -T worker python -c "import asyncio,os;from stylist_db.session import init_engine;
 from stylist_worker.erasure import drain_erasures;
 init_engine(os.environ['DATABASE_URL']);print(asyncio.run(drain_erasures({})))"
 ```

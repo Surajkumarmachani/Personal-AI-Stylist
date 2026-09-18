@@ -68,10 +68,42 @@ IOU_DUPLICATE_THRESHOLD = 0.5
 DRAPE_AMBIGUITY_IOU = 0.30
 DRAPE_AMBIGUOUS_CLASSES = frozenset({"Skirt", "Dress", "Scarf"})
 
-# Above this share of skin the photo is worn rather than a flat-lay. Used only
-# to annotate the result — nothing branches on it yet, but Phase 4's VLM prompt
-# and the correction UI both want to know.
-WORN_SKIN_THRESHOLD = 0.03
+# Above this share of skin the photo is WORN rather than a flat-lay.
+#
+# THIS IS LOAD-BEARING. Rule 5 below branches on it: a photo judged flat-lay is
+# not split at all. The comment here used to say "nothing branches on it yet",
+# which was true when the constant only annotated the result — and it stayed
+# there after rule 5 made it control flow, so its calibration was never
+# revisited. That staleness is why the value below was wrong for eight months
+# of this project rather than for eight minutes.
+#
+# 0.03 WAS WRONG, AND WRONG IN A WAY SPECIFIC TO THIS WARDROBE.
+# Measured 2026-09-17 against real photographs (the first real photographs this
+# pipeline has ever seen — everything before was procedurally generated):
+#
+#   WORN, ethnic          skin_pct        WORN, western / flat-lay   skin_pct
+#   saree (arms bare)       0.0213        folded flat-lay (4 items)    0.0000
+#   kurta, full sleeve      0.0185        dress shirt, product shot    0.0000
+#   salwar kameez           0.0123        t-shirt, product shot        0.0000
+#   sherwani                0.0088        lehenga, product shot        0.0000
+#
+# At 0.03, ALL FOUR worn ethnic photos were misread as flat-lays — including
+# the saree, where the wearer's face, shoulders and arms are plainly visible.
+# The reason is structural, not a tuning accident: a kurta, sherwani or fully
+# draped saree covers the wrist, the neck and the ankle. A t-shirt and jeans do
+# not. A skin-fraction threshold calibrated on Western clothing encodes an
+# assumption about how much of a person their clothes leave visible, and that
+# assumption does not survive contact with ethnic wear.
+#
+# The observed separation is clean — every true flat-lay measured exactly
+# 0.0000 — so 0.005 sits with margin on both sides of it.
+#
+# PROVISIONAL — set 2026-09-17 on n=8 PUBLIC images, not this wardrobe.
+# Resolves when: the owner's real photographs are ingested and skin_pct is
+# measured across them. The failure mode to watch is the opposite one: a
+# flat-lay shot on a wooden floor or skin-toned surface reading as worn, which
+# would split it into the garbage masks rule 5 exists to suppress.
+WORN_SKIN_THRESHOLD = 0.005
 
 
 class SplitOutcome(StrEnum):
@@ -93,12 +125,32 @@ class MaskInfo:
 
 
 @dataclass(frozen=True, slots=True)
+class ComponentInfo:
+    """One spatially disjoint blob in a flat-lay. NO label, deliberately.
+
+    Like MaskInfo this is not the pixels — the connected-component pass runs in
+    the ml service, where the arrays already are, and this module receives only
+    the geometry. Keeping image data out of the decision logic is the same rule
+    that makes `iou` work on boxes rather than masks.
+    """
+
+    bbox: tuple[int, int, int, int]
+    area_pct: float
+    index: int
+
+
+@dataclass(frozen=True, slots=True)
 class GarmentCandidate:
     slot_hint: str | None
     atr_labels: tuple[str, ...]  # >1 when masks were merged (a pair of shoes)
     area_pct: float
     bbox: tuple[int, int, int, int]
     mask_indices: tuple[int, ...]
+    # Index into the ml service's `flatlay_components`, set ONLY on the
+    # flat-lay path. The caller uses it to fetch that component's own mask
+    # instead of unioning `mask_indices`, because on a flat-lay the masks are
+    # mislabelled and one of them can span several garments.
+    component_index: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,7 +215,12 @@ def detect_drape_ambiguity(masks: list[MaskInfo]) -> str | None:
     return None
 
 
-def split_masks(masks: list[MaskInfo], *, skin_pct: float = 0.0) -> SplitResult:
+def split_masks(
+    masks: list[MaskInfo],
+    *,
+    skin_pct: float = 0.0,
+    components: tuple[ComponentInfo, ...] = (),
+) -> SplitResult:
     """Decide which masks become garments.
 
     Order matters: the area floor runs FIRST so that noise masks cannot
@@ -173,14 +230,46 @@ def split_masks(masks: list[MaskInfo], *, skin_pct: float = 0.0) -> SplitResult:
     is_worn = skin_pct >= WORN_SKIN_THRESHOLD
     dropped: list[str] = []
 
-    # RULE 5: a flat-lay is one garment, not a parse.
+    # RULE 5: a flat-lay is not PARSED — but it may still be SPLIT.
     #
     # No person in frame means the human-parsing model had nothing to parse and
-    # its class labels are shape guesses. Emitting one whole-frame candidate
-    # with NO slot hint is the honest result: we know there is a garment here,
-    # we do not know from this model what kind, and the VLM — which looks at
-    # the actual garment rather than at body regions — answers that far better.
+    # its class labels are shape guesses, so the labels go in the bin either
+    # way. The question is how many garments are in the photo.
+    #
+    # Originally this returned exactly one whole-frame candidate, which was
+    # right about the labels and wrong about the count: a photo of four folded
+    # garments catalogued as one garment. The fix is that the labels being
+    # wrong does not make the PIXELS wrong — measured 2026-09-17, the union of
+    # five mislabelled masks over four folded garments has exactly four
+    # connected components, positioned correctly.
+    #
+    # So when the ml service reports disjoint components, each becomes a
+    # candidate. When it reports none (an older image, an empty frame, or a
+    # union that fragmented past its cap) this falls back to the single
+    # whole-frame candidate, which is the previous behaviour.
     if not is_worn:
+        if len(components) > 1:
+            return SplitResult(
+                outcome=SplitOutcome.OK,
+                candidates=tuple(
+                    GarmentCandidate(
+                        # Still None. A component tells us WHERE a garment is,
+                        # never WHAT it is — that is the VLM's job, and
+                        # inventing a slot here would reintroduce exactly the
+                        # error rule 5 exists to prevent.
+                        slot_hint=None,
+                        atr_labels=("flat_lay",),
+                        area_pct=c.area_pct,
+                        bbox=c.bbox,
+                        mask_indices=(),
+                        component_index=c.index,
+                    )
+                    for c in components
+                ),
+                reason=f"flat-lay split into {len(components)} disjoint garments",
+                dropped=tuple(f"{m.atr_label} (flat-lay: label discarded)" for m in masks),
+                is_worn=False,
+            )
         return SplitResult(
             outcome=SplitOutcome.OK,
             candidates=(
@@ -191,9 +280,10 @@ def split_masks(masks: list[MaskInfo], *, skin_pct: float = 0.0) -> SplitResult:
                     # needs a `lower`.
                     slot_hint=None,
                     atr_labels=("flat_lay",),
-                    area_pct=1.0,
-                    bbox=(0, 0, 0, 0),  # whole frame; the matte defines the edges
+                    area_pct=components[0].area_pct if components else 1.0,
+                    bbox=components[0].bbox if components else (0, 0, 0, 0),
                     mask_indices=(),
+                    component_index=components[0].index if components else None,
                 ),
             ),
             dropped=tuple(f"{m.atr_label} (flat-lay: not split)" for m in masks),

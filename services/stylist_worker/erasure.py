@@ -299,12 +299,26 @@ async def _delete_objects(
     from stylist_worker import deps
 
     store = deps.get_object_store()
+    # EVERY prefix `presign_upload` can write, plus everything the pipeline
+    # derives. A prefix missing here is data that survives an account deletion
+    # — invisible, because nothing else ever lists it.
+    #
+    # `body/` is the one most worth naming: body photographs are the most
+    # sensitive class this system stores, they are uploaded under their own
+    # prefix so consent and revocation can target them separately, and that
+    # same separation is exactly what would let an erasure walk past them.
     prefixes = [
         f"originals/{user_id}/",
         f"cutouts/{user_id}/",
         f"masks/{user_id}/",
         f"boards/{user_id}/",
         f"grids/{user_id}/",
+        f"body/{user_id}/",
+        # Renders of the OWNER'S BODY wearing their clothes. Derived, and more
+        # sensitive than either input — missing this prefix would leave
+        # photographs of a deleted person's body in the bucket.
+        f"tryon/{user_id}/",
+        f"exports/{user_id}/",
     ]
 
     deleted = 0

@@ -33,6 +33,7 @@ from stylist_api.routers import (
     push,
     search,
     suggestions,
+    tryon,
     wear,
 )
 from stylist_api.settings import get_settings
@@ -164,6 +165,7 @@ def create_app() -> FastAPI:
     app.include_router(calendar.router)
     app.include_router(push.router)
     app.include_router(privacy.router)
+    app.include_router(tryon.router)
 
     from stylist_api.routers import uploads
 

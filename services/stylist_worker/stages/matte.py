@@ -23,9 +23,11 @@ losing EVERY garment is terminal.
 
 from __future__ import annotations
 
+import io
 import logging
 from typing import Any
 
+from PIL import Image
 from sqlalchemy import text
 
 from stylist_db.session import tenant_session
@@ -39,6 +41,51 @@ logger = logging.getLogger(__name__)
 # — usually a dark-garment-on-dark-background frame. Storing a near-blank PNG
 # would give the user an empty tile with no explanation.
 MIN_ALPHA_COVERAGE = 0.02
+
+# Breathing room around a connected component before matting it. Components are
+# tight against the fabric and rembg needs background to find an edge against.
+CROP_PAD_PCT = 0.04
+
+# A box this close to the full frame is the full frame; cropping buys nothing
+# and costs a re-encode.
+WHOLE_FRAME_AREA_PCT = 0.95
+
+
+def _crop_to_bbox(image: bytes, bbox: Any) -> bytes:
+    """Crop to `bbox`, or return the image unchanged.
+
+    Unchanged in every doubtful case — a missing box, the whole-frame sentinel
+    `(0,0,0,0)` that the single-garment flat-lay path still emits, a box that
+    covers essentially the entire frame, or anything unreadable. A crop that
+    silently loses part of a garment is worse than no crop, so this only acts
+    when the box is unambiguously a sub-region.
+
+    PADDED by CROP_PAD_PCT. Connected components are tight against the fabric,
+    and rembg needs some background to find an edge against; a pixel-exact crop
+    leaves it deciding where the garment ends with no evidence either side.
+    """
+    if not bbox or len(bbox) != 4:
+        return image
+    x1, y1, x2, y2 = (int(v) for v in bbox)
+    if x2 <= x1 or y2 <= y1:
+        return image
+    try:
+        img = Image.open(io.BytesIO(image))
+        img.load()
+    except Exception:  # pragma: no cover - the sanitise stage already validated it
+        return image
+
+    w, h = img.size
+    if (x2 - x1) * (y2 - y1) >= WHOLE_FRAME_AREA_PCT * w * h:
+        # Effectively the whole photo. Cropping would cost a re-encode and
+        # change nothing.
+        return image
+
+    pad_x, pad_y = int((x2 - x1) * CROP_PAD_PCT), int((y2 - y1) * CROP_PAD_PCT)
+    box = (max(0, x1 - pad_x), max(0, y1 - pad_y), min(w, x2 + pad_x), min(h, y2 + pad_y))
+    buf = io.BytesIO()
+    img.crop(box).save(buf, format="PNG")
+    return buf.getvalue()
 
 
 async def _run(ctx: JobContext) -> dict[str, Any]:
@@ -54,8 +101,22 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
     matted: list[dict[str, Any]] = []
     for record in records:
         mask = store.get_bytes(record["mask_key"]) if record.get("mask_key") else None
+        # A MULTI-GARMENT FLAT-LAY IS CROPPED, NOT MASKED.
+        #
+        # One photo of four folded garments produces four rows, each with the
+        # bounding box of its own connected component and NO mask — because
+        # passing a mask here is what tore the cutouts: the matte widens its
+        # alpha with the mask, so any region that under-covers the garment
+        # punches holes in an otherwise clean result.
+        #
+        # Cropping sidesteps that entirely. rembg then sees a single-garment
+        # image, which is the case it handles cleanly, and the alpha it returns
+        # is its own rather than an intersection with a segmentation guess.
+        subject = image
+        if mask is None:
+            subject = _crop_to_bbox(image, record.get("bbox"))
         try:
-            result = await ml.matte(image_bytes=image, mask_png=mask)
+            result = await ml.matte(image_bytes=subject, mask_png=mask)
         except MLUnavailable as exc:
             raise Unavailable(exc.reason, retry_after=exc.retry_after) from exc
 

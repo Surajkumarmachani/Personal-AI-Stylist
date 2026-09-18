@@ -127,7 +127,8 @@ async def _job_row(owner_engine, job_id: uuid.UUID) -> dict[str, Any]:
             (
                 await session.execute(
                     text(
-                        "SELECT state, stage_attempts, dlq_at, last_error FROM jobs WHERE id = :id"
+                        "SELECT state, stage_attempts, dlq_at, last_error, dependency_wait_s, "
+                        "deferrals FROM jobs WHERE id = :id"
                     ),
                     {"id": job_id},
                 )
@@ -459,3 +460,165 @@ def test_the_unavailable_budget_exceeds_a_realistic_cold_start() -> None:
     below that would make this whole mechanism decorative.
     """
     assert UNAVAILABLE_BUDGET_SECONDS >= 120.0
+
+
+# ------------------------------------- deferral: giving the worker slot back
+
+
+async def test_a_long_dependency_wait_defers_instead_of_holding_the_slot(
+    owner_engine, make_stages, monkeypatch
+) -> None:
+    """THE BUG THIS FIXES.
+
+    `Unavailable` used to be absorbed by sleeping in-process for up to
+    UNAVAILABLE_BUDGET_SECONDS (180s). That is right about the backpressure and
+    wrong about where to wait: arq runs WORKER_MAX_JOBS=2, so two jobs waiting
+    on a down ml service occupied both slots and the queue stopped draining for
+    every other tenant. §C6 asks for "workers backoff; queue absorbs" and this
+    absorbed nothing.
+
+    Known since the cross-phase pass on 2026-09-10 and seen twice on
+    2026-09-17: once as a `TimeoutError` when the 180s sleep outlived arq's own
+    job ceiling, and once as ten parked jobs starving the queue.
+
+    Past the in-process budget the job must hand the slot back, and it must do
+    so FAST — the assertion below is on elapsed time, because a test that only
+    checked the exception type would pass even if the sleep were still there.
+    """
+    import time
+
+    import stylist_worker.state_machine as sm
+
+    monkeypatch.setattr(sm, "IN_PROCESS_WAIT_BUDGET_SECONDS", 0.0)
+
+    job_id, user_id = await _make_job(owner_engine)
+    stages, _ = make_stages(matte=UnavailableStage("matte", unavailable_times=9999, retry_after=30))
+    try:
+        t0 = time.monotonic()
+        with pytest.raises(sm.Deferred) as caught:
+            await run_pipeline(user_id, job_id, stages)
+        elapsed = time.monotonic() - t0
+
+        assert elapsed < 1.0, f"held the slot for {elapsed:.2f}s instead of deferring"
+        assert caught.value.delay == 30, "must propagate the server's Retry-After"
+
+        row = await _job_row(owner_engine, job_id)
+        assert row["dlq_at"] is None, "a deferral is not a failure"
+        assert row["state"] == "moderated", "the job keeps its last good state"
+        assert "matte" not in row["stage_attempts"], "a deferral must not consume an attempt"
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_the_wait_survives_the_re_enqueue(owner_engine, make_stages, monkeypatch) -> None:
+    """The accumulated wait is persisted WITH the delay about to be spent
+    outside the process, so the accounting is identical whether the job waited
+    in the worker or in the queue. That equivalence is the whole reason the
+    budget still means anything after a deferral."""
+    import stylist_worker.state_machine as sm
+
+    monkeypatch.setattr(sm, "IN_PROCESS_WAIT_BUDGET_SECONDS", 0.0)
+
+    job_id, user_id = await _make_job(owner_engine)
+    stages, _ = make_stages(matte=UnavailableStage("matte", unavailable_times=9999, retry_after=12))
+    try:
+        with pytest.raises(sm.Deferred):
+            await run_pipeline(user_id, job_id, stages)
+        row = await _job_row(owner_engine, job_id)
+        assert row["dependency_wait_s"] == 12, "the wait was not persisted"
+        assert row["deferrals"] == 1
+        assert "deferred" in (row["last_error"] or ""), (
+            "a deferred job must say why, or it is indistinguishable from a stuck one"
+        )
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_a_permanently_down_dependency_still_dlqs_across_deferrals(
+    owner_engine, make_stages, monkeypatch
+) -> None:
+    """THE REGRESSION THIS EXISTS FOR, and the reason the wait is a column.
+
+    If each re-enqueue started the budget at zero, a permanently-down
+    dependency would defer forever and NEVER reach the DLQ — trading a stalled
+    queue for an invisible infinite retry, which is worse because nothing
+    alerts on it. This drives the loop the worker drives and asserts the job
+    lands in the DLQ anyway.
+    """
+    import stylist_worker.state_machine as sm
+
+    monkeypatch.setattr(sm, "IN_PROCESS_WAIT_BUDGET_SECONDS", 0.0)
+    monkeypatch.setattr(sm, "UNAVAILABLE_BUDGET_SECONDS", 25.0)
+    monkeypatch.setattr(sm, "UNAVAILABLE_BACKOFF_CAP_SECONDS", 10.0)
+
+    job_id, user_id = await _make_job(owner_engine)
+    stages, _ = make_stages(matte=UnavailableStage("matte", unavailable_times=9999, retry_after=10))
+    try:
+        outcome = None
+        for _ in range(10):  # the worker's loop, without the waiting
+            try:
+                outcome = await run_pipeline(user_id, job_id, stages)
+                break
+            except sm.Deferred:
+                continue
+        assert outcome == "dlq", f"never reached the DLQ; ended at {outcome!r}"
+
+        row = await _job_row(owner_engine, job_id)
+        assert row["dlq_at"] is not None
+        assert row["state"] == "moderated", "DLQ must preserve the last good state"
+        assert row["deferrals"] >= 2, "expected several deferrals before the budget ran out"
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_each_deferral_gets_a_distinct_arq_job_id(owner_engine, make_stages) -> None:
+    """arq DEDUPES ON `_job_id`, and that is a trap here.
+
+    Reusing the relay's `outbox-{id}` returns None as already-completed and the
+    job never runs again. A bare `defer-{job_id}` works once and is then
+    deduped from the second round onward — the same bug, one round later. The
+    counter is what makes each round distinct while still collapsing a
+    duplicate delivery of the SAME round.
+    """
+    from stylist_worker.state_machine import deferral_count
+
+    job_id, user_id = await _make_job(owner_engine)
+    try:
+        assert await deferral_count(user_id, job_id) == 0
+        ids = set()
+        for expected in range(3):
+            count = await deferral_count(user_id, job_id)
+            assert count == expected
+            ids.add(f"defer-{job_id}-{count}")
+            await _bump_deferral(owner_engine, job_id)
+        assert len(ids) == 3, "deferral rounds collided on one arq job id"
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def test_a_short_blip_is_still_absorbed_in_process(owner_engine, make_stages) -> None:
+    """The fast path must not regress. An ml pod finishing a model load is back
+    within a second or two, and deferring that costs a Redis round trip, a job
+    dispatch and a row reload to avoid a 2s sleep — so short waits stay here.
+    """
+    job_id, user_id = await _make_job(owner_engine)
+    matte = UnavailableStage("matte", unavailable_times=3, retry_after=0.01)
+    stages, _ = make_stages(matte=matte)
+    try:
+        assert await run_pipeline(user_id, job_id, stages) == "complete"
+        row = await _job_row(owner_engine, job_id)
+        assert row["deferrals"] == 0, "a 10ms blip should never reach the queue"
+        assert row["dependency_wait_s"] == 0
+    finally:
+        await _cleanup(owner_engine, user_id)
+
+
+async def _bump_deferral(owner_engine, job_id: uuid.UUID) -> None:
+    from sqlalchemy.ext.asyncio import async_sessionmaker
+
+    maker = async_sessionmaker(owner_engine, expire_on_commit=False)
+    async with maker() as session:
+        await session.execute(
+            text("UPDATE jobs SET deferrals = deferrals + 1 WHERE id = :j"), {"j": job_id}
+        )
+        await session.commit()

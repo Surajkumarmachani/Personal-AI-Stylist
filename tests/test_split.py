@@ -10,6 +10,8 @@ says which.
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from stylist_domain.split import (
@@ -381,3 +383,143 @@ def test_the_threshold_errs_toward_flat_lay() -> None:
 
     assert len(just_below.candidates) == 1, "below the line: treated as a flat-lay"
     assert len(at_threshold.candidates) == 2, "at the line: parsed as worn"
+
+
+# ---------------------------------------------- measured against real photos
+
+
+def test_worn_ethnic_wear_is_not_mistaken_for_a_flat_lay() -> None:
+    """THE BUG REAL PHOTOGRAPHS FOUND, PINNED SO IT CANNOT COME BACK.
+
+    Until 2026-09-17 every image this pipeline had ever seen was procedurally
+    generated. The first eight real photographs broke it immediately:
+    `WORN_SKIN_THRESHOLD` was 0.03, and all four worn ethnic-wear photos
+    measured BELOW that, so each was treated as a flat-lay and rule 5 dropped
+    every mask.
+
+    The cause is structural rather than a tuning accident. A kurta, sherwani or
+    fully draped saree covers the wrist, the neck and the ankle; a t-shirt and
+    jeans do not. A skin-fraction threshold calibrated on Western clothing
+    encodes an assumption about how much of a person their clothes leave
+    visible, and that assumption does not survive contact with ethnic wear —
+    which is the wardrobe this product exists for.
+
+    The numbers are the ones actually measured by services/stylist_ml.
+    """
+    from stylist_domain.split import WORN_SKIN_THRESHOLD
+
+    worn_ethnic = {
+        "saree (face, shoulders and arms visible)": 0.0213,
+        "kurta, full sleeve and high collar": 0.0185,
+        "salwar kameez": 0.0123,
+        "sherwani": 0.0088,
+    }
+    for description, skin_pct in worn_ethnic.items():
+        assert skin_pct >= WORN_SKIN_THRESHOLD, (
+            f"{description} measured {skin_pct} and would be split as a flat-lay; "
+            "this is the exact failure that made every worn ethnic photo "
+            "collapse to one whole-frame garment"
+        )
+
+    # And the other direction still holds: a true flat-lay must NOT be read as
+    # worn, or rule 5 stops suppressing the garbage masks it exists for. Every
+    # true flat-lay measured exactly 0.0000, including one shot on beige carpet.
+    for description, skin_pct in {
+        "four garments folded on beige carpet": 0.0,
+        "dress shirt, product shot": 0.0,
+        "t-shirt, product shot": 0.0,
+    }.items():
+        assert skin_pct < WORN_SKIN_THRESHOLD, f"{description} would be split"
+
+
+# ------------------------------------------- multi-garment flat-lays
+
+
+def _components(*boxes: tuple[int, int, int, int]) -> tuple[Any, ...]:
+    from stylist_domain.split import ComponentInfo
+
+    return tuple(ComponentInfo(bbox=b, area_pct=0.1, index=i) for i, b in enumerate(boxes))
+
+
+def test_a_flat_lay_of_four_garments_becomes_four_garments() -> None:
+    """THE GAP REAL PHOTOGRAPHS FOUND.
+
+    Rule 5 refuses to PARSE a flat-lay, because SegFormer is a human-parsing
+    model with no human to parse and its class labels are shape guesses. That
+    was right. But it also refused to COUNT, so a photo of four folded garments
+    catalogued as one garment.
+
+    The labels being wrong does not make the pixels wrong. Measured 2026-09-17
+    on a real photo of four folded garments: the union of five mislabelled
+    masks has exactly four connected components, positioned correctly. These
+    are those boxes.
+    """
+    from stylist_domain.split import MaskInfo, split_masks
+
+    masks = [
+        MaskInfo(atr_label=lbl, slot_hint=None, area_pct=0.2, bbox=(0, 0, 10, 10), index=i)
+        for i, lbl in enumerate(["Upper-clothes", "Pants", "Skirt", "Bag", "Hat"])
+    ]
+    result = split_masks(
+        masks,
+        skin_pct=0.0,  # a flat-lay
+        components=_components(
+            (182, 14, 539, 348), (604, 32, 843, 418), (547, 473, 839, 777), (280, 398, 494, 637)
+        ),
+    )
+    assert len(result.candidates) == 4, "four folded garments must not collapse to one"
+
+    # Still no slot hints. A component says WHERE a garment is, never WHAT it
+    # is — inventing a slot here would reintroduce the error rule 5 prevents.
+    assert all(c.slot_hint is None for c in result.candidates)
+    # And each carries its own component so the matte can crop to it.
+    assert sorted(c.component_index or 0 for c in result.candidates) == [0, 1, 2, 3]
+
+
+def test_one_component_still_yields_one_garment() -> None:
+    """The common case, and it must not regress: a single garment on a plain
+    background is one component and one garment."""
+    from stylist_domain.split import split_masks
+
+    result = split_masks([], skin_pct=0.0, components=_components((76, 3, 510, 781)))
+    assert len(result.candidates) == 1
+    assert result.candidates[0].bbox == (76, 3, 510, 781)
+
+
+def test_no_components_falls_back_to_the_whole_frame() -> None:
+    """A version skew — an older ml image that does not report components — must
+    degrade to the previous behaviour rather than produce zero garments."""
+    from stylist_domain.split import split_masks
+
+    result = split_masks([], skin_pct=0.0, components=())
+    assert len(result.candidates) == 1
+    assert result.candidates[0].bbox == (0, 0, 0, 0), "whole-frame sentinel"
+    assert result.candidates[0].component_index is None
+
+
+def test_a_print_inside_a_garment_is_not_a_second_garment() -> None:
+    """A contrasting panel — a print, embroidery, zari work — mattes as its own
+    blob inside the garment. Emitting it would put a phantom garment in the
+    wardrobe whose cutout is somebody's chest print.
+
+    This taxonomy has `embroidered`, `zari_work`, `block_print` and `sequinned`
+    in it, so contrasting panels are the norm here, not an edge case.
+    """
+    from stylist_ml.segmentation import _drop_contained
+
+    garment = {"bbox": [100, 100, 500, 900], "area_pct": 0.30}
+    print_panel = {"bbox": [200, 300, 400, 500], "area_pct": 0.04}  # fully inside
+    kept = _drop_contained([garment, print_panel])
+    assert len(kept) == 1, "the print must not become a garment"
+    assert kept[0]["bbox"] == [100, 100, 500, 900]
+
+
+def test_two_garments_side_by_side_both_survive() -> None:
+    """The guard must not merge genuinely separate garments. Overlapping boxes
+    with neither contained in the other is two shirts lying next to each
+    other, not a print on one of them."""
+    from stylist_ml.segmentation import _drop_contained
+
+    left = {"bbox": [0, 0, 500, 400], "area_pct": 0.2}
+    right = {"bbox": [450, 0, 900, 400], "area_pct": 0.2}
+    assert len(_drop_contained([left, right])) == 2

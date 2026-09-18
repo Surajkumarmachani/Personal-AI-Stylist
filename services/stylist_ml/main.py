@@ -57,7 +57,10 @@ MAX_BODY_BYTES = 12 * 1024 * 1024
 # without consuming the image's retry budget, so backpressure costs latency
 # instead of losing uploads.
 #
-# PROVISIONAL: retune in P9 against real percentiles and real pod counts.
+# MEASURED, not provisional. 2 slots x 2 ORT threads = 4 busy threads on an
+# 8-vCPU box. At 4x4 the service thrashed and every request read-timed-out;
+# at this setting a 5-photo burst drained with ZERO read timeouts
+# (2026-09-10). POD COUNTS are still unmeasured — that part needs traffic.
 MAX_CONCURRENT_INFERENCE = int(os.environ.get("ML_MAX_CONCURRENCY", "2"))
 _inference_slots = asyncio.Semaphore(MAX_CONCURRENT_INFERENCE)
 
@@ -280,6 +283,14 @@ async def segment(request: Request) -> dict[str, Any]:
             }
             for m in result.masks
         ],
+        # Spatially disjoint garments, from the masks' PIXELS rather than their
+        # labels. Returned ALWAYS rather than only for flat-lays: this service
+        # reports what it saw and the caller decides what to do with it, the
+        # same principle as returning every mask unfiltered. Costs a connected-
+        # component pass over an array we already have, not another inference.
+        "flatlay_components": segmentation.flatlay_components(
+            list(result.masks), result.width, result.height
+        ),
         # A HINT, not truth: the VLM tagging stage may override a mask-derived
         # slot, and a user correction always wins (taxonomy.yaml).
         "slot_hint_confidence": taxonomy.slot_hint_confidence,

@@ -30,7 +30,7 @@ from typing import Any
 from sqlalchemy import text
 
 from stylist_db.session import tenant_session
-from stylist_domain.split import MaskInfo, SplitOutcome, split_masks
+from stylist_domain.split import ComponentInfo, MaskInfo, SplitOutcome, split_masks
 from stylist_worker.io_helpers import load_sanitised
 from stylist_worker.keys import mask_key
 from stylist_worker.state_machine import IngestState, JobContext, Stage, Terminal
@@ -66,6 +66,10 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
             for i, m in enumerate(seg.masks)
         ],
         skin_pct=seg.skin_pct,
+        components=tuple(
+            ComponentInfo(bbox=c.bbox, area_pct=c.area_pct, index=i)
+            for i, c in enumerate(seg.flatlay_components)
+        ),
     )
 
     if decision.dropped:
@@ -98,6 +102,13 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
         # `matte` already treats a missing mask as "use rembg's own alpha",
         # which is the correct answer for a flat-lay and demonstrably clean on
         # real photos.
+        #
+        # A MULTI-GARMENT FLAT-LAY KEEPS THAT INVARIANT. Its candidates carry a
+        # connected component's bounding box but still no mask, and `matte`
+        # CROPS to that box before matting. So rembg sees a single-garment
+        # image and returns its own clean alpha, instead of intersecting it
+        # with a segmentation region that may under-cover the fabric — which is
+        # the mechanism that tore the cutouts in the first place.
         key: str | None = None
         if candidate.mask_indices:
             mask_png = seg.masks[candidate.mask_indices[0]].mask_png

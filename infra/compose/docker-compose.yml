@@ -127,7 +127,9 @@ services:
     image: redis:7-alpine
     # allkeys-lru: everything here (rationales, boards, weather context) is
     # recomputable, so evicting under pressure is correct behaviour.
-    # PROVISIONAL: retune in P9. 512mb is a guess; the capacity model says
+    # PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+    # Resolves when: measured Redis working-set size. 512mb is a guess;
+    # the capacity model says
     # ~2GB of rationales + boards + context at 50k MAU, but this is a laptop.
     command: >
       redis-server
@@ -354,11 +356,11 @@ services:
       # Pin onnxruntime's thread pool instead of letting it size from detected
       # cores. Left to itself it assumes it owns the machine, so several ml
       # pods per node oversubscribe and everything gets slower under load.
-      # PROVISIONAL: retune in P9.
+      # MEASURED 2026-09-10, not provisional.
       # 2 threads x 2 concurrent inferences = 4 busy threads on an 8-vCPU
       # box, leaving room for the event loop and the other services. At 4x4 the
-      # service thrashed and every request read-timed-out.
-      # PROVISIONAL: retune in P9.
+      # service thrashed and every request read-timed-out; at 2x2 the same
+      # burst drained with zero. A number with an A/B behind it is a result.
       ORT_INTRA_OP_THREADS: "2"
       # MEASURED, A/B on fresh containers with a drained queue (2026-09-10):
       #
@@ -388,7 +390,8 @@ services:
       # wait and the worker's backoff ladder, requests spent most of their time
       # queued and one photo took 112s. Measured memory is 606MB of a 3GB
       # ceiling, so memory was never the constraint — serialising was.
-      # PROVISIONAL: retune in P9 against real percentiles and pod counts.
+      # PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+      # Resolves when: p95 per ml endpoint plus a real pod count.
       ML_MAX_CONCURRENCY: "2"
     ports:
       - "8081:8000"
@@ -411,7 +414,9 @@ services:
     # The ceiling is kept (rather than removed) so pressure becomes a legible
     # OOM kill on ONE container instead of a wedged host VM — which is what
     # happened when it had no limit at all.
-    # PROVISIONAL: retune in P9; production runs 2-12 pods, not one (View 2).
+    # PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+    # Resolves when: real queue depth drives an HPA. Production runs 2-12
+    # pods, not one (View 2).
     mem_limit: 4g
     command: uvicorn stylist_ml.main:app --host 0.0.0.0 --port 8000 --reload
     volumes:

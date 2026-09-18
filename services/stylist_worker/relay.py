@@ -48,6 +48,11 @@ EVENT_HANDLERS: dict[str, str] = {
     # transaction roll back, leaving a job for a row that does not exist — the
     # exact failure the outbox exists to prevent.
     "export.requested": "build_export",
+    # Same argument as the export above, plus one specific to try-on: the
+    # render reads the body photo, so an enqueue that outlived a rolled-back
+    # transaction could send a photograph of a person to a third party for an
+    # outfit that was never saved.
+    "tryon.requested": "render_tryon",
     # Phase 6+ will add: feedback.recorded -> invalidate_precompute.
 }
 

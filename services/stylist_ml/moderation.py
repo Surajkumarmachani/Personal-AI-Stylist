@@ -33,7 +33,10 @@ from stylist_ml.runtime import LoadedModel
 
 logger = logging.getLogger(__name__)
 
-# PROVISIONAL: retune in P9 against real correction data. Deliberately high,
+# PROVISIONAL — re-dated 2026-09-17. P9 arrived with no real traffic, so this is unchanged.
+# Resolves when: false-quarantine and false-pass rates on real photos. With
+# one user and no golden set there is nothing to measure either against.
+# Deliberately high,
 # because a false quarantine is a worse failure than a false pass into review.
 QUARANTINE_THRESHOLD = 0.90
 REVIEW_THRESHOLD = 0.60

@@ -48,8 +48,10 @@ def init_engine(dsn: str, *, pool_size: int = 20, echo: bool = False) -> AsyncEn
     ml 5) so a worker burst cannot exhaust Postgres connections and take down
     the API — see the bulkhead table (§C2).
 
-    # PROVISIONAL: retune in P9. The ratio is the design; the numbers are not
-    # measured. Unlabelled invented numbers become load-bearing folklore.
+    # PROVISIONAL — re-dated 2026-09-17. P9 arrived with no real traffic, so this is unchanged.
+    # The RATIO is the design and stands; the absolute numbers are invented.
+    # Resolves when: peak concurrent connections per service under real load.
+    # Unlabelled invented numbers become load-bearing folklore.
     """
     global _engine, _sessionmaker
     _engine = create_async_engine(

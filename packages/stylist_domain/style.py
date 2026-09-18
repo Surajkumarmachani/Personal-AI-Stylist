@@ -41,8 +41,11 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-# ~20 reactions of effective memory. `# PROVISIONAL: retune in P9` against real
-# feedback — the plan says alpha ~= 0.1 and there is no data yet to argue otherwise.
+# ~20 reactions of effective memory.
+# PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+# Resolves when: ~100 real feedback events, enough to see whether the vector
+# tracks taste or chases noise. The plan says alpha ~= 0.1 and there is still
+# no data to argue otherwise.
 DEFAULT_ALPHA = 0.1
 
 # Kinds that move the vector, and which way. `saved` is treated as a weak

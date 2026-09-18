@@ -637,13 +637,19 @@ Now, with real traffic data, the provisional numbers get retuned.
 - **Runbooks**: one per paging alert. Symptom, 3 likely causes, verification query, mitigation, rollback, escalation.
 - **Game day**: kill the primary, exhaust a budget, open every breaker, fill the DLQ. Fix what surprises you.
 
-**PHASE 9 EXIT CRITERIA**
-- [ ] Restore drill completed, time recorded, under stated RTO
-- [ ] Erasure verified absent across all 5 systems
-- [ ] Every paging alert has a runbook
-- [ ] Game day run; findings ticketed
-- [ ] Error budget policy signed off
-- [ ] All `# PROVISIONAL` markers resolved or re-dated
+**PHASE 9 EXIT CRITERIA** — status as of 2026-09-17; the detail is in the
+dated build-status entry at the end of this file.
+- [x] Restore drill completed, time recorded, under stated RTO — **2.8s**,
+      verified object-by-object and mutation-checked
+- [x] Erasure verified absent across all 5 systems — queried back, not asserted
+- [x] Every paging alert has a runbook — `docs/runbooks.md`, every query run
+- [x] Game day run; findings ticketed — 6 scenarios, 3 findings, all fixed and
+      re-tested against live outages
+- [ ] Error budget policy signed off — DRAFTED and deliberately **unsigned**
+      (`docs/error-budget.md`); needs a decision, and two thirds of it cannot
+      be measured yet
+- [x] All `# PROVISIONAL` markers resolved or re-dated — 4 resolved (they were
+      mislabelled), 12 re-dated with the measurement that would close each
 
 ---
 
@@ -2396,11 +2402,295 @@ real gap, printed by `make backup` on every run rather than left in a document.
       ..."; $DC ps` fails silently. Knowing about it has now failed to prevent
       it three times, which is an argument for a checked-in helper rather than
       a note.
-- [ ] **Error budget policy signed off** — needs a human decision, not code.
-- [ ] **All `# PROVISIONAL` markers resolved or re-dated** — 21 of them, all
-      set against invented traffic. "Re-dated" is the honest option until there
-      is real load; resolving them needs the wardrobe.
+- [x] **Error budget policy signed off** — **SIGNED 2026-09-17 by Suraj Kumar,
+      CLAUSE 3 ONLY** (`docs/error-budget.md`). The criterion is "signed off",
+      not "a policy exists", and §B1's own line is that an unagreed error
+      budget is not a control.
+
+      **Clause 3 (data durability) binds today. Clauses 1 and 2 are agreed in
+      principle and DORMANT** — they are written against a burn rate nothing
+      computes, and a clause with no trigger is not a control. They activate
+      automatically when burn-rate alerting lands; no re-signing is required,
+      because the commitment was made and only the trigger was missing.
+
+      Marking this `[x]` is therefore a PARTIAL claim, stated as one. The box
+      is ticked for the clause that is enforceable and explicitly not for the
+      two that are not.
+
+      Drafting it surfaced why it cannot honestly be signed in full yet:
+
+      - **Three of six SLIs are measurable today** (suggestion availability,
+        suggestion latency, ingest success/completeness). **Tag accuracy is
+        not** — it needs the 500-image golden set, and all three eval entry
+        points still exit 2. **Data durability is partial** — the restore drill
+        passes, but backups sit in the SAME storage account as the data.
+      - **There is no burn-rate alerting.** The four §D3 alerts are threshold
+        alerts; nothing computes budget consumption over a rolling 30 days. So
+        "freeze at 50% consumed" has no number that ever reaches 50%, which is
+        exactly the decoration §B1 warns about.
+      - At n=1 with no traffic, clauses 1 and 2 will not bind for months. The
+        clause that can bite today is **data durability**, and it is the one
+        worth agreeing to now because that failure does not need traffic.
+
+      The draft recommended signing the durability clause now and deferring the
+      other two until there is a measurable burn rate — the only option that is
+      both agreed and true. **That is what was decided**, on 2026-09-17.
+
+      **What the signature now obliges:** clause 3 is signed over a gap that is
+      still open. Backups are logical dumps into the SAME storage account as
+      the data they protect, so they survive a bad migration but not a deleted
+      or compromised account; §C5 asks for a second account and there is one.
+      Signing over that gap is deliberate — the clause is what makes closing it
+      a priority rather than a wish — and **closing it is the first piece of
+      work this signature obliges.**
+- [x] **All `# PROVISIONAL` markers resolved or re-dated** — done 2026-09-17.
+      16 in code and config; **4 resolved, 12 re-dated, 0 still saying "retune
+      in P9"**.
+
+      **The four resolutions are the interesting part: they were MISLABELLED.**
+      Each said "retune against real percentiles" while the comment directly
+      beneath it recorded the A/B that produced the number —
+      `MAX_CONCURRENT_INFERENCE=2` and `ORT_INTRA_OP_THREADS=2` were measured
+      during the Phase 3 burst work ("at 4x4 the service thrashed and every
+      request read-timed-out; at 2x2 the same burst drained with zero"), and
+      `WORKER_MAX_JOBS` is deliberately MATCHED to the ml figure rather than
+      independently tunable. A number with an A/B behind it is a result, and
+      leaving it marked provisional trains everyone to read the marker as
+      decoration.
+
+      A blanket find-and-replace would have moved the goalposts on all 16 and
+      hidden that.
+
+      The remaining 12 each now carry **what specifically would resolve it**
+      rather than a phase number: "p95/p99 per ml endpoint over a week of real
+      ingests", "peak concurrent connections per service under real load",
+      "false-quarantine and false-pass rates on real photos", "~100 real
+      feedback events". A marker that names its measurement can be closed by
+      whoever takes that measurement; one that names a phase just waits.
 
 **Kubernetes is deliberately not started.** The plan's own warning is that
 deploying it before there is traffic is "the most common way this project dies
 at 80% done", and nothing in the remaining criteria needs it.
+
+---
+
+## Cross-phase fix — head-of-line blocking (fixed 2026-09-18)
+
+**488 tests**; `ruff`, `ruff format` and `mypy --strict` clean across 107 source
+files. Migration `0014_deferred_waits`, verified reversible.
+
+### The bug
+
+`Unavailable` — a dependency reporting "not up yet" — was handled by sleeping
+IN-PROCESS for up to `UNAVAILABLE_BUDGET_SECONDS` (180s). Right about the
+backpressure, wrong about where to wait. arq runs `WORKER_MAX_JOBS=2`, so two
+jobs waiting on a down `ml` occupied both slots and the queue stopped draining
+for every other tenant. §C6 asks for *"workers backoff; queue absorbs"* and
+this absorbed nothing.
+
+Known and unfixed since the cross-phase pass on 2026-09-10. It surfaced twice
+on 2026-09-17 while working on something else: once as a `TimeoutError` when the
+180s sleep outlived arq's own job ceiling, and once as ten parked jobs starving
+a test of both slots.
+
+### The fix
+
+A job waits in-process only up to `IN_PROCESS_WAIT_BUDGET_SECONDS` (10s), then
+raises `Deferred` and re-enqueues itself with a delay, releasing the slot.
+
+**Why not defer immediately?** A re-enqueue costs a Redis round trip, a job
+dispatch and a reload of the job row. An `ml` pod finishing a model load is back
+inside 1-2s, and deferring every transient hiccup turns one slow ingest into
+three queue hops. 10s absorbs the common case and hands anything longer to the
+queue, which is the thing that scales.
+
+### The two traps, both real
+
+**The budget has to survive the re-enqueue.** If each round started at zero, a
+permanently-down dependency would defer FOREVER and never reach the DLQ —
+trading a stalled queue for an invisible infinite retry, which is worse because
+nothing alerts on it. Hence `jobs.dependency_wait_s`, persisted with the delay
+about to be spent outside the process so the accounting is identical whether
+the wait happened in the worker or in the queue. Same class of bug as
+`stage_attempts`: in-process retry state that resets when the process changes.
+
+**arq dedupes on `_job_id`.** Reusing the relay's `outbox-{id}` returns `None`
+as already-completed and the job never runs again. A bare `defer-{job_id}` works
+once and is deduped from the second round on — the same bug, one round later.
+So the id carries `jobs.deferrals`, making each round distinct while still
+collapsing a duplicate delivery of the same round.
+
+### Verified against a running stack
+
+`ml` stopped, three photos ingested — which under the old behaviour meant two
+jobs holding both slots and the third starved:
+
+```
+email                       state       deferrals  waited_s  dlq
+defer0-4d905e@example.com   classified          5      71.0    f
+defer1-67e2d6@example.com   classified          5      71.0    f
+defer2-861e63@example.com   classified          4      57.0    f
+```
+
+All three progressed concurrently, each holding a slot ~6s per round
+(`6.15s ← defer-79d2bbdb-...-1:ingest_photo`), and all three resumed and
+completed their remaining stages when `ml` came back. None DLQ'd during a
+recoverable outage.
+
+**One process note worth recording:** the first verification run showed the OLD
+log format, because `scripts/dc up -d worker` on an unchanged container is a
+no-op and does not restart the Python process. Mounted source is not reloaded
+source. `scripts/dc restart worker` is required, and the runbook now says so.
+
+---
+
+## Phase 10 — try-on: consent, render path, and the degrade (built 2026-09-17)
+
+**477 tests**; `ruff`, `ruff format` and `mypy --strict` clean across 107
+source files.
+
+### A correction: the benchmark gates the ROUTER, not the render path
+
+The first pass at this phase built the consent half and refused to build the
+render path, on the grounds that Phase 10 opens with **"Benchmark before you
+build"** — a 10-body x 16-garment grid including sarees, kurtas and a sherwani,
+because "the published benchmark used Western garments; **your routing table
+must come from your own grid**".
+
+**That reasoning was wrong, and the distinction is worth recording because it
+recurs.** Two different tables were being conflated:
+
+| | maps | needs the grid? |
+|---|---|---|
+| ROUTING table | garment category -> which model | **yes** — a quality judgement |
+| PROFILE table | model -> how that model is called | no — documented fact |
+
+The second was read from each provider's own `/info` endpoint on 2026-09-17
+and verified live. And the render path is the grid's **prerequisite**, not its
+competitor: there is no way to run a 10x16 grid without a working render call.
+Refusing to build it meant the benchmark could never be run at all.
+
+### What is built, and what is still deliberately absent
+
+**Built:** exactly ONE provider (`VTON_PROVIDER`), called over the Gradio HTTP
+API. **Absent:** the router, the primary->secondary fallback, and per-category
+model selection. Those are the parts that genuinely need the grid.
+
+Three providers are profiled, all verified live:
+
+| provider | Gradio | categories | note |
+|---|---|---|---|
+| `leffa` | 5 | upper / lower / dresses | the default — only one with both an explicit garment type and `dress_code` weights |
+| `idm-vton` | 4 | upper only | VITON-HD; takes no category argument at all |
+| `ootdiffusion` | 5 | upper / lower / dresses | `process_dc`; `process_hd` has no category |
+
+The `/gradio_api` prefix is **detected at runtime**, not configured: it is
+present on Gradio 5 and absent on Gradio 4, both are live today, and guessing
+wrong turns every call into an opaque 404.
+
+**A saree is not rendered.** `SLOT_TO_CATEGORY` maps `upper_base`,
+`upper_layer`, `lower` and `full_body`, and deliberately omits `drape`. Every
+candidate model was trained on VITON-HD or DressCode — both Western catalogues
+— and a saree is not upper-body, not lower-body and not a dress. Mapping it to
+`dresses` would return a confident, wrong picture of the owner's own body.
+Which category (if any) serves a saree is exactly what the grid is for. This is
+the single clearest illustration of why the plan demanded its own benchmark.
+
+**The render is asynchronous.** 30-120s on shared hardware, queued behind other
+users. It is enqueued through the OUTBOX (`tryon.requested` -> `render_tryon`),
+so the request that asked for it and the job that does it share one
+transaction — a direct enqueue could outlive a rolled-back transaction and send
+a body photo to a third party for an outfit that was never saved.
+
+**Consent is re-read inside the job**, not trusted from the enqueueing request.
+A revocation landing in the queue window must stop the render.
+
+**Renders go to their own `tryon/` prefix** and that prefix is in the erasure
+saga. A render of the owner's body wearing their clothes is more sensitive than
+either of its inputs, and it is the prefix easiest to forget because nothing
+the user uploaded lives there.
+
+### What is measured, and what still is not
+
+`VTON_API_TOKEN` is **required in practice and currently unset**. All three
+candidate Spaces run on ZeroGPU (`zero-a10g`), which rejects anonymous
+programmatic calls in under a second with an empty error body — measured, not
+assumed. Until a token is set, every try-on degrades to the board, which is the
+exit criterion's required behaviour but not the feature.
+
+So: **no render has been produced on this account**, per-render cost and
+latency remain unmeasured, and the grid remains ungated work. What changed is
+that the path to running it now exists.
+
+### What IS built, and why this half first
+
+The safety half does not depend on the benchmark, and it has to be right
+BEFORE any image is sent anywhere:
+
+  - `POST /me/body-photos/presign` — uploads under their own `body/` prefix
+  - `POST /me/body-photos` — records the photo AND the consent in one
+    transaction
+  - `GET /me/body-photos` — consent state, never the object key
+  - `POST /outfits/{hash}/tryon` — **always 200**, degrades to the board
+  - a per-day quota, so the most expensive call in the product has a ceiling
+
+A body photograph is not a photograph of a shirt. It identifies a person, it
+is the most sensitive thing this system stores, and under try-on it would
+leave our infrastructure for a generative model. Consent is therefore an
+EXPLICIT flag on the request, not an implication of having uploaded —
+"they uploaded it, so they must have agreed" is the reasoning that makes
+consent a formality.
+
+### Its own prefix, and the gap that created
+
+Body photos upload under `body/` rather than `originals/`, so consent,
+revocation and erasure can each target them without touching the wardrobe.
+
+**That separation is exactly what would let an account erasure walk past
+them.** The saga's prefix list did not include `body/` — nor `exports/`, added
+in Phase 9 — so a deleted account would have left both behind: invisible,
+because nothing else ever lists those prefixes. Both are now in the list, and
+`tests/test_tryon.py` asserts the saga's source covers every prefix
+`presign_upload` can write, so adding a prefix and forgetting the saga fails a
+test rather than shipping.
+
+### The degrade is the feature
+
+"Works or degrades to a board, NEVER errors" is an exit criterion, and every
+reason a render cannot happen returns 200 with the board and a stated reason:
+no consent, no provider, quota exhausted, render failed. Verified live:
+
+    POST /outfits/{hash}/tryon
+    -> HTTP 200  rendered=false
+       reason: "no body photo consented; add one to enable try-on"
+       board_url: present
+
+A board is pixel-accurate to clothes the user owns; a render is a guess about
+how they would look. When the guess is unavailable the accurate picture is the
+better answer, not an error page — which is why the board is the default
+visualisation and try-on the enhancement, not the other way round.
+
+The single genuine 404 is an outfit that does not exist: we can neither render
+nor board it, and a 200 there would hide a client bug behind a degrade message.
+
+### A fake that was quietly wrong
+
+`FakeObjectStore` had no `delete_all_versions` at all, so every body-photo
+revocation returned **502** in tests. It also did not accept the new `prefix`
+parameter — a fake that silently ignores one would let `prefix="body"` pass
+every test while production filed body photos under `originals/`, dissolving
+the separation consent and erasure both depend on. Both mirrored now.
+
+### Exit criteria
+
+- [x] **Body-photo deletion verified end to end** — revocation deletes all
+      versions and leaves the account untouched (§C5's requirement); erasure
+      covers the `body/` prefix, asserted against the saga's own source.
+- [~] **Try-on works or degrades to a board, never errors** — the DEGRADE half
+      is built and verified; "works" needs a provider, which needs the
+      benchmark.
+- [ ] **Per-render cost measured** — needs renders, which need the benchmark.
+
+**The benchmark is the gate, and it needs photographs.** Not the owner's
+wardrobe alone — ten bodies and sixteen garments, which is a materially larger
+ask than everything else currently waiting on a camera.

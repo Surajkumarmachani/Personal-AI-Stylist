@@ -21,7 +21,9 @@ import httpx
 
 # Measured in-container: embed ~0.5s, segment ~2.6s, matte ~3-5s. Ceilings are
 # ~4x those so a slow-but-working call succeeds while a hung one fails fast.
-# PROVISIONAL: retune in P9 against real percentiles.
+# PROVISIONAL — re-dated 2026-09-17. P9 arrived with no real traffic, so this is unchanged.
+# Resolves when: p95/p99 per ml endpoint over a week of real ingests. Today
+# every percentile comes from synthetic bursts on one laptop.
 CONNECT_TIMEOUT = 5.0
 EMBED_TIMEOUT = 20.0
 MODERATE_TIMEOUT = 25.0
@@ -76,6 +78,20 @@ class MatteResponse:
 
 
 @dataclass(frozen=True, slots=True)
+class FlatlayComponent:
+    """One spatially disjoint garment in a flat-lay.
+
+    Derived from the union of the masks' pixels, so it carries NO class label —
+    on a flat-lay the labels are shape guesses and the whole point of this
+    structure is that the pixels are trustworthy while the names are not.
+    """
+
+    bbox: tuple[int, int, int, int]
+    area_pct: float
+    mask_png: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class SegmentMask:
     atr_class: int
     atr_label: str
@@ -96,6 +112,12 @@ class SegmentResponse:
     non_garment_coverage: dict[str, float]
     slot_hint_confidence: float
     model: str
+    # Empty when the service did not report any — an older ml image, a frame
+    # with nothing in it, or a union that fragmented past the service's cap.
+    # A DEFAULT rather than a required field so a version skew between this
+    # client and the ml service degrades to the previous behaviour (one
+    # whole-frame candidate) instead of raising.
+    flatlay_components: tuple[FlatlayComponent, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +179,14 @@ class MLClient:
         _raise_for_status(resp)
         body = resp.json()
         return SegmentResponse(
+            flatlay_components=tuple(
+                FlatlayComponent(
+                    bbox=(c["bbox"][0], c["bbox"][1], c["bbox"][2], c["bbox"][3]),
+                    area_pct=c["area_pct"],
+                    mask_png=base64.b64decode(c["mask_png_b64"]),
+                )
+                for c in body.get("flatlay_components", ())
+            ),
             masks=tuple(
                 SegmentMask(
                     atr_class=m["atr_class"],

@@ -61,7 +61,8 @@ def upgrade() -> None:
 
     with op.get_context().autocommit_block():
         # m=16, ef_construction=64 are pgvector's documented defaults and the
-        # plan's stated values. PROVISIONAL: retune in P9 — the trade is index
+        # plan's stated values. PROVISIONAL — re-dated 2026-09-17. Resolves
+        # when there is a real recall measurement to tune against. The trade is index
         # build time and memory against recall, and it cannot be tuned
         # meaningfully against an empty table.
         op.execute(

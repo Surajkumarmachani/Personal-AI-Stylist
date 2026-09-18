@@ -32,7 +32,13 @@ from stylist_worker.notify import hourly_digest
 from stylist_worker.precompute import nightly_precompute
 from stylist_worker.relay import relay_outbox
 from stylist_worker.stages import INGEST_STAGES
-from stylist_worker.state_machine import run_pipeline
+from stylist_worker.state_machine import (
+    UNAVAILABLE_BUDGET_SECONDS,
+    Deferred,
+    deferral_count,
+    run_pipeline,
+)
+from stylist_worker.tryon import render_tryon
 
 logger = logging.getLogger(__name__)
 
@@ -43,15 +49,52 @@ async def ingest_photo(
     user_id: str,
     aggregate_id: str,
     payload: dict[str, Any],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """Drive one photo through the pipeline.
 
     Idempotent by construction: run_pipeline reloads the job and skips stages
     already completed, so a duplicate delivery from the relay costs one row
-    read rather than a repeated matte.
+    read rather than a repeated matte — which is also what makes the deferred
+    re-enqueue below safe rather than wasteful.
     """
     job_id = uuid.UUID(payload["job_id"])
-    final_state = await run_pipeline(uuid.UUID(user_id), job_id, INGEST_STAGES)
+    uid = uuid.UUID(user_id)
+    try:
+        final_state = await run_pipeline(uid, job_id, INGEST_STAGES)
+    except Deferred as deferred:
+        # NOT a failure. A dependency is down for longer than a worker slot
+        # should be held, so the job goes back to the queue and this slot is
+        # freed for everyone else — §C6's "workers backoff; queue absorbs".
+        #
+        # The arq job id carries the DEFERRAL COUNT. Reusing the relay's
+        # `outbox-{id}` would be deduped to None as already-completed and the
+        # job would never run again; a bare `defer-{job_id}` would be deduped
+        # from the second round onward, which is the same bug one round later.
+        # Counter in the id means each round is distinct AND a duplicate
+        # delivery of the same round is still collapsed by arq.
+        round_no = await deferral_count(uid, job_id)
+        redis = ctx.get("redis")
+        if redis is None:  # pragma: no cover - arq always provides it
+            raise
+        await redis.enqueue_job(
+            "ingest_photo",
+            _job_id=f"defer-{job_id}-{round_no}",
+            _defer_by=deferred.delay,
+            user_id=user_id,
+            aggregate_id=aggregate_id,
+            payload=payload,
+        )
+        logger.info(
+            "ingest_photo job=%s deferred %.1fs (round %d, %.0f/%.0fs of budget): %s",
+            job_id,
+            deferred.delay,
+            round_no,
+            deferred.waited,
+            UNAVAILABLE_BUDGET_SECONDS,
+            deferred.reason,
+        )
+        return {"job_id": str(job_id), "state": "deferred", "retry_in_s": deferred.delay}
+
     logger.info("ingest_photo job=%s finished at %s", job_id, final_state)
     return {"job_id": str(job_id), "state": final_state}
 
@@ -77,7 +120,8 @@ async def startup(ctx: dict[str, Any]) -> None:
     configure_tracing("stylist-worker")
     settings = get_settings()
     logging.basicConfig(level=settings.log_level)
-    init_engine(settings.database_url, pool_size=10)  # PROVISIONAL: retune in P9
+    # PROVISIONAL — re-dated 2026-09-17; see stylist_api.settings for the ratio.
+    init_engine(settings.database_url, pool_size=10)
     logger.info("worker started, environment=%s", settings.environment)
 
 
@@ -86,13 +130,14 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions = [ingest_photo, build_export, ping]
+    functions = [ingest_photo, build_export, render_tryon, ping]
 
     # The relay tick. 1s rather than the plan's 250ms: at 250ms this is 4
     # queries/second/replica against Postgres forever, and the ingest UX
     # budget is 10 seconds — a sub-second dispatch delay is invisible inside
     # that, while the query load is not. Revisit in P9 with real numbers.
-    # PROVISIONAL: retune in P9.
+    # PROVISIONAL — re-dated 2026-09-17: P9 arrived with no real traffic.
+    # Resolves when: measured outbox dispatch latency under real ingest rates.
     cron_jobs = [
         cron(relay_outbox, second=set(range(0, 60)), run_at_startup=True, max_tries=1),
         # 03:15 local. Guarded by pg_try_advisory_lock, so running this on
@@ -138,7 +183,10 @@ class WorkerSettings:
     # onto it produced read timeouts at whichever stage got unlucky.
     #
     # Production scales ml OUT (View 2: 2-12 pods) and raises this to match.
-    # PROVISIONAL: retune in P9 against measured ml throughput.
+    # MATCHED to ML_MAX_CONCURRENCY, and that number IS measured (see
+    # services/stylist_ml/main.py). An unmatched bulkhead is not a bulkhead,
+    # it is a queue in a different place — so this is not independently
+    # tunable and not independently provisional.
     max_jobs = int(os.environ.get("WORKER_MAX_JOBS", "2"))
 
     # arq writes a health record to Redis on this interval, and the container

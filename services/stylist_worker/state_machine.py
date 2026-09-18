@@ -72,6 +72,24 @@ BACKOFF_BASE_SECONDS = 2.0
 UNAVAILABLE_BUDGET_SECONDS = 180.0
 UNAVAILABLE_BACKOFF_CAP_SECONDS = 15.0
 
+# How long a stage may wait IN-PROCESS before the job is re-enqueued instead.
+#
+# THE BUG: the 180s budget above was spent entirely inside the worker, holding
+# an arq slot. At WORKER_MAX_JOBS=2, two jobs waiting on a down ml service
+# occupied both slots and the queue stopped draining for every other tenant —
+# §C6 asks for "workers backoff; queue absorbs" and this absorbed nothing.
+# Known since the cross-phase pass on 2026-09-10; seen twice on 2026-09-17,
+# once as `TimeoutError` when the 180s sleep outlived arq's own job ceiling,
+# and once as ten parked jobs starving a test of both slots.
+#
+# WHY NOT ZERO — why sleep in-process at all? A re-enqueue costs a Redis
+# round trip, a job dispatch and a reload of the job row. For a 1-2s blip
+# (an ml pod finishing a model load) that overhead exceeds the wait it avoids,
+# and deferring every transient hiccup would turn one slow ingest into three
+# queue hops. 10s absorbs the common case in-process and hands anything longer
+# back to the queue, which is the thing that scales.
+IN_PROCESS_WAIT_BUDGET_SECONDS = 10.0
+
 
 class IngestState(StrEnum):
     """Every state in View 5, including ones no Phase 2 stage produces yet.
@@ -157,6 +175,28 @@ class Terminal(Exception):  # noqa: N818 - name matches the plan's stage contrac
         self.reason = reason
 
 
+class Deferred(Exception):  # noqa: N818 - a state, not an error type
+    """Stop work, release the worker slot, come back in `delay` seconds.
+
+    NOT a failure and NOT terminal: the job is intact, its dependency is simply
+    still down and the remaining wait is longer than IN_PROCESS_WAIT_BUDGET_
+    SECONDS. The caller re-enqueues with this delay; `run_pipeline` is already
+    safe to call again, because completed stages are skipped.
+
+    Distinct from Unavailable on purpose. Unavailable is what a STAGE raises to
+    say "my dependency is down"; Deferred is what the state machine decides to
+    do about it once waiting in-process stops being the right answer.
+    """
+
+    def __init__(self, reason: str, delay: float, waited: float) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.delay = delay
+        # Cumulative, already persisted. Carried here for the log line so the
+        # operator can see how much of the 180s budget is gone without a query.
+        self.waited = waited
+
+
 class Unavailable(Exception):  # noqa: N818 - a state, not an error type
     """A dependency is not ready — a connection refused, or a 503 from a service
     still loading. NOT a failure of this image.
@@ -238,7 +278,12 @@ async def _run_stage_with_retry(
     attempt = attempts_so_far
     last_error = ""
     max_attempts = MAX_ATTEMPTS if stage.retryable else 1
-    waited_for_dependency = 0.0
+    # Seconds already burned on this job BEFORE this run, across deferrals.
+    # Loaded rather than started at zero, or every re-enqueue would hand the
+    # next worker a fresh 180s and a permanently-down dependency would defer
+    # forever instead of reaching the DLQ.
+    waited_before = await _dependency_wait_for(ctx.user_id, ctx.job_id)
+    waited_in_process = 0.0
     unavailable_round = 0
 
     while attempt < max_attempts:
@@ -247,7 +292,8 @@ async def _run_stage_with_retry(
         except Terminal:
             raise  # deterministic outcome; retrying wastes CPU and delays the user
         except Unavailable as exc:
-            if not stage.retryable or waited_for_dependency >= UNAVAILABLE_BUDGET_SECONDS:
+            waited_total = waited_before + waited_in_process
+            if not stage.retryable or waited_total >= UNAVAILABLE_BUDGET_SECONDS:
                 last_error = f"Unavailable: {exc.reason}"
                 break
             unavailable_round += 1
@@ -255,20 +301,31 @@ async def _run_stage_with_retry(
                 UNAVAILABLE_BACKOFF_CAP_SECONDS,
                 BACKOFF_BASE_SECONDS * (2 ** (unavailable_round - 1)),
             )
-            delay = min(delay, UNAVAILABLE_BUDGET_SECONDS - waited_for_dependency)
-            logger.info(
-                "stage %s: dependency unavailable (%s); waiting %.1fs "
-                "(%.0f/%.0fs of budget, attempt %d not consumed)",
-                stage.name,
-                exc.reason,
-                delay,
-                waited_for_dependency,
-                UNAVAILABLE_BUDGET_SECONDS,
-                attempt + 1,
-            )
-            await asyncio.sleep(delay)
-            waited_for_dependency += delay
-            continue
+            delay = min(delay, UNAVAILABLE_BUDGET_SECONDS - waited_total)
+
+            # SHORT WAIT: absorb it here. A re-enqueue costs more than a 2s
+            # sleep, and an ml pod loading a model is back inside that.
+            if waited_in_process + delay <= IN_PROCESS_WAIT_BUDGET_SECONDS:
+                logger.info(
+                    "stage %s: dependency unavailable (%s); waiting %.1fs in-process "
+                    "(%.0f/%.0fs of budget, attempt %d not consumed)",
+                    stage.name,
+                    exc.reason,
+                    delay,
+                    waited_total,
+                    UNAVAILABLE_BUDGET_SECONDS,
+                    attempt + 1,
+                )
+                await asyncio.sleep(delay)
+                waited_in_process += delay
+                continue
+
+            # LONG WAIT: give the slot back. The remaining budget is persisted
+            # WITH the delay we are about to spend outside the process, so the
+            # accounting is the same whether the wait happened here or in the
+            # queue — that equivalence is what keeps the DLQ reachable.
+            await _record_dependency_wait(ctx.user_id, ctx.job_id, waited_total + delay, exc.reason)
+            raise Deferred(exc.reason, delay=delay, waited=waited_total + delay) from exc
         except Exception as exc:
             attempt += 1
             last_error = f"{type(exc).__name__}: {exc}"
@@ -401,6 +458,56 @@ async def load_job(user_id: uuid.UUID, job_id: uuid.UUID) -> JobContext | None:
     )
 
 
+async def _dependency_wait_for(user_id: uuid.UUID, job_id: uuid.UUID) -> float:
+    """Seconds this job has already spent waiting on a down dependency."""
+    async with tenant_session(user_id) as session:
+        row = await session.execute(
+            text("SELECT COALESCE(dependency_wait_s, 0) FROM jobs WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+        return float(row.scalar_one() or 0.0)
+
+
+async def _record_dependency_wait(
+    user_id: uuid.UUID, job_id: uuid.UUID, waited: float, reason: str
+) -> None:
+    """Persist the cumulative wait and count the deferral.
+
+    `deferrals` doubles as the arq dedupe key for the re-enqueue, so it is
+    incremented HERE — in the same statement as the wait — rather than by the
+    caller. Two writes could interleave and hand two deferral rounds the same
+    id, which arq would silently collapse into one and the job would stop
+    being retried at all.
+
+    `last_error` is set so an operator reading the jobs table sees WHY a job is
+    sitting in a non-terminal state. Without it a deferred job is
+    indistinguishable from a stuck one.
+    """
+    async with tenant_session(user_id) as session:
+        await session.execute(
+            text(
+                "UPDATE jobs SET dependency_wait_s = :waited, deferrals = deferrals + 1, "
+                "last_error = :reason, updated_at = now() WHERE id = :job_id"
+            ),
+            {"waited": waited, "reason": f"deferred: {reason}"[:500], "job_id": job_id},
+        )
+
+
+async def deferral_count(user_id: uuid.UUID, job_id: uuid.UUID) -> int:
+    """The deferral counter, for the re-enqueue's arq job id.
+
+    Public, unlike the other helpers here: the worker needs it to build the
+    arq job id, and that is the one piece of this module's retry accounting
+    the caller legitimately has to see.
+    """
+    async with tenant_session(user_id) as session:
+        row = await session.execute(
+            text("SELECT COALESCE(deferrals, 0) FROM jobs WHERE id = :job_id"),
+            {"job_id": job_id},
+        )
+        return int(row.scalar_one() or 0)
+
+
 async def _attempts_for(user_id: uuid.UUID, job_id: uuid.UUID, stage: str) -> int:
     async with tenant_session(user_id) as session:
         row = await session.execute(
@@ -416,6 +523,13 @@ async def run_pipeline(user_id: uuid.UUID, job_id: uuid.UUID, stages: tuple[Stag
     Safe to call again at any point: completed stages are skipped, so a
     duplicate delivery from the relay is a cheap no-op rather than repeated
     work.
+
+    RAISES `Deferred`, which is not an error. It means a dependency is down for
+    longer than a worker slot should be held, and the caller must re-enqueue
+    the job after `Deferred.delay` seconds. It propagates rather than being
+    handled here because re-enqueueing needs the arq Redis pool, which lives in
+    the job context and deliberately does not reach into this module — the
+    state machine decides WHEN to step aside, the worker knows HOW.
     """
     ctx = await load_job(user_id, job_id)
     if ctx is None:

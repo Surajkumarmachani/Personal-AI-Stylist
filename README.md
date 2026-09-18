@@ -5,7 +5,7 @@ Western mixed wardrobes. Photograph your clothes, get them catalogued
 automatically, get outfit suggestions that account for weather, occasion and
 what you actually wear.
 
-**Status:** Phase 9 (partial) — a photo is split into garments, cut out, coloured,
+**Status:** Phase 10 (partial) — a photo is split into garments, cut out, coloured,
 moderated in-VPC, tagged through the LiteLLM gateway, embedded in pgvector,
 checked for duplicates, and every field is correctable with the correction
 locked against future backfills. You can log wears, track laundry and
