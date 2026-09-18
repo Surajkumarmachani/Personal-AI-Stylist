@@ -24,6 +24,8 @@ so it stops being a caveat on its own when real tags arrive.
 from __future__ import annotations
 
 import json
+from collections import Counter
+from datetime import date
 from typing import Annotated, Any
 
 from fastapi import APIRouter, HTTPException, Query, status
@@ -37,9 +39,12 @@ from stylist_api.deps import (
     SettingsDep,
     TenantDB,
 )
+from stylist_domain.bandit import Arm, daily_seed, explore_slots, reorder
 from stylist_domain.context import resolve_context
 from stylist_domain.taxonomy import load_taxonomy
 from stylist_suggest import TEMPLATE_RATIONALE, load_wardrobe, rerank, suggest
+from stylist_suggest.pipeline import load_style_vector
+from stylist_worker.trends import load_trends
 
 router = APIRouter(tags=["suggestions"])
 
@@ -120,7 +125,16 @@ async def get_suggestions(
         # returning an empty list — see the module docstring.
         served_from = "live"
         pool = await load_wardrobe(db, ctx)
-        live = suggest(pool, ctx, limit=limit)
+        style_vector, style_events = await load_style_vector(db)
+        trends = await load_trends(db)
+        live = suggest(
+            pool,
+            ctx,
+            limit=limit,
+            style_vector=style_vector,
+            style_events=style_events,
+            trends=trends,
+        )
         rows = [
             {
                 "garment_ids": [g.garment_id for g in items],
@@ -157,7 +171,16 @@ async def get_suggestions(
     if not outfits and served_from == "materialised":
         served_from = "live"
         pool = await load_wardrobe(db, ctx)
-        live = suggest(pool, ctx, limit=limit)
+        style_vector, style_events = await load_style_vector(db)
+        trends = await load_trends(db)
+        live = suggest(
+            pool,
+            ctx,
+            limit=limit,
+            style_vector=style_vector,
+            style_events=style_events,
+            trends=trends,
+        )
         rows = [
             {
                 "garment_ids": [g.garment_id for g in items],
@@ -231,12 +254,41 @@ async def get_suggestions(
         for o in outfits:
             o["rationale"] = TEMPLATE_RATIONALE
 
+    # THE BANDIT ORDERS THE FINAL LIST (Phase 11), after the scorer and after
+    # the reranker. Last, because it is the only step that deliberately shows
+    # something other than the best-predicted outfit, and doing that before the
+    # reranker would just let the reranker undo it.
+    #
+    # Seeded from (user, today): identical within a day, so pulling to refresh
+    # does not reshuffle and the precompute and request paths agree; different
+    # across days, so exploration actually happens.
+    explored = 0
+    if outfits:
+        arms = await _load_bandit_arms(db)
+        ranked = [(str(i), o.get("dress_code")) for i, o in enumerate(outfits)]
+        order = reorder(ranked, arms, seed=daily_seed(str(user.id), date.today()))
+        reordered = [outfits[int(i)] for i in order]
+        # THE COUNT IS THE EXPLORE BUDGET, not the number of positions that
+        # moved. Promoting one outfit shifts every outfit after it, so a
+        # positional diff reported 7 of 12 "explored" for a 2-slot budget —
+        # a number that looks like a finding and is an artefact of list
+        # surgery. `explore_slots` is what the bandit actually chose.
+        explored = explore_slots(len(reordered))
+        outfits = reordered
+        if explored:
+            ranking_source = f"{ranking_source}+bandit"
+
     for o in outfits:
         o.pop("_ids", None)
+        o.pop("dress_code", None)
 
     return {
         "outfits": outfits,
         "served_from": served_from,
+        # How many slots the bandit moved off the predicted-best order. Stated
+        # rather than hidden: a user asking "why is this odd one at number 4"
+        # deserves an answer that exists in the response.
+        "explored_slots": explored,
         # HOW the list was ordered, surfaced rather than logged. A ranking that
         # silently switches between a model and a scorer is unexplainable when
         # someone asks why this morning's suggestion is different.
@@ -244,6 +296,21 @@ async def get_suggestions(
         "validator_reject_rule": reject_rule,
         "context": _context_payload(ctx),
         "notes": rerank_notes,
+    }
+
+
+async def _load_bandit_arms(db: Any) -> dict[str, Arm]:
+    """This tenant's Thompson posteriors, keyed by arm.
+
+    An arm absent from the table is NOT absent from the bandit — `reorder`
+    substitutes `Arm(key)` with a uniform Beta(1,1) prior, which is the honest
+    posterior for a kind nobody has reacted to and is what makes a cold start
+    explore instead of settling on whichever arm happens to exist.
+    """
+    rows = await db.execute(text("SELECT arm_key, successes, failures FROM bandit_arm"))
+    return {
+        r["arm_key"]: Arm(r["arm_key"], int(r["successes"]), int(r["failures"]))
+        for r in rows.mappings()
     }
 
 
@@ -267,6 +334,10 @@ async def _hydrate(
             """
             SELECT id, slot::text AS slot, subcategory::text AS subcategory,
                    primary_colour::text AS primary_colour, material::text AS material,
+                   -- `dress_code` is the BANDIT ARM. Without it every outfit
+                   -- lands in the `unknown` arm and the bandit learns one
+                   -- meaningless posterior while looking like it works.
+                   dress_code::text AS dress_code,
                    formality, warmth, cutout_key, needs_review, needs_wash
             FROM garments g
             WHERE g.id = ANY(CAST(:ids AS uuid[])) AND g.is_active
@@ -311,6 +382,16 @@ async def _hydrate(
             # Either way the outfit cannot be rendered honestly, so it is
             # skipped rather than shown with a gap.
             continue
+        # THE OUTFIT'S DRESS CODE = the most common among its garments, which
+        # is the bandit's arm. Ties break on the value itself, not on row
+        # order, so an arm cannot change because the query plan did. Stripped
+        # from the response before it is returned — it is an internal key, not
+        # a field the client asked for.
+        codes = Counter(
+            rows_by_id[gid]["dress_code"]
+            for gid in (str(g) for g in r["garment_ids"])
+            if rows_by_id.get(gid, {}).get("dress_code")
+        )
         outfits.append(
             {
                 "_ids": [str(g) for g in r["garment_ids"]],
@@ -318,6 +399,7 @@ async def _hydrate(
                 "score": float(r["score"]),
                 "informative_weight": (breakdown or {}).get("informative_weight"),
                 "score_breakdown": breakdown,
+                "dress_code": (min(sorted(codes), key=lambda c: (-codes[c], c)) if codes else None),
             }
         )
     return outfits, rows_by_id

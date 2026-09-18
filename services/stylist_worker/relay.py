@@ -53,7 +53,13 @@ EVENT_HANDLERS: dict[str, str] = {
     # transaction could send a photograph of a person to a third party for an
     # outfit that was never saved.
     "tryon.requested": "render_tryon",
-    # Phase 6+ will add: feedback.recorded -> invalidate_precompute.
+    # BUILT 2026-09-18 (Phase 11), having been a comment here since Phase 6.
+    # Feedback moves the style vector and the bandit posterior immediately, but
+    # suggestions come from the materialised precompute — so without this the
+    # user reacts, the system learns, and nothing changes until the nightly
+    # run. A bandit that explores once a day regardless of input is not a
+    # bandit.
+    "feedback.recorded": "invalidate_precompute",
 }
 
 

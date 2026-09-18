@@ -46,7 +46,9 @@ from stylist_domain.context import resolve_context
 from stylist_domain.scoring import load_scoring_config
 from stylist_obs import stage_span
 from stylist_suggest import garment_set_hash, load_wardrobe, rerank, suggest
+from stylist_suggest.pipeline import load_style_vector
 from stylist_suggest.rerank import PRECOMPUTE_TIMEOUT_S
+from stylist_worker.trends import load_trends
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +155,12 @@ async def precompute_for_tenant(
 
     async with tenant_session(user_id) as session:
         pruned = await _prune_stale(session, user_id)
+        # Loaded ONCE per tenant, outside the occasion loop: it does not vary
+        # by occasion and re-reading it four times would be three wasted
+        # queries per user per night.
+        style_vector, style_events = await load_style_vector(session)
+        # Published trends only, and the same rows the request path reads.
+        trends = await load_trends(session)
 
         for occasion in PRECOMPUTE_OCCASIONS:
             ctx = resolve_context(
@@ -165,7 +173,15 @@ async def precompute_for_tenant(
             pool = await load_wardrobe(session, ctx)
             if pool.total == 0:
                 continue
-            result = suggest(pool, ctx, limit=OUTFITS_PER_OCCASION, today=today)
+            result = suggest(
+                pool,
+                ctx,
+                limit=OUTFITS_PER_OCCASION,
+                today=today,
+                style_vector=style_vector,
+                style_events=style_events,
+                trends=trends,
+            )
 
             for items, score in result.outfits:
                 ids = [g.garment_id for g in items]
@@ -427,3 +443,38 @@ async def nightly_precompute(ctx: dict[str, Any]) -> dict[str, Any]:
 
     logger.info("nightly_precompute done: %s", totals)
     return {"ran": True, **totals}
+
+
+async def invalidate_precompute(
+    ctx: dict[str, Any], *, user_id: str, aggregate_id: str, payload: dict[str, Any]
+) -> dict[str, Any]:
+    """Recompute one tenant's outfits after they reacted to something.
+
+    THE GAP THIS CLOSES, which relay.py has carried as a TODO since Phase 6
+    ("Phase 6+ will add: feedback.recorded -> invalidate_precompute").
+
+    Feedback updates the style vector and the bandit posterior IMMEDIATELY, but
+    suggestions are served from the materialised precompute, whose stored
+    `score_breakdown` was computed whenever the precompute last ran. So without
+    this, a user reacts, the system learns, and their suggestions do not change
+    until tomorrow morning.
+
+    For Phase 11 that is not a latency nit, it is the feature failing: a bandit
+    whose arms only take effect nightly explores once a day no matter how much
+    the user tells it, and a style vector that reaches the scorer a day late is
+    scoring yesterday's taste.
+
+    RECOMPUTE RATHER THAN DELETE. Deleting the rows would make the next request
+    fall back to the live path, which works — it is the documented fallback —
+    but costs the user a 1.2-1.5s cold generation at the exact moment they are
+    engaged enough to be giving feedback. Recomputing here spends worker time
+    instead of request time.
+
+    Rationales and boards are NOT re-warmed: they depend on the garment set,
+    which a reaction does not change, and re-warming them would spend a model
+    call per reaction.
+    """
+    uid = uuid.UUID(user_id)
+    result = await precompute_for_tenant(uid, warm_rationales=False, warm_boards=False)
+    logger.info("invalidate_precompute user=%s -> %s", uid, result)
+    return {"user_id": user_id, **result}

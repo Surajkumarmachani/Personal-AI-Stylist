@@ -29,7 +29,7 @@ from stylist_obs import configure_tracing
 from stylist_worker.erasure import drain_erasures
 from stylist_worker.export import build_export, sweep_expired_exports
 from stylist_worker.notify import hourly_digest
-from stylist_worker.precompute import nightly_precompute
+from stylist_worker.precompute import invalidate_precompute, nightly_precompute
 from stylist_worker.relay import relay_outbox
 from stylist_worker.stages import INGEST_STAGES
 from stylist_worker.state_machine import (
@@ -38,6 +38,7 @@ from stylist_worker.state_machine import (
     deferral_count,
     run_pipeline,
 )
+from stylist_worker.trends import compute_trends
 from stylist_worker.tryon import render_tryon
 
 logger = logging.getLogger(__name__)
@@ -130,7 +131,7 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions = [ingest_photo, build_export, render_tryon, ping]
+    functions = [ingest_photo, build_export, render_tryon, invalidate_precompute, ping]
 
     # The relay tick. 1s rather than the plan's 250ms: at 250ms this is 4
     # queries/second/replica against Postgres forever, and the ingest UX
@@ -146,6 +147,12 @@ class WorkerSettings:
         #
         # max_tries=1: a failed nightly run should wait for tomorrow, not
         # retry into the morning traffic it was scheduled to avoid.
+        # 03:05, BEFORE the precompute at 03:15. The precompute scores with
+        # whatever trends exist, so computing them afterwards would serve a
+        # whole night of rankings built on yesterday's signal — the same
+        # ordering trap as "anything that pre-computes for a reader must order
+        # by the reader's query, not its own".
+        cron(compute_trends, hour={3}, minute={5}, max_tries=1),
         cron(nightly_precompute, hour={3}, minute={15}, max_tries=1),
         # EVERY HOUR, on purpose. The plan says "07:00 local", and there is no
         # single moment that is 07:00 — it happens 24+ times a day across

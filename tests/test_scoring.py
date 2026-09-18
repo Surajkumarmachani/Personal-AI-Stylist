@@ -15,6 +15,8 @@ from __future__ import annotations
 import random
 from datetime import date, timedelta
 
+import pytest
+
 from stylist_domain.scoring import (
     ScoredGarment,
     colour_harmony,
@@ -200,19 +202,124 @@ def test_wear_count_is_log_damped_so_one_favourite_cannot_dominate() -> None:
     assert many > few * 0.4
 
 
-# ------------------------------------------------- deliberately inactive
+# --------------------------------- style affinity and trends, once dead
 
 
-def test_style_affinity_and_trend_are_zero_and_say_why() -> None:
-    """Weighted 0.20 and 0.05 at zero, reported rather than omitted.
+def test_no_style_vector_and_no_trends_contribute_zero_and_say_why() -> None:
+    """Weighted 0.20 and 0.05, reported rather than omitted when absent.
 
     Omitting them would mean the other four weights secretly sum to 0.75 and
     every score would be depressed for a reason no reader could see.
+
+    THIS TEST USED TO ASSERT THE BUG. It checked for "Phase 8" and "Phase 11"
+    in the detail strings — that is, it asserted the terms were UNWIRED, and
+    it passed for three phases while 25% of the scoring weight was dead.
+    A test that pins a stub in place is worse than no test, because it makes
+    fixing the stub look like a regression.
     """
     s = style_affinity(outfit())
-    t = trend_alignment(outfit())
-    assert s.value == 0.0 and "Phase 8" in s.detail
-    assert t.value == 0.0 and "Phase 11" in t.detail
+    tr = trend_alignment(outfit())
+    assert s.value == 0.0 and "no style vector" in s.detail
+    assert tr.value == 0.0 and "no published trend" in tr.detail
+    # And uninformative, so `score_breakdown` says "contributed nothing"
+    # rather than leaving a reader to wonder whether it is broken.
+    assert not s.informative and not tr.informative
+
+
+def test_style_affinity_rewards_alignment_and_clamps_dislike() -> None:
+    """Cosine clamped at zero rather than rescaled to [0,1].
+
+    `(cos+1)/2` would hand every outfit 0.5 — a tenth of the total score — for
+    being merely ORTHOGONAL to the user's taste, and would let an outfit they
+    demonstrably dislike still outscore nothing.
+    """
+    import numpy as np
+
+    from stylist_domain.scoring import ScoredGarment
+
+    dim = 8
+    taste = np.zeros(dim)
+    taste[0] = 1.0
+
+    def built_from(vec) -> list[ScoredGarment]:
+        return [
+            ScoredGarment(
+                garment_id=f"g{i}", slot="upper_base", subcategory="kurta", embedding=tuple(vec)
+            )
+            for i in range(2)
+        ]
+
+    aligned = style_affinity(built_from(taste), taste, events_applied=25)
+    orthogonal = style_affinity(built_from(np.eye(dim)[3]), taste, events_applied=25)
+    opposed = style_affinity(built_from(-taste), taste, events_applied=25)
+
+    assert aligned.value == pytest.approx(1.0)
+    assert orthogonal.value == pytest.approx(0.0)
+    assert opposed.value == 0.0, "a disliked outfit must not outscore nothing"
+    assert "clamped" in opposed.detail, "the clamp must be visible in the breakdown"
+
+
+def test_a_thin_style_vector_is_not_trusted() -> None:
+    """A vector built from three reactions is whichever outfit was rated first.
+
+    Scoring against it would be self-reinforcing: the outfits it favours are
+    the ones shown next, which are the ones rated next.
+    """
+    import numpy as np
+
+    from stylist_domain.scoring import MIN_EVENTS_FOR_STYLE_AFFINITY, ScoredGarment
+
+    taste = np.zeros(8)
+    taste[0] = 1.0
+    garments = [
+        ScoredGarment(
+            garment_id="g", slot="upper_base", subcategory="kurta", embedding=tuple(taste)
+        )
+    ]
+    thin = style_affinity(garments, taste, events_applied=MIN_EVENTS_FOR_STYLE_AFFINITY - 1)
+    enough = style_affinity(garments, taste, events_applied=MIN_EVENTS_FOR_STYLE_AFFINITY)
+
+    assert thin.value == 0.0 and not thin.informative
+    assert enough.value > 0.0 and enough.informative
+
+
+def test_trend_alignment_averages_and_takes_the_strongest_field() -> None:
+    """Averaged over garments so a five-piece outfit does not outscore a
+    three-piece one for being larger, and the STRONGEST matching field per
+    garment rather than the sum — a garment that is both a trending colour and
+    a trending material is still one garment."""
+    from stylist_domain.scoring import ScoredGarment
+
+    trends = {
+        ("subcategory", "kurta"): 1.0,
+        ("primary_colour", "maroon"): 0.5,
+        ("material", "silk"): 0.8,
+    }
+    both = ScoredGarment(
+        garment_id="a",
+        slot="upper_base",
+        subcategory="kurta",
+        primary_colour="maroon",
+        material="silk",
+    )
+    # Strongest match is subcategory=kurta at 1.0, not 1.0+0.5+0.8.
+    assert trend_alignment([both], trends).value == pytest.approx(1.0)
+
+    untrending = ScoredGarment(garment_id="b", slot="lower", subcategory="jeans")
+    # One garment at 1.0 and one at 0.0 averages to 0.5.
+    assert trend_alignment([both, untrending], trends).value == pytest.approx(0.5)
+
+
+def test_an_unpublished_value_scores_zero_rather_than_being_guessed() -> None:
+    """Only trends that passed the k-anonymity floor are in `trends` at all.
+    A value that is not there has no trend to be aligned with, which is
+    different from being unfashionable."""
+    from stylist_domain.scoring import ScoredGarment
+
+    g = ScoredGarment(garment_id="a", slot="drape", subcategory="saree")
+    result = trend_alignment([g], {("subcategory", "kurta"): 1.0})
+    assert result.value == 0.0
+    assert not result.informative, "no match is not the same as a zero trend"
 
 
 # --------------------------------------------------------- hard penalty

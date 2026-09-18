@@ -45,6 +45,7 @@ from sqlalchemy import text
 from stylist_domain.context import OutfitContext
 from stylist_domain.scoring import OutfitScore, ScoredGarment, score_outfit
 from stylist_domain.slots import base_structures, evaluate, optional_slots, required_slots
+from stylist_domain.style import parse_embedding
 from stylist_domain.taxonomy import load_taxonomy
 
 # 8-12 per the plan. The upper bound is a latency budget, not a taste
@@ -126,7 +127,11 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
                    g.pattern::text AS pattern, g.material::text AS material,
                    g.formality, g.warmth, g.climate_bands,
                    COALESCE(w.wear_count, 0) AS wear_count,
-                   w.last_worn
+                   w.last_worn,
+                   -- Needed only by `style_affinity`. Cast to text because
+                   -- pgvector's adapter is registered for the ORM mapping and
+                   -- not for text() queries; `parse_embedding` handles it.
+                   g.embedding::text AS embedding
             FROM garments g
             LEFT JOIN (
                 SELECT garment_id, count(*) AS wear_count, max(worn_on) AS last_worn
@@ -203,6 +208,10 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
             warmth=r["warmth"],
             wear_count=int(r["wear_count"]),
             last_worn=r["last_worn"],
+            # pgvector comes back as a STRING through text() queries — the type
+            # adapter is registered for the ORM mapping, not for raw SQL. Same
+            # trap Phase 8 hit; `parse_embedding` is the shared answer.
+            embedding=tuple(parse_embedding(r["embedding"]) or ()) or None,
         )
         pool.by_slot.setdefault(item.slot, []).append(item)
 
@@ -389,6 +398,33 @@ def generate_candidates(
     return candidates
 
 
+async def load_style_vector(session: Any) -> tuple[Any | None, int]:
+    """This tenant's style vector and how many events built it.
+
+    ONE LOADER, THREE CALL SITES, and that is the point. The nightly
+    precompute and the two live paths must score identically or the precompute
+    serves rankings the request path would not reproduce — the same class of
+    bug as `serve_partial_cache` in the reranker. A vector loaded differently
+    in one of the three is indistinguishable from a scoring regression.
+
+    Returns (None, 0) when the user has no vector yet, which is the common case
+    and not an error: `style_affinity` reports it as uninformative and
+    contributes zero rather than guessing.
+    """
+    import numpy as np
+
+    row = await session.execute(
+        text("SELECT vector::text AS v, events_applied FROM user_style_vector LIMIT 1")
+    )
+    found = row.mappings().one_or_none()
+    if found is None:
+        return None, 0
+    parsed = parse_embedding(found["v"])
+    if not parsed:
+        return None, int(found["events_applied"] or 0)
+    return np.asarray(parsed, dtype=np.float64), int(found["events_applied"] or 0)
+
+
 def suggest(
     pool: CandidatePool,
     ctx: OutfitContext,
@@ -396,8 +432,18 @@ def suggest(
     limit: int = 20,
     today: date | None = None,
     seed: int = 0,
+    style_vector: Any | None = None,
+    style_events: int = 0,
+    trends: dict[tuple[str, str], float] | None = None,
 ) -> SuggestionResult:
-    """Generate, score, rank. Deterministic for a given pool and seed."""
+    """Generate, score, rank. Deterministic for a given pool and seed.
+
+    `style_vector` / `style_events` come from `user_style_vector` and are what
+    make `style_affinity` non-zero. They are ARGUMENTS rather than something
+    loaded in here so this function stays pure and the nightly precompute and
+    the request path provably score the same way — the property the whole
+    precompute design rests on.
+    """
     candidates = generate_candidates(pool, ctx, seed=seed)
     scored: list[tuple[tuple[ScoredGarment, ...], OutfitScore]] = []
     for items in candidates:
@@ -406,6 +452,9 @@ def suggest(
             warmth_target=ctx.warmth_target,
             formality_target=ctx.formality_target,
             today=today,
+            style_vector=style_vector,
+            style_events=style_events,
+            trends=trends,
         )
         if result.total > 0:
             scored.append((items, result))

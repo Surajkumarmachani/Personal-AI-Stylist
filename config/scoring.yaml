@@ -29,8 +29,13 @@ weights:
 # score_breakdown can say "this contributed nothing BY DESIGN" rather than
 # leaving a reader to wonder whether it is broken.
 inactive_until_later_phases:
-  - style_affinity
-  - trend_alignment
+  # style_affinity WIRED 2026-09-18 and removed from this list. It was dead
+  # from Phase 8 to Phase 11: the vector was built and written on every
+  # reaction, and nothing read it. Note it still reports uninformative until a
+  # user has MIN_EVENTS_FOR_STYLE_AFFINITY reactions — "inactive by design" and
+  # "not enough data yet" are different states and only the first belongs here.
+  # trend_alignment WIRED 2026-09-18 (Phase 11), first-party sources only.
+  []
 
 # Soft penalties from taxonomy.yaml's outfit_rules.penalties are applied
 # multiplicatively by hard_penalty(). Listed there, not here, because they are

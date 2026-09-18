@@ -32,6 +32,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from stylist_api.deps import CurrentUser, TenantDB
+from stylist_db.outbox import emit
 from stylist_db.session import tenant_session
 from stylist_domain.style import (
     DEFAULT_ALPHA,
@@ -80,6 +81,11 @@ class FeedbackResponse(BaseModel):
     kind: FeedbackKind
     style_vector_events: int
     style_vector_moved: bool
+    # Which Thompson arm this reaction moved, or None when the reaction
+    # carries no evidence (`dismissed`, `saved`). Returned so a client — and a
+    # test — can see that the posterior actually changed rather than assuming
+    # it from a 200.
+    bandit_arm: str | None = None
 
 
 class FactRequest(BaseModel):
@@ -131,6 +137,58 @@ async def _save_style(db: Any, user_id: uuid.UUID, style: StyleVector) -> None:
     )
 
 
+async def _update_bandit_arm(
+    db: Any, user_id: uuid.UUID, garments: dict[str, dict[str, Any]], kind: str
+) -> str | None:
+    """Fold one reaction into this tenant's Thompson posterior.
+
+    THE OUTFIT'S DRESS CODE IS THE ARM, and an outfit has several garments, so
+    the arm is the MOST COMMON dress code among them — an outfit is
+    `festive_ethnic` if most of what is in it is. Ties break on the value
+    itself rather than on whichever row the database returned first, because an
+    arm that depends on row order is an arm that changes when the plan does.
+
+    Returns the arm key, or None when the reaction carries no evidence
+    (`dismissed`, `saved`) — see `bandit.apply_feedback` for why those move
+    neither counter.
+    """
+    from collections import Counter
+
+    from stylist_domain.bandit import Arm, apply_feedback, arm_key
+
+    codes = Counter(
+        str(row["dress_code"]) for row in garments.values() if row.get("dress_code") is not None
+    )
+    key = arm_key(min(sorted(codes), key=lambda c: (-codes[c], c)) if codes else None)
+
+    row = await db.execute(
+        text("SELECT successes, failures FROM bandit_arm WHERE arm_key = :k"),
+        {"k": key},
+    )
+    existing = row.mappings().one_or_none()
+    current = Arm(
+        key,
+        int(existing["successes"]) if existing else 0,
+        int(existing["failures"]) if existing else 0,
+    )
+    updated = apply_feedback(current, kind)
+    if updated == current:
+        # No evidence in this reaction. Not written, so `updated_at` stays
+        # honest about when the posterior last actually moved.
+        return None
+
+    await db.execute(
+        text(
+            "INSERT INTO bandit_arm (user_id, arm_key, successes, failures) "
+            "VALUES (:u, :k, :s, :f) "
+            "ON CONFLICT (user_id, arm_key) DO UPDATE SET "
+            "successes = :s, failures = :f, updated_at = now()"
+        ),
+        {"u": user_id, "k": key, "s": updated.successes, "f": updated.failures},
+    )
+    return key
+
+
 @router.post(
     "/outfits/feedback",
     response_model=FeedbackResponse,
@@ -146,12 +204,18 @@ async def record_feedback(body: FeedbackRequest, user: CurrentUser) -> FeedbackR
         # is a 404 rather than a 403, and we do not confirm the id exists.
         rows = await db.execute(
             text(
-                "SELECT id::text AS id, embedding FROM garments "
+                # `dress_code` is here for the BANDIT ARM. Selecting only the
+                # embedding would have made every arm `unknown` — the posterior
+                # would fill up, the endpoint would return 200, and the bandit
+                # would learn one meaningless arm forever.
+                "SELECT id::text AS id, embedding, dress_code::text AS dress_code "
+                "FROM garments "
                 "WHERE id = ANY(CAST(:ids AS uuid[])) AND is_active"
             ),
             {"ids": ids},
         )
-        found = {r["id"]: r["embedding"] for r in rows.mappings()}
+        mapped = {r["id"]: dict(r) for r in rows.mappings()}
+        found = {gid: row["embedding"] for gid, row in mapped.items()}
         missing = [g for g in ids if g not in found]
         if missing:
             raise HTTPException(
@@ -205,11 +269,30 @@ async def record_feedback(body: FeedbackRequest, user: CurrentUser) -> FeedbackR
         else:
             events = current.events_applied if current else 0
 
+        # THE BANDIT ARM, folded in the SAME transaction as the event and the
+        # style vector. All three derive from this one reaction, and a partial
+        # commit would leave the posteriors disagreeing with the event log they
+        # are supposed to be rebuildable from.
+        arm_updated = await _update_bandit_arm(db, user.id, mapped, body.kind)
+
+        # INSIDE the same transaction as the event, the vector and the arm.
+        # The precompute this triggers reads all three, so an enqueue that
+        # outlived a rollback would recompute from state that was never
+        # committed — the exact failure the outbox exists to prevent.
+        await emit(
+            db,
+            aggregate_id=event_id,
+            user_id=user.id,
+            event_type="feedback.recorded",
+            payload={},
+        )
+
         return FeedbackResponse(
             event_id=event_id,
             kind=body.kind,
             style_vector_events=events,
             style_vector_moved=moved,
+            bandit_arm=arm_updated,
         )
 
 

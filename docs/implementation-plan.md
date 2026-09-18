@@ -667,18 +667,100 @@ Then: consent flow (separate record, timestamped, independently revocable) → `
 
 Only now, with ≥5k feedback events: Thompson-sampling bandit (85/15 exploit/explore), then a learned compatibility model (OutfitTransformer or MCN fine-tuned on Polyvore then on your feedback) replacing `colour_harmony + formality_coherence`, gated by feedback-replay eval. Trends last, on licensed or first-party sources only, capped at ≤10% of score.
 
-**The 5k gate does not move for n=1, and this is the phase the single-user
-decision hurts most.** One person generating a handful of feedback events a day
-reaches 5k in a couple of years, not a couple of weeks. The number is not
-arbitrary padding — a learned compatibility model fitted to a few hundred events
-memorises one person's recent choices and reports it as taste, and the
-feedback-replay eval that is supposed to catch that is fitted on the same thin
-data. So the realistic reading is that **Phase 11 is out of reach at n=1**, and
-the deterministic scorer from Phase 6 is the long-term answer rather than a
-placeholder. Revisit only if the user count ever changes; do not compensate by
-lowering the gate.
+**REVISED 2026-09-18: n = 500, from n = 1.** See "Sizing for production" at
+the end of this document for how 500 was derived. The 5k gate is unchanged, and
+that is the point — it was the user count that moved, not the gate.
+
+**The 5k gate does not move.** A learned compatibility model fitted to a few
+hundred events memorises recent choices and reports it as taste, and the
+feedback-replay eval meant to catch that is fitted on the same thin data. At
+n=1 the gate put Phase 11 a couple of years out; at n=500 it is a few days of
+real use. **Do not compensate by lowering the gate** — that is the one change
+that makes every number downstream of it meaningless, and
+`stylist_domain.promotion.MIN_EVENTS_TO_PROMOTE` asserts it in a test.
+
+**What the gate does and does not block, which the first reading got wrong.**
+Phase 11 is three things and only one of them is gated on 5k events:
+
+| | gated on 5k? | why |
+|---|---|---|
+| Thompson-sampling bandit | **no** | An online learner. It has no training phase: with no data every arm draws from Beta(1,1), which is exactly uniform exploration. It does not need 5k events to be correct, only to be confident — and it reports its own uncertainty by construction. It is also how the 5k events get collected in a form worth fitting a model to, because a purely greedy ranker only ever shows its own top pick and the log it produces teaches a model the ranker rather than the wearer. |
+| First-party trends | **no** | Gated on a COHORT, not on feedback volume: `MIN_COHORT_USERS = 5`. Structurally impossible at n=1, which is why this moved with the user count rather than with the gate. |
+| Learned compatibility model | **yes** | And additionally on Polyvore pretraining, which needs a GPU and a dataset licence this project does not have. |
+
+So the bandit and trends are **built**; the learned model is **not**, and what
+is built in its place is the GATE it has to pass — `may_promote`, which refuses
+for every reason it should and says which one.
 
 ---
+
+---
+
+## Sizing for production — n = 500 (revised 2026-09-18, from n = 1)
+
+The user count moved twice: 20 (startup validation) -> 1 (a personal stylist
+for its owner) -> **500**. This records how 500 was derived, because a capacity
+number with no derivation becomes load-bearing folklore inside a month — the
+failure mode commitment 2 exists to prevent.
+
+### What actually binds
+
+Not ingest, and not the request path:
+
+| Path | Measured | Binds at n=500? |
+|---|---|---|
+| Suggestions, warm from precompute | 6.4-22ms p95 | No. Served from a materialised table. |
+| Suggestions, cold/live | 1.2-1.5s | No. It is the documented fallback, not the common path. |
+| Ingest | ~25s/photo, `ML_MAX_CONCURRENCY=2` | No. One-time per garment; a 100-garment wardrobe is ~21 min of worker time, and onboarding is bursty rather than sustained. |
+| **Nightly precompute** | **see below** | **Yes. This is the constraint.** |
+
+### The derivation
+
+Measured 2026-09-18 on the live stack: a full `nightly_precompute` over 306
+tenants took **27.5s**, of which 11 tenants had wardrobes — **2.50s per active
+tenant**. That figure is NOT the production cost, because rationale warming was
+failing fast with depleted Gemini credits, and rationale warming is the
+expensive part.
+
+With real reranks at the measured **3.2-6.4s** per top-8, four occasions per
+tenant, run sequentially:
+
+| Rerank latency | Per tenant/night | 4h window | 6h window |
+|---|---|---|---|
+| 3.2s (best measured) | 13s | 1,125 tenants | 1,687 tenants |
+| 6.4s (worst measured) | 26s | **562 tenants** | 843 tenants |
+
+**500 is the worst-case 4-hour figure with a margin.** It is deliberately the
+pessimistic corner of a measured range rather than the optimistic one: a
+capacity number that only holds if the provider is fast is a number that fails
+on the provider's bad night.
+
+### What 500 buys, and what it costs
+
+- **Phase 11 becomes reachable.** At ~3 feedback events per active user per day,
+  500 users clear the 5,000-event gate in **3-4 days** of real use rather than
+  the couple of years n=1 implied.
+- **Trends become possible at all.** `MIN_COHORT_USERS = 5` is a privacy floor,
+  not a quality threshold — a trend aggregated from fewer tenants is a report of
+  what those tenants wore. At n=1 no trend can ever be published; at n=500 the
+  floor is met while still meaning something.
+- **Free-tier ceiling: $75/month.** 500 x `free_tier_monthly_budget_usd` of
+  $0.15, enforced by LiteLLM on the virtual key rather than by feature code.
+- **The blind eval keeps its two outside raters.** Unchanged from the n=1
+  revision and for the same reason: a rater grading outfits built from their own
+  wardrobe cannot separate "this is a good outfit" from "this is what I would
+  have picked anyway".
+
+### Beyond 500
+
+The next ceiling is the same one: the nightly rationale warm, sequential per
+tenant. Past ~560 it needs parallelising, which is the `w-render`/autoscaling
+work §C2 defers to the capacity phase. **That work is not done**, so 500 is a
+ceiling and not a waypoint — raising it is a code change, not a config change.
+
+Tenancy itself is unaffected and always was: RLS is proven by the test suite
+rather than by having tenants, which is why it was built that way in Phase 1.
+
 
 ## Weekly operating cadence
 
@@ -2694,3 +2776,145 @@ the separation consent and erasure both depend on. Both mirrored now.
 **The benchmark is the gate, and it needs photographs.** Not the owner's
 wardrobe alone — ten bodies and sixteen garments, which is a materially larger
 ask than everything else currently waiting on a camera.
+
+---
+
+## Phase 11 — learning: bandit, trends, and a gate (built 2026-09-18)
+
+**512 tests**; `ruff`, `ruff format` and `mypy --strict` clean across 113
+source files. Migrations `0015_trend_signal` and `0016_bandit_arm`, both
+verified reversible.
+
+### Before Phase 11: 25% of the scoring weight was dead
+
+Phase 11 replaces `colour_harmony + formality_coherence` with a learned model
+"gated by feedback-replay eval". That gate compares a challenger against the
+deterministic scorer — so the champion was checked first, and the champion was
+running at 75%.
+
+| Sub-score | Weight | State before |
+|---|---|---|
+| `style_affinity` | 0.20 | **Returned 0.0 unconditionally**, including when handed a style vector. `score_outfit` was never called with one. |
+| `trend_alignment` | 0.05 | Returned 0.0 — Phase 11's own stub. |
+
+Phase 8 built the style vector (EWMA, replayable, `user_style_vector`) and the
+feedback router wrote it on every reaction. **Nothing ever read it.** A
+populated table, a tested pure function, a weight in config — and no path from
+any of them to a ranking. The same recurring failure in this codebase under a
+new name, and the test suite was holding it in place: a test asserted
+`"Phase 8" in detail`, i.e. asserted the term was UNWIRED, and passed for three
+phases while a fifth of the score did nothing.
+
+Wiring it threaded the vector and per-garment embeddings through
+`load_wardrobe` -> `suggest` -> `score_outfit` via ONE loader
+(`load_style_vector`) shared by the nightly precompute and both live paths,
+because three loaders is three chances for the precompute to serve a ranking
+the request path would not reproduce.
+
+Cosine is **clamped at zero**, not rescaled: `(cos+1)/2` hands every outfit
+0.10 of free score for being merely orthogonal to the user's taste, and lets an
+outfit they demonstrably dislike still outscore nothing.
+
+### The feedback loop was open, and had been since Phase 6
+
+`relay.py` carried this comment from Phase 6: *"Phase 6+ will add:
+feedback.recorded -> invalidate_precompute."* It was never built.
+
+So feedback moved the style vector and the bandit posterior IMMEDIATELY, while
+suggestions came from a materialised precompute whose stored breakdown was
+computed whenever the nightly job last ran. The user reacted, the system
+learned, and nothing changed until tomorrow. For Phase 11 that is not a latency
+nit — a bandit whose arms take effect nightly explores once a day regardless of
+what it is told.
+
+Built as an outbox event so the enqueue commits with the reaction it describes.
+Measured end to end: `style_affinity` went from 0.0 ("3 events, needs 10") to
+**0.505** ("cosine +0.505 from 13 events") **10 seconds** after one tap.
+
+### Thompson-sampling bandit (85/15)
+
+Arms are DRESS CODES — eight values, so 5k events is ~600 per arm. It learns a
+per-kind correction to the scorer ("this user likes festive_ethnic more than the
+weights predict") and only reorders what the scorer already produced; it cannot
+invent an outfit the scorer rejected.
+
+**Seeded from (user, date), and that is load-bearing.** A stochastic bandit
+otherwise breaks the invariant that the precompute and the request path produce
+identical rankings. Consequences, all wanted: pull-to-refresh does not
+reshuffle, the two paths agree exactly, and exploration happens across days —
+the honest cadence for something opened once a morning.
+
+Seeds are HASHED, not concatenated: `random.Random` seeded with nearby integers
+gives nearby first draws, so two users with adjacent ids would explore in
+lockstep and the cohort would collect half the information it thinks it does.
+
+Position 0 is never explored — the top of the list is the product's promise.
+`dismissed` and `saved` move neither counter: the style vector can afford a
+weak signal because it moves a direction, but a Beta counter is a claim about
+probability.
+
+### First-party trends, with a k-anonymity floor
+
+"Licensed or first-party sources only, capped at <=10% of score". There is no
+licensed feed, so the signal is our own wear logs: values worn above their own
+recent baseline. Weight 0.05, inside the cap.
+
+**`MIN_COHORT_USERS = 5` is a privacy control, not a quality threshold.** A
+trend aggregated from two tenants is a report of what those two wore this
+fortnight; at n=1 it is the owner's wardrobe handed back as a trend.
+`users_contributing` is stored so the floor is auditable rather than trusted.
+
+Two bugs found while building it, both worth recording:
+
+1. **The aggregation read zero rows and reported success.** The first version
+   used `system_session()`, whose own docstring says tenant-scoped tables
+   return zero rows there. `{'published': 0, 'suppressed': 0}` is also what a
+   correctly-working job with no trends returns. Seventh instance of the
+   pattern in this codebase, written minutes after the module docstring warning
+   about exactly this. Fixed with a `SECURITY DEFINER` function per 0006's
+   precedent, and the job now reports `examined`, so "no trends" and "no data"
+   can never look identical again.
+2. **Every score saturated at 1.0.** `(velocity-1)/(SATURATION-1)` against a
+   constant of 2.0 published 156 of 175 rows at exactly 1.0 — a constant
+   contributes nothing to a ranking, so the term was dead again in a new way.
+   The constant was the real fault: "which absolute velocity is high" cannot be
+   answered without the data, so it was a magic number wearing a PROVISIONAL
+   label. Scores are now a value's position among the other risers of the SAME
+   FIELD — self-calibrating, no threshold, always discriminating, with the
+   absolute gate still excluding anything flat or falling.
+
+`unknown` is excluded: it is what a field holds when tagging could not tell, so
+a rising `unknown` is a rising tagging gap, and scoring it would reward the
+system for garments it failed to identify.
+
+### The learned compatibility model is NOT built, and the gate is
+
+It cannot be. The gate is >=5k feedback events, there are 3 real ones, and
+Polyvore pretraining needs a GPU and a dataset licence this project does not
+have. Building it anyway produces precisely what the plan warns about —
+something that memorises one person's recent choices and reports it as taste,
+evaluated by a replay eval fitted on the same thin data.
+
+What IS built is the part that has to exist first, and is testable today:
+
+- **`eval/replay_feedback.py`** — pairwise accuracy over (preferred, rejected)
+  pairs from real history. PAIRS, not events, is the denominator: a user who
+  only taps "like" produces zero pairs however many events they generate, and
+  reporting 100% there certifies a scorer nobody tested. Scored WITHOUT the
+  style vector, because the vector is derived from those very reactions and
+  including it would let the scorer see its own label.
+- **`stylist_domain.promotion.may_promote`** — refuses for every reason it
+  should and says which one: under the 5k gate, no ordered pairs, replayed on
+  different histories, near-chance accuracy, or a margin under 2 points
+  ("shown indistinguishable, not better").
+
+Run against the live database: 13 events, 27 ordered pairs, **0.519** pairwise
+accuracy — barely above chance, which is the honest answer for near-random test
+feedback. The eval does not invent skill.
+
+### What Phase 11 still needs
+
+Real feedback from real users. The bandit and the trends are live and will
+improve with use; the learned model waits on 5,000 events, and at n=500 that is
+3-4 days of real traffic rather than the couple of years n=1 implied.
+

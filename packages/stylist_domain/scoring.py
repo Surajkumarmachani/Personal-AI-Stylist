@@ -81,6 +81,10 @@ class ScoredGarment:
     warmth: int | None = None
     wear_count: int = 0
     last_worn: date | None = None
+    # The garment's SigLIP vector, when the caller loaded it. Optional because
+    # most of the scorer does not need it and every other sub-score stays pure
+    # arithmetic on tags — only `style_affinity` reads it.
+    embedding: tuple[float, ...] | None = None
 
     def as_item(self) -> OutfitItem:
         return OutfitItem(self.garment_id, self.slot, self.subcategory)
@@ -236,19 +240,85 @@ def weather_fit(garments: list[ScoredGarment], warmth_target: int) -> SubScore:
     return SubScore(round(value, 4), True, f"warmest item {effective} vs target {warmth_target}")
 
 
-def style_affinity(
-    garments: list[ScoredGarment], style_vector: np.ndarray | None = None
-) -> SubScore:
-    """Zero until Phase 8 builds the style vector.
+# Below this many feedback events the style vector is noise, not taste.
+#
+# EWMA with alpha=0.1 has ~20 reactions of effective memory, so at 3 events the
+# vector is dominated by whichever outfit happened to be rated first. Scoring
+# against it would hand 20% of the weight to an accident and — worse — the
+# accident would be self-reinforcing, because the outfits it favours are the
+# ones that get shown and rated next.
+#
+# PROVISIONAL — set 2026-09-18 with no real feedback events in the system.
+# Resolves when: ~100 real events exist and the vector can be checked against
+# held-out reactions instead of against reasoning.
+MIN_EVENTS_FOR_STYLE_AFFINITY = 10
 
-    Present, weighted and reported at zero rather than omitted, so the weights
-    in config are the real weights and `score_breakdown` has a stable shape.
-    Omitting it would mean the other five weights secretly sum to 0.80 and
-    every score would be depressed by 20% for a reason no reader could see.
+
+def style_affinity(
+    garments: list[ScoredGarment],
+    style_vector: np.ndarray | None = None,
+    *,
+    events_applied: int = 0,
+) -> SubScore:
+    """How close this outfit sits to the taste the user has demonstrated.
+
+    WIRED 2026-09-18, AND IT WAS DEAD BEFORE THAT. Phase 8 built the style
+    vector — EWMA, replayable, `user_style_vector` — and the feedback router
+    writes it on every reaction. Nothing ever read it. This function returned
+    0.0 unconditionally, including when handed a vector, and the suggest
+    pipeline never passed one anyway. At weight 0.20 that is a fifth of the
+    score permanently zero, with `trend_alignment` making it a quarter.
+
+    That is the recurring failure in this codebase under a new name: a signal
+    that looks live — a populated table, a tested pure function, a weight in
+    config — and cannot affect the thing it exists to affect.
+
+    COSINE CLAMPED AT ZERO, not rescaled to [0,1]. `(cos+1)/2` would hand every
+    outfit 0.5 for being merely orthogonal to the user's taste, which is 0.10
+    of free score for no information, and would make an outfit the user
+    demonstrably dislikes (negative cosine) still outscore nothing. Clamping
+    also keeps this continuous with the unwired behaviour: no vector and an
+    unlike-you outfit both score 0.
     """
     if style_vector is None:
-        return SubScore(0.0, False, "style vector arrives in Phase 8 (weighted 0.20)")
-    return SubScore(0.0, False, "style vector present but scoring lands in Phase 8")
+        return SubScore(0.0, False, "no style vector for this user yet (weighted 0.20)")
+    if events_applied < MIN_EVENTS_FOR_STYLE_AFFINITY:
+        return SubScore(
+            0.0,
+            False,
+            f"style vector has {events_applied} event(s), needs "
+            f"{MIN_EVENTS_FOR_STYLE_AFFINITY} before it is trusted",
+        )
+
+    embeddings = [list(g.embedding) for g in garments if g.embedding]
+    if not embeddings:
+        # Garments predating the embed stage, or a pool loaded without
+        # embeddings. Reported rather than silently scored as dissimilar.
+        return SubScore(0.0, False, "no garment embeddings in this outfit")
+
+    from stylist_domain.style import outfit_embedding
+
+    outfit_vec = outfit_embedding(embeddings)
+    if outfit_vec is None:
+        return SubScore(0.0, False, "outfit embedding could not be computed")
+
+    sv = np.asarray(style_vector, dtype=np.float64)
+    if sv.shape[0] != len(outfit_vec):
+        raise ValueError(f"dimension mismatch: style {sv.shape[0]} vs outfit {len(outfit_vec)}")
+    norm = float(np.linalg.norm(sv))
+    if norm == 0.0:
+        # A real state: equal likes and dislikes converge here. Not an error,
+        # and not similarity either.
+        return SubScore(0.0, False, "style vector is zero — no net preference yet")
+
+    cosine = float(np.dot(sv / norm, np.asarray(outfit_vec, dtype=np.float64)))
+    value = max(0.0, cosine)
+    return SubScore(
+        value,
+        True,
+        f"cosine {cosine:+.3f} against a style vector from {events_applied} event(s)"
+        + (" (clamped to 0)" if cosine < 0 else ""),
+    )
 
 
 def novelty(garments: list[ScoredGarment], today: date | None = None) -> SubScore:
@@ -288,9 +358,76 @@ def novelty(garments: list[ScoredGarment], today: date | None = None) -> SubScor
     )
 
 
-def trend_alignment(garments: list[ScoredGarment]) -> SubScore:
-    """Zero until Phase 11. Same reasoning as style_affinity."""
-    return SubScore(0.0, False, "trend signals arrive in Phase 11 (weighted 0.05)")
+# Which fields carry a trend at all.
+#
+# `subcategory`, `primary_colour`, `pattern` and `material` are the fields where
+# "more people are wearing this lately" is a meaningful statement. `formality`
+# and `warmth` are deliberately absent: they are properties of the OCCASION and
+# the WEATHER, already scored by their own terms, and a "trend toward warmer
+# clothes" is a season, not a taste.
+TREND_FIELDS = ("subcategory", "primary_colour", "pattern", "material")
+
+
+def trend_alignment(
+    garments: list[ScoredGarment], trends: dict[tuple[str, str], float] | None = None
+) -> SubScore:
+    """How much of this outfit is in something people are wearing more lately.
+
+    WIRED 2026-09-18 (Phase 11). First-party only: the signal is our own wear
+    logs — which values are being worn above their own recent baseline — never
+    a scraped or unlicensed trend feed. Phase 11's constraint is "licensed or
+    first-party sources only, capped at <=10% of score", and the weight is
+    0.05, which satisfies the cap with room.
+
+    ONLY PUBLISHED TRENDS COUNT. `trends` holds the rows that passed the
+    k-anonymity floor in `trend_signal`; a value not in it scores 0 rather than
+    being guessed at. So a wardrobe full of garments nobody else owns gets no
+    trend credit, which is correct — there is no trend to be aligned with.
+
+    AVERAGED OVER GARMENTS, NOT SUMMED. A five-piece outfit must not outscore
+    a three-piece one for being larger, and the weighted sum only stays
+    debuggable if every sub-score is a [0,1] intensity rather than a total.
+    """
+    if not trends:
+        return SubScore(0.0, False, "no published trend signals (weighted 0.05)")
+
+    scores: list[float] = []
+    matched: list[str] = []
+    for g in garments:
+        values = {
+            "subcategory": g.subcategory,
+            "primary_colour": g.primary_colour,
+            "pattern": g.pattern,
+            "material": g.material,
+        }
+        best = 0.0
+        best_label = ""
+        for field_name in TREND_FIELDS:
+            value = values.get(field_name)
+            if not value:
+                continue
+            found = trends.get((field_name, value))
+            # The STRONGEST matching field, not the sum: a garment that is both
+            # a trending colour and a trending material is one garment, and
+            # adding the two would let a single item carry the whole outfit.
+            if found is not None and found > best:
+                best, best_label = found, f"{field_name}={value}"
+        scores.append(best)
+        if best_label:
+            matched.append(best_label)
+
+    if not scores:
+        return SubScore(0.0, False, "no garments to score")
+
+    mean_trend = sum(scores) / len(scores)
+    informative = bool(matched)
+    return SubScore(
+        round(min(1.0, max(0.0, mean_trend)), 4),
+        informative,
+        (f"{len(matched)}/{len(scores)} garment(s) in a published trend: " + ", ".join(matched[:4]))
+        if informative
+        else "no garment in this outfit matched a published trend",
+    )
 
 
 # ------------------------------------------------------------ hard penalty
@@ -341,8 +478,15 @@ def score_outfit(
     formality_target: int,
     today: date | None = None,
     style_vector: np.ndarray | None = None,
+    style_events: int = 0,
+    trends: dict[tuple[str, str], float] | None = None,
 ) -> OutfitScore:
-    """The weighted total, plus a breakdown you can debug a ranking from."""
+    """The weighted total, plus a breakdown you can debug a ranking from.
+
+    `style_events` gates `style_affinity`: a vector built from three reactions
+    is an accident, and scoring against it would make the accident
+    self-reinforcing because the outfits it favours are the ones shown next.
+    """
     cfg = load_scoring_config()
     weights = {k: float(v) for k, v in cfg["weights"].items()}
     inactive = set(cfg.get("inactive_until_later_phases", []))
@@ -353,9 +497,9 @@ def score_outfit(
         "colour_harmony": colour_harmony(garments),
         "formality_coherence": formality_coherence(garments, formality_target),
         "weather_fit": weather_fit(garments, warmth_target),
-        "style_affinity": style_affinity(garments, style_vector),
+        "style_affinity": style_affinity(garments, style_vector, events_applied=style_events),
         "novelty": novelty(garments, today),
-        "trend_alignment": trend_alignment(garments),
+        "trend_alignment": trend_alignment(garments, trends),
     }
 
     for name, sub in subs.items():
