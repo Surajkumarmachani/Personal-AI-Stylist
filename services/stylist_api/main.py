@@ -21,6 +21,7 @@ from stylist_api.routers import (
     auth,
     boards,
     calendar,
+    chat,
     corrections,
     duplicates,
     evalview,
@@ -166,6 +167,7 @@ def create_app() -> FastAPI:
     app.include_router(push.router)
     app.include_router(privacy.router)
     app.include_router(tryon.router)
+    app.include_router(chat.router)
 
     from stylist_api.routers import uploads
 

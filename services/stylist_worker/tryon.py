@@ -35,6 +35,7 @@ one, and that applies with more force to a picture of someone's own body.
 
 from __future__ import annotations
 
+import io
 import logging
 import uuid
 from typing import Any
@@ -53,6 +54,51 @@ MAX_PASSES = 2
 
 # Lower first so the upper garment layers over it. See the module docstring.
 PASS_ORDER = {"lower": 0, "full_body": 0, "upper_base": 1, "upper_layer": 2}
+
+
+# Below this mean per-pixel difference, the "render" is the input photo handed
+# back unchanged.
+#
+# THE BUG THIS CATCHES, found 2026-09-18 on the first render that ever
+# returned True: a provider echoed the body photo verbatim, the pipeline got
+# valid PNG bytes back, stored them, and reported `rendered: True`. The image
+# was the person in their own clothes. Nothing in the response said otherwise
+# and the UI would have shown it as a try-on.
+#
+# `rendered: True` meant "bytes came back", not "a garment was fitted" — the
+# same class of failure as the cache_hit header, the RLS zero-rows read and the
+# style vector nothing consumed: a signal that looks live and cannot answer its
+# own question. Eighth instance in this codebase.
+#
+# 2.0/255 rather than exact equality: the provider re-encodes, so a genuine
+# passthrough still differs by JPEG/PNG rounding. A real fit changes the torso
+# entirely and scores far higher — the measured passthrough was 0.0.
+PASSTHROUGH_MAX_DIFF = 2.0
+
+
+def _looks_unchanged(before: bytes, after: bytes) -> bool:
+    """True when `after` is `before` re-encoded rather than rendered.
+
+    Compared on a downscaled greyscale copy: the question is "is this the same
+    picture", which survives a thumbnail, and a full-resolution RGB diff would
+    cost more than the render it is checking.
+    """
+    from PIL import Image
+
+    try:
+        a = Image.open(io.BytesIO(before)).convert("L").resize((64, 64))
+        b = Image.open(io.BytesIO(after)).convert("L").resize((64, 64))
+    except Exception:  # pragma: no cover - unreadable bytes fail elsewhere
+        return False
+    # `list(img.getdata())` rather than iterating the ImagingCore directly:
+    # Pillow's stubs do not declare it iterable, and bytes() gives a flat,
+    # typed sequence for a greyscale image.
+    pixels_a = bytes(a.tobytes())
+    pixels_b = bytes(b.tobytes())
+    if len(pixels_a) != len(pixels_b):
+        return False
+    total = sum(abs(x - y) for x, y in zip(pixels_a, pixels_b, strict=True))
+    return bool((total / len(pixels_a)) < PASSTHROUGH_MAX_DIFF)
 
 
 async def render_tryon(
@@ -121,16 +167,41 @@ async def render_tryon(
     if not renderable:
         return {"rendered": False, "reason": "no renderable garment", "skipped": skipped}
 
-    renderable.sort(key=lambda g: PASS_ORDER.get(g["slot"], 99))
-    dropped = [g["slot"] for g in renderable[MAX_PASSES:]]
-    renderable = renderable[:MAX_PASSES]
-
     client = VTONClient(
         provider,
         api_token=getattr(settings, "vton_api_token", ""),
         base_url=getattr(settings, "vton_base_url", ""),
         timeout=getattr(settings, "vton_timeout_s", 900.0),
     )
+
+    # DROP CATEGORIES THIS PROVIDER CANNOT RENDER, BEFORE ordering and capping.
+    #
+    # Several providers are upper-body only — IDM-VTON takes no category
+    # argument at all, and the Colab wrapper removed it. Previously an outfit
+    # whose FIRST pass was the trousers abandoned the whole render, because the
+    # loop below treats a failure with `passes == 0` as "nothing worked". An
+    # unsupported category is not a provider failure: the shirt in the same
+    # outfit is perfectly renderable, and giving up on it produced "no render"
+    # for outfits that were half-renderable all along.
+    #
+    # Filtering here rather than inside the loop also means MAX_PASSES applies
+    # to garments that can actually be rendered, instead of being spent on ones
+    # that were going to be refused.
+    supported = client.profile.categories
+    unsupported = [g["slot"] for g in renderable if SLOT_TO_CATEGORY[g["slot"]] not in supported]
+    renderable = [g for g in renderable if SLOT_TO_CATEGORY[g["slot"]] in supported]
+    if not renderable:
+        return {
+            "rendered": False,
+            "reason": f"{provider} renders only "
+            f"{sorted(client.profile.categories)}; nothing in this outfit qualifies",
+            "skipped": skipped + unsupported,
+        }
+
+    renderable.sort(key=lambda g: PASS_ORDER.get(g["slot"], 99))
+    dropped = [g["slot"] for g in renderable[MAX_PASSES:]]
+    renderable = renderable[:MAX_PASSES]
+    skipped = skipped + unsupported
 
     try:
         current = store.get_bytes(body_key)
@@ -143,11 +214,20 @@ async def render_tryon(
         category = SLOT_TO_CATEGORY[garment["slot"]]
         try:
             with stage_span("vton_render"):
-                current = client.render(
+                produced = client.render(
                     person_png=current,
                     garment_png=store.get_bytes(garment["cutout_key"]),
                     category=category,
                 )
+            # THE PROVIDER MUST ACTUALLY HAVE CHANGED THE PICTURE. See
+            # PASSTHROUGH_MAX_DIFF: a provider that echoes the input yields
+            # valid bytes and a `rendered: True` that means nothing.
+            if _looks_unchanged(current, produced):
+                raise VTONUnavailable(
+                    f"{provider} returned the body photo unchanged for slot "
+                    f"{garment['slot']} — it accepted the request but fitted nothing"
+                )
+            current = produced
             passes += 1
         except VTONUnavailable as exc:
             # Logged at WARNING with the provider's own words. This is the only

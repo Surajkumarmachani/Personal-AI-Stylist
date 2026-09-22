@@ -47,6 +47,7 @@ those cases.
 
 from __future__ import annotations
 
+import json
 import uuid
 from typing import Annotated, Any
 
@@ -91,6 +92,12 @@ _PROVIDER_NOTICE = {
     "leffa": "Leffa, hosted on Hugging Face",
     "idm-vton": "IDM-VTON, hosted on Hugging Face",
     "ootdiffusion": "OOTDiffusion, hosted on Hugging Face",
+    # A self-hosted tunnel (Colab/Kaggle) rather than a public Space, so the
+    # destination is the operator's own machine. Still NAMED: the point of this
+    # map is that a body photo is never transmitted somewhere the notice does
+    # not mention, and "somewhere you set up yourself" is still somewhere.
+    "leffa-hd": "Leffa, running on the notebook GPU configured for this deployment",
+    "leffa-colab": "Leffa, running on the notebook GPU configured for this deployment",
 }
 
 
@@ -270,17 +277,31 @@ async def tryon(
             # would make the quota unenforceable in exactly the situation it
             # exists for — a client retrying in a loop.
             async with tenant_session(user.id) as session:
+                # `subject_id` IS A UUID COLUMN, and a garment_set_hash is 64
+                # hex characters. Passing the hash raised
+                # `invalid UUID ... length must be between 32..36, got 64` and
+                # turned this endpoint's "always 200" contract into a 500.
+                #
+                # It had never run: the branch is only reachable once a
+                # provider is configured, so from Phase 10 until the token was
+                # set it was dead code that typechecked, passed review and was
+                # wrong. The hash goes in `detail`, which is jsonb and is where
+                # it belonged all along.
                 await session.execute(
                     text(
                         "INSERT INTO audit_log (id, user_id, action, subject_type, "
                         "subject_id, detail) VALUES (:i, :u, 'tryon.requested', "
-                        "'outfit', :s, :d)"
+                        "'outfit', NULL, CAST(:d AS jsonb))"
                     ),
                     {
                         "i": uuid.uuid4(),
                         "u": user.id,
-                        "s": garment_set_hash,
-                        "d": f'{{"provider": "{provider}"}}',
+                        # json.dumps, not an f-string: a provider name is
+                        # config, but building JSON by interpolation is how a
+                        # quote in a value silently corrupts the column.
+                        "d": json.dumps(
+                            {"provider": provider, "garment_set_hash": garment_set_hash}
+                        ),
                     },
                 )
                 await emit(

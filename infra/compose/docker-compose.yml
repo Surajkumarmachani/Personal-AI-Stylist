@@ -254,6 +254,16 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8080/calendar/callback}
+      # ---- Virtual try-on (Phase 10) ----
+      # The API does not RENDER — the worker does — but it decides whether to
+      # enqueue at all, and it names the third party in the body-photo consent
+      # notice. A service that cannot see the provider tells the user try-on is
+      # disabled while the worker is perfectly able to render, and worse, takes
+      # a body photo without naming where it would be sent.
+      VTON_PROVIDER: ${VTON_PROVIDER:-}
+      VTON_API_TOKEN: ${VTON_API_TOKEN:-}
+      VTON_BASE_URL: ${VTON_BASE_URL:-}
+      VTON_TIMEOUT_S: ${VTON_TIMEOUT_S:-900}
     ports:
       - "8080:8000"
     command: uvicorn stylist_api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -310,6 +320,15 @@ services:
       # Phase 8 push. A PATH inside the container; the file is mounted
       # read-only below from ./secrets, which is gitignored.
       FIREBASE_CREDENTIALS_FILE: ${FIREBASE_CREDENTIALS_FILE:-}
+      # ---- Virtual try-on (Phase 10) ----
+      # Passed through from .env. WITHOUT THESE FOUR LINES the settings exist,
+      # the token sits in .env, and the container never sees any of it — the
+      # render then degrades to a board with "try-on is not enabled", which
+      # looks exactly like not having a token at all.
+      VTON_PROVIDER: ${VTON_PROVIDER:-}
+      VTON_API_TOKEN: ${VTON_API_TOKEN:-}
+      VTON_BASE_URL: ${VTON_BASE_URL:-}
+      VTON_TIMEOUT_S: ${VTON_TIMEOUT_S:-900}
     command: arq stylist_worker.main.WorkerSettings
     volumes:
       - ../../packages:/app/packages

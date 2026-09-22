@@ -27,9 +27,9 @@ import {
 } from "@/lib/api";
 import Link from "next/link";
 
-import GarmentEditor from "./GarmentEditor";
-import PreferenceFacts from "./PreferenceFacts";
-import WardrobeTools from "./WardrobeTools";
+import GarmentEditor from "../GarmentEditor";
+import PreferenceFacts from "../PreferenceFacts";
+import WardrobeTools from "../WardrobeTools";
 
 // jobs.state -> what the user is told.
 //
@@ -191,6 +191,16 @@ export default function Home() {
       <p className="sub">
         Upload a photo — it is split into garments, cut out, coloured and tagged.
         Click any item to review or correct its tags.
+      </p>
+
+      {/* This page is the DEV CONSOLE — ingest, corrections, duplicates, eval.
+          The thing a person actually uses is /stylist, and the two are kept
+          apart so neither has to compromise for the other. */}
+      <p className="sub">
+        <a href="/stylist" style={{ color: "var(--accent)", fontWeight: 600 }}>
+          → Open the stylist console
+        </a>{" "}
+        to ask what to wear.
       </p>
 
       {!signedIn ? (

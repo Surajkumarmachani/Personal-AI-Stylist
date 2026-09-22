@@ -1,0 +1,308 @@
+/* Product design system.
+ *
+ * Light, soft, indigo-accented — matching the production design. Applied via a
+ * `.ui` wrapper rather than to `body`, so `/dev` and `/eval` keep the console
+ * theme in globals.css untouched and neither stylesheet has to know about the
+ * other.
+ *
+ * No CSS framework: the surface is a sidebar, a card grid and a chat, and a
+ * framework would outweigh it — the same call that kept lib/api.ts a plain
+ * fetch wrapper.
+ */
+
+.ui {
+  --bg: #f6f6fb;
+  --surface: #ffffff;
+  --ink: #16152e;
+  --ink-2: #3b3a58;
+  --muted: #7b7a95;
+  --line: #e8e8f2;
+  --accent: #5b5bd6;
+  --accent-soft: #eeeefc;
+  --dark: #1c1a3a;
+  --heart: #e5568a;
+  --ok: #17a673;
+  --r: 14px;
+
+  min-height: 100vh;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.55 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  display: flex;
+}
+
+.ui *, .ui *::before, .ui *::after { box-sizing: border-box; }
+.ui a { color: inherit; text-decoration: none; }
+.ui button { font-family: inherit; }
+
+/* --------------------------------------------------------------- sidebar */
+
+.ui-side {
+  width: 232px;
+  flex: none;
+  background: var(--surface);
+  border-right: 1px solid var(--line);
+  padding: 20px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+
+.ui-logo {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  font-weight: 650;
+  font-size: 16px;
+  padding: 6px 10px 18px;
+}
+
+.ui-logo i {
+  width: 26px; height: 26px; border-radius: 8px; flex: none;
+  background: linear-gradient(135deg, var(--accent), #8f7bff);
+}
+
+.ui-side a {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  color: var(--ink-2);
+  font-size: 14.5px;
+  transition: background .15s, color .15s;
+}
+
+.ui-side a:hover { background: var(--bg); }
+.ui-side a.on { background: var(--accent-soft); color: var(--accent); font-weight: 560; }
+.ui-side a span.ic { width: 18px; text-align: center; flex: none; }
+
+/* The upsell card. Rendered as clearly INERT — see the note in Sidebar.tsx:
+ * there is no billing in this system and a working-looking Upgrade button
+ * would be the one dishonest control on the page. */
+.ui-pro {
+  margin-top: auto;
+  background: var(--accent-soft);
+  border-radius: 12px;
+  padding: 14px;
+  font-size: 12.5px;
+  color: var(--ink-2);
+}
+.ui-pro b { display: block; font-size: 13.5px; color: var(--ink); margin-bottom: 3px; }
+
+/* ----------------------------------------------------------------- shell */
+
+.ui-main { flex: 1; min-width: 0; }
+
+.ui-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 16px 28px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+  position: sticky; top: 0; z-index: 10;
+}
+
+.ui-back {
+  border: 1px solid var(--line); background: var(--surface);
+  width: 34px; height: 34px; border-radius: 10px; cursor: pointer;
+  color: var(--ink-2); font-size: 15px;
+}
+.ui-back:hover { background: var(--bg); }
+
+.ui-avatar {
+  width: 32px; height: 32px; border-radius: 50%; flex: none;
+  background: linear-gradient(135deg, var(--accent), #8f7bff);
+  color: #fff; display: grid; place-items: center; font-size: 13px; font-weight: 600;
+}
+
+.ui-body { padding: 26px 28px 70px; max-width: 1180px; }
+
+/* ------------------------------------------------------------------ hero */
+
+.ui-hero {
+  background: linear-gradient(115deg, #efeffb 0%, #f7f2ee 55%, #faf6f2 100%);
+  border-radius: 18px;
+  padding: 42px 38px;
+  margin-bottom: 30px;
+}
+
+.ui-hero h1 {
+  margin: 0 0 10px;
+  font-size: clamp(26px, 3.6vw, 40px);
+  line-height: 1.15;
+  font-weight: 640;
+  letter-spacing: -0.02em;
+}
+.ui-hero p { margin: 0 0 22px; color: var(--muted); font-size: 15px; }
+
+.ui-ask {
+  display: flex; align-items: center;
+  max-width: 480px; background: var(--surface);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 5px 5px 5px 18px;
+  transition: border-color .16s, box-shadow .16s;
+}
+.ui-ask:focus-within { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+.ui-ask input { flex: 1; min-width: 0; border: 0; outline: none; background: transparent; font: inherit; padding: 9px 0; color: var(--ink); }
+.ui-ask input::placeholder { color: var(--muted); }
+.ui-ask button {
+  width: 36px; height: 36px; border-radius: 50%; border: 0; flex: none;
+  background: var(--accent); color: #fff; font-size: 15px; cursor: pointer;
+  transition: transform .14s, opacity .16s;
+}
+.ui-ask button:hover:not(:disabled) { transform: scale(1.06); }
+.ui-ask button:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ------------------------------------------------------------------ pills */
+
+.ui-pills { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; }
+
+.ui-pill {
+  border: 1px solid var(--line); background: var(--surface);
+  border-radius: 999px; padding: 7px 16px; font-size: 13.5px;
+  color: var(--ink-2); cursor: pointer; transition: all .15s;
+}
+.ui-pill:hover { border-color: var(--accent); color: var(--accent); }
+.ui-pill.on { background: var(--dark); color: #fff; border-color: var(--dark); }
+.ui-pill:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ------------------------------------------------------------------ cards */
+
+.ui-h2 { margin: 0 0 16px; font-size: 18px; font-weight: 640; letter-spacing: -0.01em; }
+.ui-h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; color: var(--ink-2); }
+
+.ui-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 16px; }
+.ui-head .ui-h2 { margin: 0; }
+
+.ui-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 18px; }
+.ui-grid.tight { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 14px; }
+
+.ui-card {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r); overflow: hidden;
+  animation: ui-in .38s ease both;
+  transition: box-shadow .2s, transform .2s;
+}
+.ui-card:hover { box-shadow: 0 10px 30px rgba(28,26,58,.09); transform: translateY(-2px); }
+
+.ui-frame {
+  position: relative;
+  aspect-ratio: 3 / 4; background: var(--bg);
+  display: flex; align-items: center; justify-content: center;
+  gap: 5px; padding: 12px; flex-wrap: wrap; overflow: hidden;
+}
+.ui-frame img { max-height: 46%; max-width: 44%; object-fit: contain; }
+.ui-frame.one img { max-height: 88%; max-width: 88%; }
+
+/* A garment the pipeline has not matted yet. Its slot name beats a broken
+ * image icon, because "no cutout" is an ordinary state here. */
+.ui-ph { font-size: 10px; color: var(--muted); border: 1px solid var(--line); background: var(--surface); padding: 4px 7px; border-radius: 6px; }
+
+.ui-heart {
+  position: absolute; top: 9px; right: 9px;
+  width: 28px; height: 28px; border-radius: 50%;
+  border: 0; background: rgba(255,255,255,.9); cursor: pointer;
+  font-size: 13px; color: var(--muted); line-height: 1;
+  box-shadow: 0 2px 8px rgba(0,0,0,.07);
+  transition: color .16s, transform .14s;
+}
+.ui-heart:hover { transform: scale(1.1); }
+.ui-heart.on { color: var(--heart); }
+
+.ui-cbody { padding: 12px 13px 14px; }
+.ui-name { font-size: 14.5px; font-weight: 570; display: block; }
+.ui-sub { margin: 3px 0 0; font-size: 12.5px; color: var(--muted); }
+
+.ui-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+.ui-tag { font-size: 10.5px; color: var(--muted); background: var(--bg); border-radius: 5px; padding: 3px 7px; }
+
+/* --------------------------------------------------------------- buttons */
+
+.ui-btn {
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink);
+  border-radius: 10px; padding: 10px 18px; font-size: 13.5px; cursor: pointer;
+  transition: all .15s;
+}
+.ui-btn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+.ui-btn:disabled { opacity: .45; cursor: not-allowed; }
+.ui-btn.primary { background: var(--dark); color: #fff; border-color: var(--dark); }
+.ui-btn.primary:hover:not(:disabled) { background: #2b2852; color: #fff; }
+.ui-btn.accent { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ui-btn.wide { width: 100%; }
+
+/* ------------------------------------------------------------------ chat */
+
+.ui-chat { max-width: 760px; }
+.ui-msg { display: flex; gap: 10px; margin-bottom: 14px; animation: ui-in .3s ease both; }
+.ui-msg.me { justify-content: flex-end; }
+.ui-msg .bubble {
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; padding: 12px 15px; max-width: 78%; font-size: 14.5px;
+}
+.ui-msg.me .bubble { background: var(--accent); color: #fff; border-color: var(--accent); }
+.ui-msg .bubble small { display: block; margin-top: 7px; font-size: 11px; color: var(--muted); }
+.ui-msg.me .bubble small { color: rgba(255,255,255,.75); }
+
+/* "Why these?" — bound to the scorer's REAL informative sub-scores, not copy. */
+.ui-why { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+.ui-why b { font-size: 12.5px; }
+.ui-why li { list-style: none; font-size: 12.5px; color: var(--ink-2); margin-top: 5px; display: flex; gap: 7px; }
+.ui-why li::before { content: "✓"; color: var(--ok); flex: none; }
+.ui-why ul { margin: 6px 0 0; padding: 0; }
+
+/* ----------------------------------------------------------------- misc */
+
+.ui-empty {
+  border: 1px dashed var(--line); border-radius: var(--r);
+  padding: 26px; text-align: center; color: var(--muted); font-size: 14px;
+  background: var(--surface);
+}
+
+/* Where the design shows a feature with no backend. Deliberately obvious: a
+ * plausible-looking fake price or Buy button is the one genuinely dishonest
+ * thing these screens could contain. */
+.ui-unavailable {
+  border: 1px dashed var(--line); border-radius: 10px;
+  padding: 11px 13px; font-size: 12.5px; color: var(--muted); background: var(--bg);
+}
+.ui-unavailable b { color: var(--ink-2); }
+
+.ui-panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 20px; }
+
+.ui-auth { max-width: 360px; margin: 80px auto; display: flex; flex-direction: column; gap: 10px; }
+.ui-auth input { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; font: inherit; outline: none; }
+.ui-auth input:focus { border-color: var(--accent); }
+.ui-err { color: #d1445f; font-size: 13px; }
+
+.ui-swatch { width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--line); display: inline-block; }
+
+@keyframes ui-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .ui *, .ui *::before, .ui *::after { animation: none !important; transition: none !important; }
+}
+
+/* ----------------------------------------------------------------- phone */
+
+@media (max-width: 860px) {
+  .ui { flex-direction: column; }
+  .ui-side {
+    width: 100%; height: auto; position: static;
+    flex-direction: row; overflow-x: auto; gap: 4px;
+    padding: 10px; border-right: 0; border-bottom: 1px solid var(--line);
+  }
+  .ui-logo { display: none; }
+  .ui-side a { white-space: nowrap; padding: 8px 12px; }
+  .ui-pro { display: none; }
+  .ui-body { padding: 18px 16px 60px; }
+  .ui-hero { padding: 26px 20px; }
+  .ui-top { padding: 12px 16px; }
+  .ui-grid { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+}

@@ -3,13 +3,51 @@
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:8080";
 
-// Access tokens live 15 minutes and are held in memory only.
+// SESSION HANDLING, AND WHY IT IS SPLIT IN TWO.
 //
-// NOT localStorage: anything in localStorage is readable by any script that
-// ends up on the page, which turns one XSS into stolen credentials. Losing the
-// token on refresh is the correct trade for a Phase 2 dev UI; Phase 8 replaces
-// this with an httpOnly refresh cookie.
+// The ACCESS token lives 15 minutes and stays in memory only — never in any
+// web storage, because anything in storage is readable by any script that ends
+// up on the page, and that turns one XSS into a usable credential.
+//
+// The REFRESH token goes in sessionStorage, and that is a deliberate trade
+// rather than a relaxation of the rule above:
+//
+//   - The API returns it in the login BODY, not as an httpOnly cookie, so the
+//     client is the only thing that can hold it. There is no option where the
+//     browser keeps it out of reach of script.
+//   - `/auth/refresh` ROTATES: the presented token is revoked as it is
+//     exchanged (see routers/auth.py), so a stolen copy is single-use and its
+//     reuse is detectable server-side.
+//   - sessionStorage, not localStorage: it dies with the tab, so the window of
+//     exposure is a session rather than forever.
+//
+// WHAT THIS FIXES. Before, the access token was in memory and the EMAIL was in
+// sessionStorage, so after a reload the app believed it was signed in and
+// every request 401'd with "missing bearer token" — a UI that looked
+// authenticated over a session that did not exist. The gate now hangs on the
+// token, which is the thing that actually decides whether a call will work.
+const REFRESH_KEY = "stylist.refresh";
+
 let accessToken: string | null = null;
+
+function readRefresh(): string | null {
+  try {
+    return sessionStorage.getItem(REFRESH_KEY);
+  } catch {
+    // Private mode, blocked storage. The app still works; it just forgets
+    // between page loads, which is the old behaviour rather than a break.
+    return null;
+  }
+}
+
+function writeRefresh(token: string | null): void {
+  try {
+    if (token) sessionStorage.setItem(REFRESH_KEY, token);
+    else sessionStorage.removeItem(REFRESH_KEY);
+  } catch {
+    /* see readRefresh */
+  }
+}
 
 export function setToken(token: string | null): void {
   accessToken = token;
@@ -19,8 +57,76 @@ export function getToken(): string | null {
   return accessToken;
 }
 
+export function setSession(access: string, refresh?: string | null): void {
+  accessToken = access;
+  if (refresh !== undefined) writeRefresh(refresh);
+}
+
+export function clearSession(): void {
+  accessToken = null;
+  writeRefresh(null);
+}
+
+export function hasSession(): boolean {
+  return accessToken !== null || readRefresh() !== null;
+}
+
+/** Exchange the stored refresh token for a new access token.
+ *
+ *  Stores the ROTATED refresh token that comes back — the old one is already
+ *  revoked server-side, so keeping it would make the next refresh fail with a
+ *  401 that looks like an expired session and is actually our own bug.
+ *
+ *  Returns false when there is nothing to restore, which the caller reads as
+ *  "show sign-in". */
+export async function refreshSession(): Promise<boolean> {
+  const refresh = readRefresh();
+  if (!refresh) return false;
+  try {
+    const res = await fetch(`${API_BASE}/auth/refresh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ refresh_token: refresh }),
+    });
+    if (!res.ok) {
+      // Expired, revoked, or reused. Clearing is the honest response: a stale
+      // refresh token that stays put makes every page retry and fail forever.
+      clearSession();
+      return false;
+    }
+    const body = (await res.json()) as { access_token: string; refresh_token?: string };
+    setSession(body.access_token, body.refresh_token ?? refresh);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function authHeaders(): HeadersInit {
   return accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+}
+
+/** fetch with the bearer token, refreshing ONCE on a 401.
+ *
+ *  Access tokens last 15 minutes, so any session left open over lunch would
+ *  otherwise start failing mid-use. Retrying once after a refresh turns that
+ *  into something the user never sees.
+ *
+ *  Exactly once: if the retry also 401s the session is genuinely gone, and
+ *  looping would hammer the endpoint on every dead session. */
+export async function authedFetch(input: string, init: RequestInit = {}): Promise<Response> {
+  const withAuth = (): RequestInit => ({
+    ...init,
+    headers: { ...(init.headers ?? {}), ...authHeaders() },
+  });
+
+  if (!accessToken && readRefresh()) await refreshSession();
+
+  let res = await fetch(input, withAuth());
+  if (res.status === 401 && readRefresh()) {
+    if (await refreshSession()) res = await fetch(input, withAuth());
+  }
+  return res;
 }
 
 export type Garment = {
@@ -53,36 +159,43 @@ async function json<T>(resp: Response): Promise<T> {
 }
 
 export async function register(email: string, password: string) {
-  return json<{ access_token: string; refresh_token: string }>(
+  const body = await json<{ access_token: string; refresh_token: string }>(
     await fetch(`${API_BASE}/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
     }),
   );
+  setSession(body.access_token, body.refresh_token);
+  return body;
 }
 
 export async function login(email: string, password: string) {
-  return json<{ access_token: string; refresh_token: string }>(
+  const body = await json<{ access_token: string; refresh_token: string }>(
     await fetch(`${API_BASE}/auth/login`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ email, password }),
     }),
   );
+  // Stored HERE rather than left to each caller. A screen that signed in and
+  // forgot to keep the refresh token would work until the next page load and
+  // then 401 — which is exactly the bug this replaced.
+  setSession(body.access_token, body.refresh_token);
+  return body;
 }
 
 export async function listGarments(): Promise<Garment[]> {
   return json<Garment[]>(
-    await fetch(`${API_BASE}/garments`, { headers: authHeaders(), cache: "no-store" }),
+    await authedFetch(`${API_BASE}/garments`, { cache: "no-store" }),
   );
 }
 
 export async function presign(contentType: string): Promise<PresignResponse> {
   return json<PresignResponse>(
-    await fetch(`${API_BASE}/uploads/presign`, {
+    await authedFetch(`${API_BASE}/uploads/presign`, {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ content_type: contentType }),
     }),
   );
@@ -118,10 +231,9 @@ export async function ingest(
   idempotencyKey: string,
 ) {
   return json<{ job_ids: string[]; accepted: number; idempotent_replay: boolean }>(
-    await fetch(`${API_BASE}/garments/ingest`, {
+    await authedFetch(`${API_BASE}/garments/ingest`, {
       method: "POST",
       headers: {
-        ...authHeaders(),
         "Content-Type": "application/json",
         // Retrying an ingest must not start a second pipeline over the same
         // photos — a doubled VLM bill and duplicate wardrobe rows.
@@ -159,9 +271,7 @@ export function streamJob(
 
   (async () => {
     try {
-      const resp = await fetch(`${API_BASE}/jobs/${jobId}/events`, {
-        headers: authHeaders(),
-        signal: controller.signal,
+      const resp = await authedFetch(`${API_BASE}/jobs/${jobId}/events`, { signal: controller.signal,
       });
       if (!resp.ok || !resp.body) {
         onDone();
@@ -212,9 +322,7 @@ export type GarmentDetail = {
 
 export async function garmentDetail(id: string): Promise<GarmentDetail> {
   return json<GarmentDetail>(
-    await fetch(`${API_BASE}/garments/${id}/detail`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/garments/${id}/detail`, { cache: "no-store",
     }),
   );
 }
@@ -238,9 +346,9 @@ export async function correctField(
     new_value: string | null;
     user_verified_fields: string[];
   }>(
-    await fetch(`${API_BASE}/garments/${garmentId}/fields`, {
+    await authedFetch(`${API_BASE}/garments/${garmentId}/fields`, {
       method: "PATCH",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ field_name: fieldName, new_value: newValue }),
     }),
   );
@@ -259,9 +367,7 @@ export type CorrectionRate = {
 
 export async function correctionRate(): Promise<CorrectionRate> {
   return json<CorrectionRate>(
-    await fetch(`${API_BASE}/ops/correction-rate`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/ops/correction-rate`, { cache: "no-store",
     }),
   );
 }
@@ -323,18 +429,14 @@ export async function searchGarments(
     }
   }
   return json(
-    await fetch(`${API_BASE}/garments/search?${params}`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/garments/search?${params}`, { cache: "no-store",
     }),
   );
 }
 
 export async function facets(): Promise<Facets> {
   return json(
-    await fetch(`${API_BASE}/wardrobe/facets`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/wardrobe/facets`, { cache: "no-store",
     }),
   );
 }
@@ -350,9 +452,9 @@ export type WearResponse = {
 
 export async function logWear(id: string): Promise<WearResponse> {
   return json(
-    await fetch(`${API_BASE}/garments/${id}/wear`, {
+    await authedFetch(`${API_BASE}/garments/${id}/wear`, {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({}),
     }),
   );
@@ -360,9 +462,9 @@ export async function logWear(id: string): Promise<WearResponse> {
 
 export async function setLaundry(id: string, needsWash: boolean): Promise<void> {
   await json(
-    await fetch(`${API_BASE}/garments/${id}/laundry`, {
+    await authedFetch(`${API_BASE}/garments/${id}/laundry`, {
       method: "PATCH",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ needs_wash: needsWash }),
     }),
   );
@@ -383,9 +485,7 @@ export type MostWorn = {
 
 export async function mostWorn(limit = 20): Promise<MostWorn> {
   return json(
-    await fetch(`${API_BASE}/wardrobe/most-worn?limit=${limit}`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/wardrobe/most-worn?limit=${limit}`, { cache: "no-store",
     }),
   );
 }
@@ -405,9 +505,7 @@ export type DuplicatePair = {
 
 export async function pendingDuplicates(): Promise<{ items: DuplicatePair[] }> {
   return json(
-    await fetch(`${API_BASE}/wardrobe/duplicates`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/wardrobe/duplicates`, { cache: "no-store",
     }),
   );
 }
@@ -417,9 +515,9 @@ export async function resolveDuplicate(
   resolution: "different" | "same",
 ): Promise<void> {
   await json(
-    await fetch(`${API_BASE}/garments/${id}/duplicate-resolution`, {
+    await authedFetch(`${API_BASE}/garments/${id}/duplicate-resolution`, {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ resolution }),
     }),
   );
@@ -482,9 +580,7 @@ export async function evalView(opts: {
   p.set("offset", String(opts.offset ?? 0));
   if (opts.onlyReal) p.set("only_real", "true");
   return json(
-    await fetch(`${API_BASE}/garments/eval?${p}`, {
-      headers: authHeaders(),
-      cache: "no-store",
+    await authedFetch(`${API_BASE}/garments/eval?${p}`, { cache: "no-store",
     }),
   );
 }
@@ -519,7 +615,7 @@ export const FACT_FIELDS = [
 
 export async function listPreferences(): Promise<{ facts: PreferenceFact[] }> {
   return json(
-    await fetch(`${API_BASE}/me/preferences`, { headers: authHeaders(), cache: "no-store" }),
+    await authedFetch(`${API_BASE}/me/preferences`, { cache: "no-store" }),
   );
 }
 
@@ -529,18 +625,193 @@ export async function addPreference(
   fieldValue: string,
 ): Promise<PreferenceFact> {
   return json(
-    await fetch(`${API_BASE}/me/preferences`, {
+    await authedFetch(`${API_BASE}/me/preferences`, {
       method: "POST",
-      headers: { ...authHeaders(), "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ kind, field_name: fieldName, field_value: fieldValue }),
     }),
   );
 }
 
 export async function deletePreference(id: string): Promise<void> {
-  const resp = await fetch(`${API_BASE}/me/preferences/${id}`, {
-    method: "DELETE",
-    headers: authHeaders(),
-  });
+  const resp = await authedFetch(`${API_BASE}/me/preferences/${id}`, { method: "DELETE" });
   if (!resp.ok) throw new Error(`${resp.status} ${await resp.text()}`);
+}
+
+// ---------------------------------------------------------------- chat
+
+export type ChatGarment = {
+  id: string;
+  slot: string | null;
+  subcategory: string | null;
+  primary_colour: string | null;
+  cutout_url: string | null;
+  needs_review?: boolean;
+};
+
+export type ChatOutfit = {
+  garments: ChatGarment[];
+  score: number;
+  rationale?: string | null;
+  informative_weight?: number | null;
+  score_breakdown?: Record<string, unknown> | null;
+};
+
+export type ChatReply = {
+  reply: string;
+  understood: {
+    occasion: string;
+    matched: string | null;
+    feels_like_c: number;
+    weather_stated: boolean;
+  } | null;
+  outfits: ChatOutfit[];
+  examples?: string[];
+  notes?: string[];
+  ranking_source?: string | null;
+  served_from?: string | null;
+  explored_slots?: number | null;
+  context?: Record<string, unknown> | null;
+  needs_clarification: boolean;
+};
+
+export async function askStylist(message: string, limit = 4): Promise<ChatReply> {
+  const res = await authedFetch(`${API_BASE}/chat?limit=${limit}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message }),
+  });
+  if (!res.ok) {
+    // The body carries FastAPI's `detail`, which is the only thing that
+    // distinguishes "your session expired" from "the wardrobe is empty".
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = (await res.json()) as { detail?: string };
+      if (body.detail) detail = body.detail;
+    } catch {
+      /* a non-JSON error body is still an error */
+    }
+    throw new Error(detail);
+  }
+  return (await res.json()) as ChatReply;
+}
+
+// ---------------------------------------------------------------- try-on
+
+export type TryOnResult = {
+  garment_set_hash: string;
+  rendered: boolean;
+  reason: string | null;
+  queued?: boolean;
+  tryon_url?: string | null;
+  board_url?: string | null;
+  board_endpoint: string;
+};
+
+/** Ask for a render of one outfit. ALWAYS 200 by design — see the router:
+ *  "works or degrades to a board, never errors". So a falsy `rendered` is a
+ *  normal answer carrying a `reason`, not a failure to handle. */
+export async function requestTryOn(garmentSetHash: string): Promise<TryOnResult> {
+  const res = await authedFetch(`${API_BASE}/outfits/${garmentSetHash}/tryon`, { method: "POST" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as TryOnResult;
+}
+
+export type OutfitBoard = { board_url: string | null; garment_set_hash: string };
+
+export async function outfitBoard(garmentSetHash: string): Promise<OutfitBoard> {
+  const res = await authedFetch(`${API_BASE}/outfits/${garmentSetHash}/board`, { });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as OutfitBoard;
+}
+
+// -------------------------------------------------- feedback / saved looks
+
+/** Save a look. `saved` is a real `feedback_kind`, so the heart on a card
+ *  writes an event the Saved Looks screen reads back — it is not decorative.
+ *
+ *  Deliberately NOT `like`: saving is intent, liking is a verdict, and the
+ *  style vector weights them differently (0.5 vs 1.0). Conflating them would
+ *  teach the recommender that bookmarking something is endorsement. */
+export async function saveOutfit(garmentIds: string[], occasion = "casual_outing") {
+  const res = await authedFetch(`${API_BASE}/outfits/feedback`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      garment_ids: garmentIds,
+      occasion,
+      kind: "saved",
+      was_suggested: true,
+    }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return await res.json();
+}
+
+// ------------------------------------------------------------ body photos
+
+export type BodyPhoto = {
+  id: string;
+  consented_at: string;
+  revoked_at: string | null;
+  deleted_from_storage: boolean;
+};
+
+export type BodyPhotoPresign = {
+  upload_id: string;
+  key: string;
+  url: string;
+  fields: Record<string, string>;
+  expires_at: string;
+  notice: string;
+  sent_to_third_party: string | null;
+};
+
+/** Where the upload will go, plus the CONSENT NOTICE to show before it does.
+ *  The notice names the third party the photo would be sent to when a provider
+ *  is configured — consent to storage is not consent to transmission, and the
+ *  UI must show the server's wording rather than paraphrase it. */
+export async function presignBodyPhoto(): Promise<BodyPhotoPresign> {
+  return json<BodyPhotoPresign>(
+    await authedFetch(`${API_BASE}/me/body-photos/presign`, { method: "POST" }),
+  );
+}
+
+export async function uploadBodyPhoto(p: BodyPhotoPresign, file: File): Promise<void> {
+  const form = new FormData();
+  for (const [k, v] of Object.entries(p.fields)) form.append(k, v);
+  form.append("file", file);
+  const res = await fetch(p.url, { method: "POST", body: form });
+  if (!res.ok) throw new Error(`upload failed: HTTP ${res.status}`);
+}
+
+/** Record the photo AND the consent together.
+ *  `consent_to_virtual_tryon` is explicit on purpose — the server rejects
+ *  false, because "they uploaded it so they must have agreed" is the reasoning
+ *  that makes consent a formality. */
+export async function recordBodyPhoto(p: BodyPhotoPresign): Promise<{ body_photo_id: string }> {
+  return json<{ body_photo_id: string }>(
+    await authedFetch(`${API_BASE}/me/body-photos`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        upload_id: p.upload_id,
+        key: p.key,
+        consent_to_virtual_tryon: true,
+      }),
+    }),
+  );
+}
+
+export async function listBodyPhotos(): Promise<{ photos: BodyPhoto[]; active: number }> {
+  return json<{ photos: BodyPhoto[]; active: number }>(
+    await authedFetch(`${API_BASE}/me/body-photos`),
+  );
+}
+
+/** Revoke consent and delete the photo. Does NOT touch the account — §C5
+ *  requires the two be separable, because withdrawing consent for one feature
+ *  must not cost you the product. */
+export async function revokeBodyPhotos(): Promise<unknown> {
+  return json<unknown>(await authedFetch(`${API_BASE}/me/body-photos`, { method: "DELETE" }));
 }

@@ -169,6 +169,57 @@ PROFILES: dict[str, Profile] = {
         ],
         categories=frozenset({UPPER}),
     ),
+    # LEFFA WITH ONLY THE VITON-HD MODEL LOADED.
+    #
+    # Same nine-argument `leffa_predict_vt` endpoint as `leffa`, so the call
+    # shape is identical — the difference is which weights are in memory. On a
+    # 16GB GPU the DressCode model is commonly dropped alongside the SDXL
+    # pose-transfer one to make Leffa fit at all, and this profile matches that
+    # deployment.
+    #
+    # UPPER BODY ONLY, declared rather than discovered. `leffa` sends
+    # `vt_model_type="dress_code"` for lower-body and dresses; against a server
+    # where those weights were never loaded that either errors or silently
+    # renders with the wrong model. Restricting the category here means the
+    # worker skips trousers and sarees and still renders the shirt, instead of
+    # producing a confident wrong picture.
+    "leffa-hd": Profile(
+        space="",  # tunnel-only; always paired with VTON_BASE_URL
+        api_name="leffa_predict_vt",
+        build_data=lambda person, garment, category: [
+            _file(person),
+            _file(garment),
+            "False",
+            30,
+            2.5,
+            42,
+            "viton_hd",  # the only model this deployment has
+            category,
+            "False",
+        ],
+        categories=frozenset({UPPER}),
+    ),
+    # A LEFFA WRAPPER, verified 2026-09-18 against a live tunnel:
+    #   lightweight_tryon(person, garment) -> output
+    #
+    # "Leffa Free Colab Memory-Optimized Tunnel" — the same model behind a
+    # two-argument endpoint that drops `vt_garment_type` and `vt_model_type`.
+    # Used with VTON_BASE_URL pointed at a Colab/Kaggle share URL, which is how
+    # this renders for free: no ZeroGPU gate, no token, no bill.
+    #
+    # UPPER BODY ONLY, and that is a deduction rather than a limitation of the
+    # underlying model. Leffa itself handles lower body and dresses, but this
+    # wrapper removed the argument that selects them — so the defaults are
+    # baked in and we cannot tell it what it is fitting. Declaring all three
+    # would send trousers to a model configured for tops and get back a
+    # confident picture of the wrong thing, which is exactly what the category
+    # guard exists to prevent.
+    "leffa-colab": Profile(
+        space="",  # always paired with VTON_BASE_URL; there is no public Space
+        api_name="lightweight_tryon",
+        build_data=lambda person, garment, category: [_file(person), _file(garment)],
+        categories=frozenset({UPPER}),
+    ),
     # Verified 2026-09-17 against https://levihsu-OOTDiffusion.hf.space/gradio_api/info
     #   /process_dc(vton_img, garm_img, category, n_samples, n_steps,
     #               image_scale, seed)  -> Gallery
@@ -210,6 +261,10 @@ class VTONClient:
         # An override so a self-hosted or dedicated Inference Endpoint can be
         # pointed at without a code change — the protocol is identical, only
         # the host differs.
+        if not base_url and not self.profile.space:
+            # A tunnel-only profile with nowhere to go. Caught here rather than
+            # as a confusing DNS failure 30 seconds into a render.
+            raise ValueError(f"provider {provider!r} requires VTON_BASE_URL to be set")
         self.base_url = (base_url or f"https://{self.profile.space}.hf.space").rstrip("/")
         self.timeout = timeout
         self._prefix: str | None = None
