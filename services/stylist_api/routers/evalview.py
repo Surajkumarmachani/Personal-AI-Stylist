@@ -27,6 +27,7 @@ mistake is very easy to make by looking at a pretty grid.
 
 from __future__ import annotations
 
+from collections import Counter
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Query
@@ -55,14 +56,44 @@ TAG_FIELDS = (
 SYNTHETIC_VERSIONS = {"seed-demo-v1"}
 
 
-def _tag_source(extractor_version: str | None, vlm_model: str | None) -> str:
+def _is_mock(model: str | None) -> bool:
+    return bool(model and "mock" in model)
+
+
+def _tag_source(extractor_version: str | None, tagged_by: str | None) -> str:
+    """What produced THIS row's tags. `tagged_by` is the model_calls row for
+    this garment, not the current setting.
+
+    This used to take `vlm_model` — the model the API is configured for TODAY —
+    and attribute every historical row to it. Swapping the config rewrote the
+    past: three garments tagged by `vlm-tagger-mock` on 10 Sep rendered as
+    "model (vlm-tagger-openrouter)", naming a model that had never seen them.
+    The mock check was worse still: it asked whether the CONFIGURED model is a
+    mock to decide whether an OLD row is mock, so switching away from the mock
+    silently relabelled stand-in tags as real ones.
+
+    The banner above this list was already fixed to read `model_calls` instead
+    of config, with a comment explaining why. The per-row label was left
+    reading config in the same function — and it is the more dangerous of the
+    two, because the banner only says the two disagree while this asserts one
+    specific model with no hedging.
+    """
     if extractor_version in SYNTHETIC_VERSIONS:
         return "synthetic (seed script — NOT model output)"
+    # `tagged_by` OUTRANKS a missing extractor_version. Three rows on this
+    # account have extractor_version NULL and a recorded `vlm-tagger-mock`
+    # call: "unknown, pre-dates the extractor_version fix" would throw away a
+    # ledger entry that says exactly what produced them, and the honest label
+    # for a mock row matters more than the honest label for an old one.
+    if tagged_by is not None:
+        if "mock" in tagged_by:
+            return f"mock model ({tagged_by}) — deterministic stand-in, not a real VLM"
+        return f"model ({tagged_by})"
     if extractor_version is None:
         return "unknown (pre-dates the extractor_version fix)"
-    if vlm_model and "mock" in vlm_model:
-        return f"mock model ({vlm_model}) — deterministic stand-in, not a real VLM"
-    return f"model ({vlm_model or extractor_version})"
+    # Tagged, but no call recorded against the job — written before
+    # `model_calls` existed, or a cache hit that skipped the ledger.
+    return f"model (unrecorded; extractor {extractor_version})"
 
 
 @router.get("/garments/eval")
@@ -91,7 +122,7 @@ async def eval_view(
         where.append("extractor_version IS NOT NULL")
         where.append("extractor_version <> ALL(:synthetic)")
 
-    params: dict[str, Any] = {"lim": limit, "off": offset}
+    params: dict[str, Any] = {"lim": limit, "off": offset, "uid": str(user.id)}
     if only_real:
         params["synthetic"] = list(SYNTHETIC_VERSIONS)
 
@@ -111,7 +142,27 @@ async def eval_view(
                    (embedding IS NOT NULL) AS has_embedding,
                    attributes_raw->'tag'->>'degraded' AS tag_degraded,
                    attributes_raw->'tag'->>'reason' AS tag_reason,
-                   created_at
+                   created_at,
+                   -- PER-ROW PROVENANCE. jobs.garment_id is the only link
+                   -- between a garment and the call that tagged it, and it is
+                   -- what makes this page able to say "this one is mock" about
+                   -- a single row rather than about the whole page.
+                   --
+                   -- EXPLICIT user_id on model_calls: that table has NO RLS
+                   -- policy (relrowsecurity = f), unlike `jobs` and every
+                   -- other tenant table here. Without the predicate this
+                   -- lateral reads other tenants' calls, which is the exact
+                   -- bug the banner query below already carries a comment
+                   -- about. `jobs` is RLS-scoped, so the join is belt and
+                   -- braces on that side.
+                   (SELECT mc.model_name
+                      FROM jobs j
+                      JOIN model_calls mc ON mc.job_id = j.id
+                     WHERE j.garment_id = garments.id
+                       AND mc.purpose = 'tag'
+                       AND mc.user_id = CAST(:uid AS uuid)
+                     ORDER BY mc.created_at DESC
+                     LIMIT 1) AS tagged_by
             FROM garments
             WHERE {" AND ".join(where)}
             ORDER BY created_at DESC
@@ -157,11 +208,20 @@ async def eval_view(
                 ),
                 "fields": fields,
                 "climate_bands": list(r["climate_bands"] or []),
-                "tag_source": _tag_source(r["extractor_version"], vlm_model),
+                "tag_source": _tag_source(r["extractor_version"], r["tagged_by"]),
+                "tagged_by": r["tagged_by"],
+                # This row's own model, not the configured one. Switching away
+                # from the mock must not retroactively promote rows the mock
+                # produced. A recorded call is the strongest evidence there is,
+                # so it decides on its own; extractor_version is the fallback
+                # for rows older than the ledger.
                 "tag_is_real": (
-                    r["extractor_version"] is not None
-                    and r["extractor_version"] not in SYNTHETIC_VERSIONS
-                    and not (vlm_model and "mock" in vlm_model)
+                    (not _is_mock(r["tagged_by"]))
+                    if r["tagged_by"] is not None
+                    else (
+                        r["extractor_version"] is not None
+                        and r["extractor_version"] not in SYNTHETIC_VERSIONS
+                    )
                 ),
                 "tag_degraded": r["tag_degraded"] == "true",
                 "tag_reason": r["tag_reason"],
@@ -212,6 +272,18 @@ async def eval_view(
     )
     used = last_call.scalar_one_or_none()
 
+    # WHAT IS ACTUALLY ON THIS PAGE, per model. The banner used to say "tags
+    # below were produced by <the last call's model>", which is only true if
+    # every row came from one model. On this account it was five from
+    # `vlm-tagger`, three from `vlm-tagger-mock` and one unrecorded — so the
+    # sentence was wrong about four of nine rows, and wrong in the direction
+    # that hides mock output.
+    #
+    # A page-level summary cannot answer a per-row question. It can report the
+    # distribution, which is a question it CAN answer, and the per-row label
+    # carries the rest.
+    on_page = Counter(str(i["tagged_by"] or "unrecorded") for i in items)
+
     return {
         "items": items,
         "total": int(total.scalar_one()),
@@ -220,6 +292,11 @@ async def eval_view(
         # Stated once at the top so the whole page can be read in context.
         "tagging_model": used or vlm_model,
         "tagging_model_configured": vlm_model,
+        # Ordered most-common first so the UI can render it as written.
+        "tagging_models_on_page": [
+            {"model": name, "garments": n} for name, n in on_page.most_common()
+        ],
+        "tagging_mixed_on_page": len(on_page) > 1,
         # None when nothing has been tagged yet: "we have not run" and "we ran
         # a mock" are different facts, and collapsing them into False would
         # tell a new user their tags are real before any exist.

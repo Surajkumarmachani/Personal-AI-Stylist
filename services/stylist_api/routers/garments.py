@@ -158,9 +158,16 @@ async def list_garments(
     query to the caller's tenant at the database, so forgetting the filter is
     not a data leak. tests/test_rls_isolation.py asserts exactly this.
     """
+    # `rejected` and `quarantined` are hidden, matching search.py and
+    # evalview.py. A photo the pipeline refused is not a garment, and leaving
+    # it here showed the user a blank card with no slot and no explanation —
+    # which is worse than showing nothing, because it looks like a garment
+    # that failed to load. `needs_review` and `duplicate_suspect` stay VISIBLE:
+    # those rows exist and need the user's attention.
     rows = await db.execute(
         select(Garment)
         .where(Garment.is_active.is_(True))
+        .where(Garment.state.notin_(("rejected", "quarantined")))
         .order_by(Garment.created_at.desc())
         .limit(limit)
         .offset(offset)
@@ -253,3 +260,89 @@ async def similar_garments(
         )
         for row in rows
     ]
+
+
+@router.delete("/garments/{garment_id}", status_code=status.HTTP_200_OK)
+async def remove_garment(
+    garment_id: uuid.UUID,
+    user: CurrentUser,
+    db: TenantDB,
+) -> dict[str, object]:
+    """Take a garment out of the wardrobe.
+
+    SOFT DELETE, for the reason duplicates.py already gives about merging:
+    `is_active = false` rather than DELETE, because the cutout, the tags and
+    the embedding took real work and a mis-tap should cost an undo rather than
+    a re-upload. `is_active` is the predicate every read already applies — the
+    wardrobe grid, search, the candidate pool, the eval view — so one column
+    removes it from all of them at once, with no second notion of "gone".
+
+    THE WEAR LOG STAYS. A garment worn eleven times WAS worn eleven times, and
+    cost-per-wear and the style vector are both built by replaying that log.
+    Deleting the history to tidy the grid would silently rewrite numbers the
+    user has already seen, which is a worse outcome than a retired row.
+
+    WHAT THIS DOES NOT DO: it does not delete the photograph. The original and
+    the cutout stay in object storage, and the response says so rather than
+    implying an erasure it did not perform. Deleting a user's pixels is
+    `DELETE /me`, which is audited, staged and covered by the retention SLA —
+    quietly doing a fraction of that here would make the strong guarantee
+    harder to reason about, not easier.
+
+    Idempotent: removing an already-removed garment is a 200 with
+    `already_removed`, not a 404. The client that retries after a dropped
+    response is right to, and punishing it would be the only effect.
+    """
+    row = await db.execute(
+        # No user_id predicate: RLS scopes it, so another tenant's id is a 404
+        # rather than a 403 and we do not confirm the id exists.
+        text("SELECT id, is_active, subcategory::text AS subcategory FROM garments WHERE id = :g"),
+        {"g": garment_id},
+    )
+    garment = row.mappings().one_or_none()
+    if garment is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="garment not found")
+    if not garment["is_active"]:
+        return {
+            "garment_id": str(garment_id),
+            "removed": True,
+            "already_removed": True,
+            "photo_retained": True,
+        }
+
+    await db.execute(
+        text("UPDATE garments SET is_active = false, updated_at = now() WHERE id = :g"),
+        {"g": garment_id},
+    )
+    # Same transaction as the update. Downstream cares: the outfits table can
+    # hold precomputed sets naming this garment, and they have to be pruned or
+    # the next suggestion hydrates a garment the user has removed.
+    await emit(
+        db,
+        aggregate_id=garment_id,
+        user_id=user.id,
+        event_type="garment.removed",
+        payload={"garment_id": str(garment_id), "subcategory": garment["subcategory"]},
+    )
+
+    # Prune precomputed outfits that name it, in the SAME transaction.
+    #
+    # Otherwise the removed garment comes straight back: `GET /suggestions`
+    # serves from `outfits` first, `_hydrate` drops the inactive garment, and
+    # the outfit is rendered a piece short with no explanation. The live path
+    # would regenerate correctly — but only once the materialised rows are
+    # gone, which is what this does.
+    pruned = await db.execute(
+        text(
+            "DELETE FROM outfits WHERE :g = ANY(garment_ids) RETURNING id",
+        ),
+        {"g": garment_id},
+    )
+    return {
+        "garment_id": str(garment_id),
+        "removed": True,
+        "already_removed": False,
+        "outfits_pruned": len(pruned.fetchall()),
+        # Stated, not implied. See the docstring.
+        "photo_retained": True,
+    }

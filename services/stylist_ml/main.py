@@ -349,6 +349,9 @@ async def matte(request: Request) -> Response:
         media_type="image/png",
         headers={
             "X-Alpha-Coverage": f"{result.alpha_coverage:.6f}",
+            # How much of the cutout is one connected piece. The worker uses
+            # this to detect a segmentation mask that shattered the garment.
+            "X-Largest-Blob-Share": f"{result.largest_blob_share:.6f}",
             "X-Cutout-Width": str(result.width),
             "X-Cutout-Height": str(result.height),
             "X-Matte-Model": result.model,

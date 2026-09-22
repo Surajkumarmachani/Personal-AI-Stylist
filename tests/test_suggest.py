@@ -269,3 +269,110 @@ async def test_the_precompute_driver_can_see_tenants(
     async with system_session() as session:
         tenants = await _tenants(session)
     assert uid in tenants, "the precompute driver cannot see a tenant that owns garments"
+
+
+# ------------------------------------------------------------- diversify
+#
+# `score_outfit` judges one outfit at a time, so nothing in it can notice that
+# ranks 1 and 3 are the same outfit with an anklet added. Measured on the demo
+# wardrobe before this existed: six suggestions drew on SEVEN distinct
+# garments across 21 slots, one garment appeared five times, and the top three
+# had a mean pairwise Jaccard of 0.450. After: 12 distinct garments, 0.122.
+
+
+def _fake(ids: list[str], total: float):
+    """A (garments, score) pair shaped like `suggest` produces."""
+    from stylist_domain.scoring import OutfitScore, ScoredGarment
+
+    items = tuple(
+        ScoredGarment(
+            garment_id=gid,
+            slot="upper_base",
+            subcategory="shirt_casual",
+            primary_colour="black",
+            secondary_colour=None,
+            pattern=None,
+            material="cotton",
+            formality=2,
+            warmth=2,
+            wear_count=0,
+            last_worn=None,
+        )
+        for gid in ids
+    )
+    return items, OutfitScore(total=total, breakdown={})
+
+
+def test_a_near_duplicate_loses_to_a_slightly_worse_but_different_outfit() -> None:
+    from stylist_suggest.pipeline import diversify
+
+    scored = [
+        _fake(["a", "b", "c"], 0.90),
+        _fake(["a", "b", "d"], 0.88),  # rank 2 by score, 2/3 shared with rank 1
+        _fake(["x", "y", "z"], 0.80),  # much worse, completely different
+    ]
+    got = diversify(scored, limit=2, overlap_penalty=0.15)
+    picked = [sorted(g.garment_id for g in items) for items, _ in got]
+
+    assert picked[0] == ["a", "b", "c"], "the best outfit is always kept"
+    assert picked[1] == ["x", "y", "z"], (
+        "0.88 - 0.15*(2/3) = 0.78 loses to 0.80; the different outfit wins"
+    )
+
+
+def test_a_much_better_outfit_still_wins_despite_repeating_a_garment() -> None:
+    """Variety must not be bought with quality. The penalty is a nudge, not a
+    veto — an outfit that is clearly better is still shown even if it repeats."""
+    from stylist_suggest.pipeline import diversify
+
+    scored = [
+        _fake(["a", "b", "c"], 0.90),
+        _fake(["a", "b", "c2"], 0.89),  # near-duplicate but nearly as good
+        _fake(["x", "y", "z"], 0.60),  # different and much worse
+    ]
+    got = diversify(scored, limit=2, overlap_penalty=0.15)
+    picked = [sorted(g.garment_id for g in items) for items, _ in got]
+    assert picked[1] == ["a", "b", "c2"], "0.89 - 0.10 = 0.79 still beats 0.60"
+
+
+def test_a_penalty_of_zero_is_exactly_the_old_behaviour() -> None:
+    """`enabled: false` in scoring.yaml has to restore the pre-Phase-12 order
+    bit for bit — that is what the measured latency figures and the blind eval
+    were run against, and a config flag that only approximately reverts is not
+    a way back."""
+    from stylist_suggest.pipeline import diversify
+
+    scored = [_fake(["a", "b"], 0.9), _fake(["a", "c"], 0.8), _fake(["d", "e"], 0.7)]
+    assert diversify(scored, limit=3, overlap_penalty=0.0) == scored[:3]
+
+
+def test_diversify_is_deterministic() -> None:
+    """The nightly precompute and the request path must agree, or
+    `served_from: materialised` and `served_from: live` rank differently for
+    the same wardrobe — the exact drift the precompute design exists to avoid."""
+    from stylist_suggest.pipeline import diversify
+
+    scored = [
+        _fake(["a", "b"], 0.80),
+        _fake(["a", "c"], 0.80),  # an exact score tie, broken on the set hash
+        _fake(["d", "e"], 0.80),
+    ]
+    runs = [
+        [sorted(g.garment_id for g in items) for items, _ in diversify(
+            scored, limit=3, overlap_penalty=0.15
+        )]
+        for _ in range(5)
+    ]
+    assert all(r == runs[0] for r in runs)
+
+
+def test_everything_overlapping_preserves_the_original_order() -> None:
+    """The small-wardrobe case, and why this is a penalty rather than a
+    per-garment appearance cap: with ten garments nearly every outfit shares
+    something, and a cap would either empty the list or force genuinely bad
+    outfits into it. A penalty applied equally leaves the ranking alone."""
+    from stylist_suggest.pipeline import diversify
+
+    scored = [_fake(["a", "b"], 0.9), _fake(["a", "b"], 0.8), _fake(["a", "b"], 0.7)]
+    got = diversify(scored, limit=3, overlap_penalty=0.15)
+    assert [s.total for _, s in got] == [0.9, 0.8, 0.7]

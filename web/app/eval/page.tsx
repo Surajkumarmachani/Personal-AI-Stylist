@@ -127,15 +127,37 @@ export default function EvalPageView() {
       )}
 
       {/* A disagreement between what ran and what is configured is worth
-          seeing rather than resolving silently in favour of either. */}
+          seeing rather than resolving silently in favour of either.
+
+          IT PERSISTS UNTIL SOMETHING RE-TAGS, AND THAT IS CORRECT. Changing
+          VLM_MODEL does not change tags that already exist, so the warning is
+          a fact about history, not a setting to dismiss. The old copy read
+          "Tags below were produced by the first", which was a guess: this page
+          routinely mixes models, and on a real account it was five Gemini,
+          three MOCK and one unrecorded. Claiming one model for all of them hid
+          the mock rows behind a real model's name. The distribution is now
+          read from `model_calls` per row. */}
       {page?.tagging_config_disagrees && (
         <div className="panel warn">
           <strong>Config and reality disagree.</strong>
           <p className="hint" style={{ margin: "6px 0 0" }}>
-            The last tag call used <code>{page.tagging_model}</code>, but this service is
-            configured for <code>{page.tagging_model_configured}</code>. Tags below were
-            produced by the first; new ones may use the second.
+            The last tag call on this account used <code>{page.tagging_model}</code>, but
+            this service is now configured for{" "}
+            <code>{page.tagging_model_configured}</code>. Existing tags are not rewritten
+            by a config change, so this stays until something is tagged again.
           </p>
+          {page.tagging_models_on_page.length > 0 && (
+            <p className="hint" style={{ margin: "6px 0 0" }}>
+              What actually tagged the {page.tagging_mixed_on_page ? "rows" : "rows"} below:{" "}
+              {page.tagging_models_on_page.map((m, i) => (
+                <span key={m.model}>
+                  {i > 0 ? ", " : ""}
+                  <code>{m.model}</code> ×{m.garments}
+                </span>
+              ))}
+              .
+            </p>
+          )}
         </div>
       )}
 

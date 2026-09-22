@@ -582,6 +582,20 @@ async def run_pipeline(user_id: uuid.UUID, job_id: uuid.UUID, stages: tuple[Stag
                 result = await _run_stage_with_retry(stage, stage_ctx, attempts_so_far)
         except Terminal as term:
             await _transition(user_id, job_id, term.state, reason=term.reason)
+            # AND the garment row, not just the job. A Terminal raised by the
+            # validate stage fires BEFORE any stage that writes `garments`, so
+            # the row it left behind sat at `received` forever: `GET /garments`
+            # filters on `is_active` alone, so a rejected photo stayed in the
+            # wardrobe grid as a permanently blank card with no slot, no
+            # colour and no reason. Meanwhile `search.py` and `evalview.py`
+            # already exclude `state NOT IN ('rejected', 'quarantined')` —
+            # they were filtering on a value nothing ever wrote.
+            #
+            # `mark_garment_state` was written for this and had ZERO callers.
+            # Its docstring said it mirrors progress onto "the row the wardrobe
+            # grid reads", which was true of nothing.
+            if ctx.garment_id is not None:
+                await mark_garment_state(user_id, ctx.garment_id, str(term.state))
             logger.info("job %s terminal: %s (%s)", job_id, term.state, term.reason)
             return str(term.state)
         except Exhausted as exhausted:

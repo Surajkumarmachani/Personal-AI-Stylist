@@ -80,6 +80,11 @@ services:
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Open-weight taggers. Only needed for `vlm-tagger-openrouter`; the
+      # Ollama row talks to host.docker.internal and needs no credential at
+      # all, which is the point of it.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
       # Langfuse. Unset by default; the gateway only exports when the callback
       # in config.yaml is uncommented AND these carry values.
       LANGFUSE_PUBLIC_KEY: ${LANGFUSE_PUBLIC_KEY:-}

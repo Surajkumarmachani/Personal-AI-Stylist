@@ -69,7 +69,30 @@ export default function StylistPage() {
       .then(setEmail)
       .finally(() => setChecking(false));
   }, []);
-  useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), [bubbles, busy]);
+  // BRACES ARE LOAD-BEARING. As a concise arrow body this was
+  //
+  //     useEffect(() => endRef.current?.scrollIntoView({ behavior: "smooth" }), deps)
+  //
+  // which RETURNS whatever scrollIntoView returns, and React treats an
+  // effect's return value as its cleanup function.
+  //
+  // For years that was safe: scrollIntoView returned undefined. Chrome 153
+  // ships the scroll-completion proposal and it now returns a PROMISE
+  // (verified in this browser: constructor.name === "Promise", typeof !==
+  // "function"). So React stored a promise as the cleanup and, the next time
+  // this effect re-ran, called it — `TypeError: i is not a function`, thrown
+  // inside the commit phase, uncaught, which tears down the tree and leaves
+  // Chrome's "This page couldn't load".
+  //
+  // The deps are why it presented as "the AI Stylist page crashes when I ask
+  // it something": the cleanup only runs on the SECOND pass, and `bubbles`
+  // first changes when a message is sent. Page load was always fine.
+  //
+  // A block body returns undefined, which is what React wants. Do not
+  // "simplify" this back.
+  useEffect(() => {
+    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [bubbles, busy]);
 
   async function send(text: string) {
     const message = text.trim();

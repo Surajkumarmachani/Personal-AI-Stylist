@@ -21,21 +21,29 @@ depending on whether you are interviewing or going to the gym" — answering
 question the user did not ask, and the whole system's rule is that an absent
 answer beats a confidently wrong one.
 
-NO MODEL CALL ON THIS PATH
---------------------------
-Intent resolution is a lexicon (see `stylist_domain.intent` for the three
-reasons). The outfits themselves may be reranked by the LLM exactly as
-`/suggestions` does, on the same budget and with the same degrade — this
-endpoint adds no new dependency and works during a provider outage, which is
-when someone asking "what do I wear in an hour" least wants a spinner.
+NO MODEL CALL ON THE FAST PATH
+------------------------------
+Intent resolution is a lexicon first (see `stylist_domain.intent` for the
+three reasons). A model is consulted ONLY when the lexicon finds nothing —
+see `stylist_domain.intent_llm`, which pays for each of those three
+objections rather than waiving them. "Diwali" still costs nothing and answers
+instantly; "visiting Patna as a tourist" now gets an answer instead of a
+shrug. Every failure of that call degrades to the clarifying question, so the
+endpoint still works during a provider outage.
+
+The outfits themselves may be reranked by the LLM exactly as `/suggestions`
+does, on the same budget and with the same degrade.
 """
 
 from __future__ import annotations
 
+import json
+import logging
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
+from sqlalchemy import text
 
 from stylist_api.deps import (
     CacheRedisDep,
@@ -46,7 +54,21 @@ from stylist_api.deps import (
     TenantDB,
 )
 from stylist_api.routers.suggestions import get_suggestions
-from stylist_domain.intent import parse, suggestions_for_unmatched
+from stylist_domain.intent import _normalise, parse, suggestions_for_unmatched
+from stylist_domain.intent_llm import (
+    INTENT_TIMEOUT_S,
+    LLMIntent,
+    build_schema,
+    validate,
+)
+from stylist_domain.intent_llm import (
+    MODEL as INTENT_MODEL,
+)
+from stylist_domain.intent_llm import (
+    SYSTEM_PROMPT as INTENT_SYSTEM_PROMPT,
+)
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["chat"])
 
@@ -57,6 +79,42 @@ CHAT_OUTFIT_LIMIT = 4
 
 class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=500)
+
+
+async def _classify(gateway: Any, api_key: str | None, message: str) -> LLMIntent | None:
+    """Ask the model what occasion this is. None on any failure.
+
+    EVERY failure returns None and the caller asks the user — timeout, outage,
+    quota, unparseable answer, an id outside the taxonomy. That is what keeps
+    this an enhancement rather than a dependency: before it existed, a lexicon
+    miss produced the clarifying question, and if this never answers, a lexicon
+    miss still produces the clarifying question.
+    """
+    if gateway is None or not api_key:
+        # No tenant key means no budget to bill this to (§B3). Asking the user
+        # is the honest answer, not billing someone else's key.
+        return None
+    try:
+        resp = await gateway.chat(
+            model=INTENT_MODEL,
+            messages=[
+                {"role": "system", "content": INTENT_SYSTEM_PROMPT},
+                {"role": "user", "content": message},
+            ],
+            # The tenant's own virtual key, never the master key — same rule
+            # the reranker follows, for the same reason.
+            api_key=api_key,
+            response_format=build_schema(),
+            timeout=INTENT_TIMEOUT_S,
+        )
+        return validate(json.loads(resp.content))
+    except Exception:
+        # Deliberately broad. Timeout, 429, 404 on a rotated free-tier slug,
+        # prose instead of JSON, an id outside the taxonomy — every one of
+        # them means "ask the user", and enumerating them would only risk
+        # missing one and turning a clarifying question into a 500.
+        logger.info("intent classifier unusable; asking the user instead", exc_info=True)
+        return None
 
 
 def _phrase_for(occasion: str) -> str:
@@ -89,6 +147,39 @@ def _phrase_for(occasion: str) -> str:
     }.get(occasion, occasion.replace("_", " "))
 
 
+async def _custom_match(db: Any, message: str) -> dict[str, Any] | None:
+    """A user's own occasion name, matched before anything else.
+
+    CUSTOM NAMES WIN OVER THE BUILT-IN LEXICON, and that ordering is the whole
+    feature. If you have named an occasion "office party", the lexicon's
+    `"office" -> office_casual` would otherwise claim it and you would get
+    desk clothes for a night out — your own words losing to a generic keyword
+    in your own wardrobe.
+
+    Longest name first, for the reason `intent.parse` sorts its lexicon that
+    way: "farmhouse haldi" must beat "haldi" when both are yours.
+
+    Word-boundary matched on a normalised string, so "date" in your alias does
+    not fire on "candidate", exactly as the built-in lexicon does. Both use
+    `_normalise`, so the two cannot disagree about what a word is.
+    """
+    rows = await db.execute(
+        text(
+            "SELECT name, base_occasion, formality_override, dress_code_override "
+            "FROM custom_occasion"
+        )
+    )
+    items = [dict(r) for r in rows.mappings()]
+    if not items:
+        return None
+    padded = f" {_normalise(message)} "
+    for item in sorted(items, key=lambda i: len(str(i["name"])), reverse=True):
+        needle = _normalise(str(item["name"]))
+        if needle and f" {needle} " in padded:
+            return item
+    return None
+
+
 @router.post("/chat")
 async def chat(
     body: ChatRequest,
@@ -102,22 +193,74 @@ async def chat(
 ) -> dict[str, Any]:
     """Answer a wardrobe question with real outfits from this wardrobe."""
     intent = parse(body.message)
+    occasion = intent.occasion
+    matched = intent.matched_phrase
 
-    if intent.needs_disambiguation:
-        # ASKS, does not guess. See the module docstring.
-        examples = suggestions_for_unmatched()
-        return {
-            "reply": (
-                "I'm not sure what the occasion is — tell me and I'll pull "
-                "something from your wardrobe."
-            ),
-            "understood": None,
-            "outfits": [],
-            "examples": examples,
-            "needs_clarification": True,
-        }
+    # BEFORE the lexicon's answer is accepted, not after: a custom name is the
+    # user's own vocabulary and outranks a generic keyword that happens to
+    # appear inside it.
+    custom = await _custom_match(db, body.message)
+    formality_override: int | None = None
+    dress_code_override: str | None = None
+    if custom is not None:
+        occasion = str(custom["base_occasion"])
+        matched = f"your occasion {custom['name']!r}"
+        formality_override = custom["formality_override"]
+        dress_code_override = custom["dress_code_override"]
 
-    assert intent.occasion is not None  # narrowed by needs_disambiguation
+    if occasion is None:
+        # The lexicon found nothing. Ask a model BEFORE giving up — this is
+        # the long tail ("visiting Patna as a tourist", "meeting my
+        # girlfriend's parents"), and the alternative is a dead end.
+        key_row = await db.execute(text("SELECT litellm_key FROM user_profile LIMIT 1"))
+        guess = await _classify(gateway, key_row.scalar(), body.message)
+
+        if guess is not None and guess.confident:
+            occasion = guess.occasion
+            matched = "understood from your message"
+        else:
+            # STILL ASKS, and still does not guess. But it asks a question
+            # someone can answer.
+            #
+            # The old reply was "I'm not sure what the occasion is" plus five
+            # FIXED examples — Diwali, a client meeting, a wedding reception —
+            # which had nothing to do with what the user typed. Two real
+            # queries that hit it were "I'm going to visit Patna as a tourist"
+            # and "going to visit zoo", and offering "Diwali" to either is a
+            # form letter, not a question.
+            #
+            # When the model had a view but was not sure enough to act on it,
+            # its guesses become the options. `suggestions_for_unmatched()` is
+            # the fallback for when there is genuinely nothing to go on — a
+            # greeting, a question about the app.
+            proposed = []
+            if guess is not None:
+                proposed = [o for o in (guess.occasion, *guess.alternatives) if o]
+            if proposed:
+                phrases = [_phrase_for(o) for o in proposed[:3]]
+                joined = (
+                    phrases[0]
+                    if len(phrases) == 1
+                    else (" or ".join([", ".join(phrases[:-1]), phrases[-1]]))
+                )
+                reply = f"Did you mean {joined}? Say which and I'll pull something."
+            else:
+                reply = (
+                    "I'm not sure what the occasion is — tell me and I'll pull "
+                    "something from your wardrobe."
+                )
+            return {
+                "reply": reply,
+                "understood": None,
+                "outfits": [],
+                # Real occasions when we have them, so the UI can offer them as
+                # buttons rather than asking the user to retype.
+                "examples": [_phrase_for(o) for o in proposed[:3]] or suggestions_for_unmatched(),
+                "suggested_occasions": proposed[:3],
+                "needs_clarification": True,
+            }
+
+    assert occasion is not None
     result = await get_suggestions(
         user=user,
         db=db,
@@ -125,14 +268,28 @@ async def chat(
         settings=settings,
         gateway=gateway,
         cache=cache,
-        occasion=intent.occasion,
-        feels_like_c=intent.feels_like_c,
+        occasion=occasion,
+        # None UNLESS THE USER ACTUALLY SAID SOMETHING ABOUT THE WEATHER.
+        #
+        # `intent.feels_like_c` is never None — it defaults to
+        # FEELS_LIKE_DEFAULT_C (26.0) so `resolve_context` always has a
+        # number. Passing that straight through made every chat message look
+        # like an explicit `?feels_like_c=26`, which `/suggestions` honours as
+        # a deliberate override — so the forecast for the user's own city was
+        # fetched, then ignored, and the response reported `user-stated` for a
+        # temperature the user never stated.
+        #
+        # `weather_stated` is the field that distinguishes a default from an
+        # answer, and it existed precisely for this.
+        feels_like_c=intent.feels_like_c if intent.weather_stated else None,
         precip_probability=intent.precip_probability,
         limit=limit,
+        formality_override=formality_override,
+        dress_code_override=dress_code_override,
     )
 
     outfits = result.get("outfits") or []
-    phrase = _phrase_for(intent.occasion)
+    phrase = _phrase_for(occasion)
 
     if not outfits:
         # The wardrobe could not dress this occasion. The NOTES say why —
@@ -145,32 +302,58 @@ async def chat(
                 + (notes[0] if notes else "There isn't enough in your wardrobe yet.")
             ),
             "understood": {
-                "occasion": intent.occasion,
-                "matched": intent.matched_phrase,
+                "occasion": occasion,
+                "matched": matched,
                 "feels_like_c": intent.feels_like_c,
                 "weather_stated": intent.weather_stated,
             },
             "outfits": [],
             "notes": notes,
+            # CARRIED ON THE EMPTY REPLY TOO. This is the branch where a user
+            # asked "what do I wear" and got nothing, so what the system was
+            # AIMING at — formality, dress code, the temperature it used — is
+            # more actionable here than on a reply that already shows outfits.
+            # It was omitted, which also made a custom occasion's formality
+            # override unobservable exactly when the wardrobe could not meet it.
+            "context": result.get("context"),
             "needs_clarification": False,
         }
 
+    # WHAT THE OUTFIT WAS ACTUALLY DRESSED FOR, read off the resolved context
+    # rather than off the intent.
+    #
+    # It used to come from `intent`, and was mentioned only when the USER had
+    # raised the weather — because on any other query the temperature was the
+    # hard-coded 26.0 placeholder and, as the old comment said, "a claim we
+    # cannot support: there is no location". There is one now, so the
+    # condition has changed rather than the caution: a real forecast is worth
+    # saying, a placeholder still is not.
+    ctx_out = result.get("context") or {}
+    source = str(ctx_out.get("weather_source") or "")
+    feels = ctx_out.get("feels_like_c")
+    wet = bool(ctx_out.get("wet"))
+
     weather_note = ""
-    if intent.weather_stated:
-        # Only mentioned when the USER raised it. Volunteering "I assumed 26°C"
-        # on every reply is noise, and on a query that said nothing about
-        # weather it is also a claim we cannot support — there is no location.
+    if source.startswith("forecast") and feels is not None:
+        weather_note = f" It's {float(feels):.0f}°C where you are"
+        weather_note += ", and I've allowed for the rain." if wet else "."
+    elif intent.weather_stated:
         weather_note = (
             " I've taken the rain into account."
             if intent.precip_probability
             else f" I've dressed it for around {intent.feels_like_c:.0f}°C."
         )
+    elif source.startswith("placeholder"):
+        # Said once, in the reply, rather than buried in a debug field. A user
+        # who sets a city gets better suggestions, and this is the only place
+        # they would ever learn that.
+        weather_note = " Set your city in Profile and I'll use the real temperature."
 
     return {
         "reply": f"Here's what I'd wear for {phrase}.{weather_note}",
         "understood": {
-            "occasion": intent.occasion,
-            "matched": intent.matched_phrase,
+            "occasion": occasion,
+            "matched": matched,
             "feels_like_c": intent.feels_like_c,
             "weather_stated": intent.weather_stated,
         },
@@ -179,6 +362,7 @@ async def chat(
         # suggestions screen does. A chat that hides whether a model ranked the
         # answer is a chat that cannot be debugged when it is odd.
         "ranking_source": result.get("ranking_source"),
+        "weather_source": source or None,
         "served_from": result.get("served_from"),
         "explored_slots": result.get("explored_slots"),
         "context": result.get("context"),

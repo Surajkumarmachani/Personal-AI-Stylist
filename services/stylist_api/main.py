@@ -29,6 +29,8 @@ from stylist_api.routers import (
     garments,
     health,
     jobs,
+    location,
+    occasions,
     ops,
     privacy,
     push,
@@ -168,6 +170,8 @@ def create_app() -> FastAPI:
     app.include_router(privacy.router)
     app.include_router(tryon.router)
     app.include_router(chat.router)
+    app.include_router(location.router)
+    app.include_router(occasions.router)
 
     from stylist_api.routers import uploads
 

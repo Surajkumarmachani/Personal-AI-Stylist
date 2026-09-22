@@ -41,6 +41,25 @@ inactive_until_later_phases:
 # multiplicatively by hard_penalty(). Listed there, not here, because they are
 # rules about garments rather than tuning knobs.
 
+# Repeat-avoidance across the RANKED LIST, not within one outfit.
+#
+# The scorer judges outfits independently, so a wardrobe with one strong shirt
+# produces a top three that is the same shirt three times with the shoes
+# swapped. Each entry is individually well-scored and the list as a whole
+# offers one decision dressed up as three.
+diversity:
+  enabled: true
+  # What a fully-overlapping outfit loses when the next rank is chosen.
+  #
+  # 0.15 — the same order as `weather_fit`'s weight, and picked so a
+  # near-duplicate loses to a slightly-worse outfit that is actually
+  # different, while a much better outfit still wins despite repeating a
+  # garment. Variety is not bought with quality.
+  #
+  # Set to 0 (or enabled: false) to restore the pre-Phase-12 order exactly,
+  # which is what the measured latency numbers and the blind eval ran against.
+  overlap_penalty: 0.15
+
 novelty:
   # A garment worn yesterday should not top today's suggestions. Beyond this
   # window, recency stops counting against it.

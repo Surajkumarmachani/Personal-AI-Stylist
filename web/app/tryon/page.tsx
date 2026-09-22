@@ -55,6 +55,10 @@ export default function TryOnPage() {
   const [occasion, setOccasion] = useState("casual");
   const [wardrobe, setWardrobe] = useState<Garment[] | null>(null);
   const [consented, setConsented] = useState(0);
+  // Non-null when the server names a third party, which it only does when
+  // a VTON provider is actually configured. This is REPORTED state, not an
+  // assumption about tokens — see the notice below.
+  const [provider, setProvider] = useState<string | null>(null);
 
   useEffect(() => {
     void restoreSession().then(setEmail).finally(() => setChecking(false));
@@ -125,7 +129,12 @@ export default function TryOnPage() {
         ))}
       </div>
 
-      <BodyPhotoPanel onChange={setConsented} />
+      <BodyPhotoPanel
+        onChange={(n, tp) => {
+          setConsented(n);
+          setProvider(tp);
+        }}
+      />
 
       {busy ? <p className="ui-sub">Building looks…</p> : null}
 
@@ -175,23 +184,36 @@ export default function TryOnPage() {
         </div>
       ) : null}
 
-      {/* States what is STILL missing, rather than a fixed sentence. A notice
-          that keeps asking for a body photo you have already given is a notice
-          people stop reading. */}
+      {/* REPORTS STATE, DOES NOT ASSUME IT.
+          An earlier version hardcoded "you still need VTON_API_TOKEN". That is
+          true for a ZeroGPU Space and FALSE for a self-hosted tunnel, where no
+          auth exists and an empty token is correct — so the page told users a
+          working feature was broken. Both facts below now come from the
+          server: `provider` is the third party it names, and it only names one
+          when a provider is configured. */}
       <div className="ui-unavailable" style={{ marginTop: 22 }}>
-        {consented > 0 ? (
+        {consented > 0 && provider ? (
           <>
-            <b>Body photo: done.</b> One thing left — <code>VTON_API_TOKEN</code> on the
-            deployment. The hosted models run on ZeroGPU, which refuses anonymous calls, so until
-            it is set every look degrades to a flat-lay board. That degrade is the designed
-            behaviour, not a failure.
+            <b>Try-on is ready.</b> A body photo is stored with your consent, and renders go to{" "}
+            {provider}. Tap Try On on any look — a render takes a few minutes, and the card shows
+            the result when it is done.
+          </>
+        ) : consented > 0 ? (
+          <>
+            <b>Body photo: done.</b> No try-on provider is configured on this deployment, so every
+            look degrades to a flat-lay board. That degrade is the designed behaviour, not a
+            failure.
+          </>
+        ) : provider ? (
+          <>
+            <b>One thing left: a body photo.</b> Add one above with consent and renders will go to{" "}
+            {provider}. Until then every look degrades to a flat-lay board.
           </>
         ) : (
           <>
             <b>Two things are needed before a render happens.</b> A body photo with explicit
-            consent (above), and <code>VTON_API_TOKEN</code> on the deployment — the hosted models
-            run on ZeroGPU, which refuses anonymous calls. Until both are true every look degrades
-            to a flat-lay board, which is the designed behaviour.
+            consent (above), and a try-on provider configured on the deployment. Until both are
+            true every look degrades to a flat-lay board, which is the designed behaviour.
           </>
         )}{" "}
         <b>Live AR is not built at all.</b>

@@ -96,6 +96,7 @@ _PROVIDER_NOTICE = {
     # destination is the operator's own machine. Still NAMED: the point of this
     # map is that a body photo is never transmitted somewhere the notice does
     # not mention, and "somewhere you set up yourself" is still somewhere.
+    "leffa-dc": "Leffa, running on the notebook GPU configured for this deployment",
     "leffa-hd": "Leffa, running on the notebook GPU configured for this deployment",
     "leffa-colab": "Leffa, running on the notebook GPU configured for this deployment",
 }

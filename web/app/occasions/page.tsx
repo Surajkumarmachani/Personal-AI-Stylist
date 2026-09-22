@@ -4,9 +4,11 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
+import Image from "next/image";
 import Shell from "../Shell";
 import SignIn from "../SignIn";
 import { OCCASIONS } from "../OCCASIONS";
+import CustomOccasions from "../CustomOccasions";
 import { restoreSession } from "../session";
 import "../ui.css";
 
@@ -39,8 +41,23 @@ export default function OccasionsPage() {
             style={{ animationDelay: `${i * 30}ms`, textAlign: "left", padding: 0 }}
             onClick={() => router.push(`/explore?o=${encodeURIComponent(o.ask)}`)}
           >
-            <div className="ui-frame" style={{ aspectRatio: "1 / 1" }}>
-              <span style={{ fontSize: 24, opacity: 0.32 }} aria-hidden="true">◇</span>
+            {/* next/image, not <img>: these are local files under public/, which
+                is the case the framework optimises — it serves a modern format,
+                lazy-loads below the fold and reserves the box so the grid does
+                not jump as twelve photos arrive. `alt=""` because the title
+                directly beneath says the same thing; announcing it twice is
+                noise to a screen reader. */}
+            <div
+              className="ui-frame photo"
+              style={{ aspectRatio: "1 / 1" }}
+            >
+              <Image
+                src={o.img}
+                alt=""
+                width={520}
+                height={520}
+                style={{ width: "100%", height: "100%", objectFit: "cover" }}
+              />
             </div>
             <div className="ui-cbody">
               <span className="ui-name">{o.title}</span>
@@ -49,9 +66,12 @@ export default function OccasionsPage() {
           </button>
         ))}
       </div>
+      <CustomOccasions />
+
       <div className="ui-unavailable" style={{ marginTop: 20 }}>
-        <b>Custom occasions</b> aren&apos;t supported: an occasion has to exist in the taxonomy
-        for the scorer to have formality and dress-code targets for it.
+        <b>A custom occasion is a name, not a new category.</b> Every one resolves to a
+        built-in occasion so the scorer has a formality and dress-code target to aim at —
+        without that it would have nothing to rank against and would return no outfits.
       </div>
     </Shell>
   );

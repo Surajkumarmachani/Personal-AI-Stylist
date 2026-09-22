@@ -136,7 +136,19 @@ PROFILES: dict[str, Profile] = {
         build_data=lambda person, garment, category: [
             _file(person),
             _file(garment),
-            "False",
+            # BOOLEAN, not the string "False", AND /info SAYS OTHERWISE.
+            #
+            # The endpoint declares `Literal['True', 'False']` — strings — and
+            # sending strings is rejected at runtime with:
+            #   Value: 'False' (type: str) is not in the list of choices:
+            #   [True, False]
+            #
+            # The Radio's choices are real Python booleans; Gradio's schema
+            # serialises them as strings. So the introspected signature and
+            # the runtime validator disagree, and the validator is the one
+            # that decides. Measured against a live Gradio 6 deployment
+            # 2026-09-21 — reading /info alone would have got this wrong.
+            False,
             30,
             2.5,
             42,
@@ -145,7 +157,7 @@ PROFILES: dict[str, Profile] = {
             # garments at all.
             "viton_hd" if category == UPPER else "dress_code",
             category,
-            "False",
+            False,
         ],
         categories=frozenset({UPPER, LOWER, DRESS}),
     ),
@@ -168,6 +180,35 @@ PROFILES: dict[str, Profile] = {
             42,
         ],
         categories=frozenset({UPPER}),
+    ),
+    # LEFFA WITH ONLY THE DRESSCODE MODEL LOADED.
+    #
+    # The mirror of `leffa-hd`: same nine-argument `leffa_predict_vt`
+    # endpoint, but the deployment kept `vt_model_dc` and dropped `vt_model_hd`
+    # along with the SDXL pose-transfer model. One model is the smallest Leffa
+    # that runs, which is how it fits a constrained free GPU.
+    #
+    # ALWAYS SENDS `dress_code`, never `viton_hd`: on this deployment
+    # `vt_inference_hd` is None, so a viton_hd request raises rather than
+    # degrading. DressCode weights cover lower-body and dresses and will
+    # attempt an upper-body garment too, so all three categories are declared
+    # — unlike `leffa-hd`, where the missing weights genuinely exclude two of
+    # them.
+    "leffa-dc": Profile(
+        space="",  # tunnel-only; always paired with VTON_BASE_URL
+        api_name="leffa_predict_vt",
+        build_data=lambda person, garment, category: [
+            _file(person),
+            _file(garment),
+            "False",
+            30,
+            2.5,
+            42,
+            "dress_code",  # the only model this deployment loaded
+            category,
+            "False",
+        ],
+        categories=frozenset({UPPER, LOWER, DRESS}),
     ),
     # LEFFA WITH ONLY THE VITON-HD MODEL LOADED.
     #

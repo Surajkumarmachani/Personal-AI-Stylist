@@ -75,6 +75,11 @@ class MatteResponse:
     width: int
     height: int
     model: str
+    # Share of the opaque alpha in its largest connected blob; 1.0 is one
+    # solid garment. Defaults to 1.0 so an older ml service that does not send
+    # the header reads as "not fragmented" rather than tripping the guard on
+    # every photo.
+    largest_blob_share: float = 1.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -157,6 +162,7 @@ class MLClient:
             width=int(resp.headers.get("X-Cutout-Width", "0")),
             height=int(resp.headers.get("X-Cutout-Height", "0")),
             model=resp.headers.get("X-Matte-Model", "unknown"),
+            largest_blob_share=float(resp.headers.get("X-Largest-Blob-Share", "1")),
         )
 
     async def segment(self, *, image_bytes: bytes) -> SegmentResponse:

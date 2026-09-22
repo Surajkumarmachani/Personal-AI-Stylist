@@ -43,7 +43,12 @@ from typing import Any
 from sqlalchemy import text
 
 from stylist_domain.context import OutfitContext
-from stylist_domain.scoring import OutfitScore, ScoredGarment, score_outfit
+from stylist_domain.scoring import (
+    OutfitScore,
+    ScoredGarment,
+    load_scoring_config,
+    score_outfit,
+)
 from stylist_domain.slots import base_structures, evaluate, optional_slots, required_slots
 from stylist_domain.style import parse_embedding
 from stylist_domain.taxonomy import load_taxonomy
@@ -96,31 +101,26 @@ def garment_set_hash(garment_ids: list[str] | tuple[str, ...]) -> str:
     return hashlib.sha256(joined.encode()).hexdigest()
 
 
-async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
-    """Hard filters, in SQL. Everything here is a hard requirement.
+# How many warmth levels either side of the target still count as wearable.
+#
+# One, normally: the scorer is what should prefer an exact match, and a hard
+# filter demanding equality would empty the wardrobe on most days.
+#
+# But it IS a hard filter, and on a required slot a hard filter with one
+# garment behind it is a single point of failure. Measured on this wardrobe:
+# the owner's only footwear is canvas sneakers tagged `warmth=1`, the default
+# 26C placeholder resolves to `warmth_target=3`, and |1-3| = 2 — so the one
+# pair of shoes was filtered out and EVERY occasion answered "no wearable
+# feet". `_rescue_required_slots` is the fix, not a wider tolerance here:
+# widening this would also let a puffer jacket through at 30C.
+WARMTH_TOLERANCE = 1
 
-    Soft preferences belong to the scorer: a garment one warmth step from
-    target should rank lower, not vanish, which is why the warmth filter has a
-    tolerance rather than an equality.
-    """
-    taxonomy = load_taxonomy()
-    # dress_codes_compatible(a, b) is a PREDICATE, not a lookup — the map is
-    # what we need here, and it is asymmetric on purpose: `casual` accepts
-    # smart_casual, but a `business` occasion does not accept casual.
-    compatible = list(
-        taxonomy.dress_code_compatibility.get(ctx.dress_code_target, [ctx.dress_code_target])
-    )
-    if ctx.dress_code_target not in compatible:
-        compatible.append(ctx.dress_code_target)
+# The rescue pass's tolerance: effectively "any warmth at all". The warmth
+# ladder has five levels, so anything >= 4 disables the predicate; 99 says
+# that outright rather than encoding the ladder's length in a second place.
+WARMTH_RELAXED = 99
 
-    # Rain is a material constraint, not a preference. A silk saree in a
-    # downpour is not a low-scoring suggestion, it is a bad one.
-    monsoon = taxonomy.raw.get("monsoon_suitability", {})
-    poor_when_wet = list(monsoon.get("poor", [])) if ctx.wet else []
-
-    rows = await session.execute(
-        text(
-            """
+POOL_SQL = """
             SELECT g.id, g.slot::text AS slot, g.subcategory::text AS subcategory,
                    g.primary_colour::text AS primary_colour,
                    g.secondary_colour::text AS secondary_colour,
@@ -138,13 +138,18 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
                 FROM wear_log GROUP BY garment_id
             ) w ON w.garment_id = g.id
             WHERE g.is_active
+              AND (CAST(:slot AS text) IS NULL OR g.slot::text = CAST(:slot AS text))
               AND g.state NOT IN ('rejected', 'quarantined', 'duplicate_suspect')
               -- in the wash is a hard exclusion: it is not in the wardrobe today
               AND NOT g.needs_wash
               -- unset warmth is KEPT. A garment whose tagging degraded is still
               -- wearable, and excluding it would make a degraded ingest look
               -- like a lost garment.
-              AND (g.warmth IS NULL OR abs(g.warmth - :warmth_target) <= 1)
+              -- :warmth_slack is 1 normally. `_rescue_required_slots` re-runs
+              -- this query with it wide open for a REQUIRED slot that nothing
+              -- satisfied, because an empty `feet` is not a ranking problem,
+              -- it is no outfit at all.
+              AND (g.warmth IS NULL OR abs(g.warmth - :warmth_target) <= :warmth_slack)
               AND (g.dress_code IS NULL OR g.dress_code::text = ANY(:compatible))
               -- climate_bands empty means "not yet classified", not "unsuitable"
               AND (
@@ -182,40 +187,120 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
                   )
               )
             """
-        ),
-        {
-            "warmth_target": ctx.warmth_target,
-            "compatible": compatible,
-            # Climate matching needs the band set for this warmth level, which
-            # the taxonomy derives rather than storing per garment.
-            "climate_any": True,
-            "poor_wet": poor_when_wet,
-            "recent_days": RECENTLY_WORN_DAYS,
-        },
+
+
+def _to_garment(r: Any) -> ScoredGarment:
+    """One candidate row. Shared by the main query and the rescue pass, so the
+    two cannot drift in what they read."""
+    return ScoredGarment(
+        garment_id=str(r["id"]),
+        slot=r["slot"],
+        subcategory=r["subcategory"],
+        primary_colour=r["primary_colour"],
+        secondary_colour=r["secondary_colour"],
+        pattern=r["pattern"],
+        material=r["material"],
+        formality=r["formality"],
+        warmth=r["warmth"],
+        wear_count=int(r["wear_count"]),
+        last_worn=r["last_worn"],
+        # pgvector comes back as a STRING through text() queries — the type
+        # adapter is registered for the ORM mapping, not for raw SQL. Same
+        # trap Phase 8 hit; `parse_embedding` is the shared answer.
+        embedding=tuple(parse_embedding(r["embedding"]) or ()) or None,
     )
+
+
+async def _rescue_required_slots(
+    session: Any, pool: CandidatePool, ctx: OutfitContext, params: dict[str, Any]
+) -> None:
+    """Re-run one required slot with the warmth match relaxed, and SAY SO.
+
+    RELAXING BEATS EMPTYING, and this codebase already argues the point:
+    `_apply_avoids` drops a preference for a slot it would otherwise empty,
+    because "I avoid crop tops" never meant "I would rather have no outfit".
+    The same reasoning holds here with more force, since warmth is a MODEL's
+    guess rather than a rule the user stated.
+
+    What went wrong without it: the owner's only footwear is canvas sneakers
+    the tagger scored `warmth=1` (the ladder's examples for level 1 are
+    `tank_top` and `sandals_flat`, so 2 was nearer). The default weather
+    placeholder is 26C, which resolves to `warmth_target=3`. |1 - 3| = 2, one
+    step outside the tolerance, so the shoes vanished and every occasion
+    answered "no wearable feet — every outfit needs one". One garment, one
+    level of tagger error, and the product returns nothing at all.
+
+    Only for REQUIRED slots, and only when the slot is otherwise EMPTY. An
+    optional slot with no candidates is just an outfit without a jacket; a
+    required slot with none is no outfit. The scorer still ranks a relaxed
+    garment below a true warmth match, so this changes what is POSSIBLE
+    without changing what is PREFERRED.
+    """
+    for slot in required_slots():
+        if pool.by_slot.get(slot):
+            continue
+        rows = await session.execute(
+            text(POOL_SQL), dict(params, slot=slot, warmth_slack=WARMTH_RELAXED)
+        )
+        found = [_to_garment(r) for r in rows.mappings()]
+        if not found:
+            # Something OTHER than warmth emptied this slot. Leave it empty and
+            # let the caller's note stand — inventing a reason here would be
+            # the same mistake as a note that blames the laundry basket for a
+            # warmth filter.
+            continue
+        pool.by_slot[slot] = found
+        levels = sorted({g.warmth for g in found if g.warmth is not None})
+        shown = ", ".join(str(v) for v in levels) or "unset"
+        pool.notes.append(
+            f"relaxed the warmth match for {slot}: the only options are warmth "
+            f"{shown} against a target of {ctx.warmth_target} — they rank lower, "
+            f"but an outfit needs {slot}"
+        )
+
+
+async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
+    """Hard filters, in SQL. Everything here is a hard requirement.
+
+    Soft preferences belong to the scorer: a garment one warmth step from
+    target should rank lower, not vanish, which is why the warmth filter has a
+    tolerance rather than an equality.
+    """
+    taxonomy = load_taxonomy()
+    # dress_codes_compatible(a, b) is a PREDICATE, not a lookup — the map is
+    # what we need here, and it is asymmetric on purpose: `casual` accepts
+    # smart_casual, but a `business` occasion does not accept casual.
+    compatible = list(
+        taxonomy.dress_code_compatibility.get(ctx.dress_code_target, [ctx.dress_code_target])
+    )
+    if ctx.dress_code_target not in compatible:
+        compatible.append(ctx.dress_code_target)
+
+    # Rain is a material constraint, not a preference. A silk saree in a
+    # downpour is not a low-scoring suggestion, it is a bad one.
+    monsoon = taxonomy.raw.get("monsoon_suitability", {})
+    poor_when_wet = list(monsoon.get("poor", [])) if ctx.wet else []
+
+    params: dict[str, Any] = {
+        "warmth_target": ctx.warmth_target,
+        "warmth_slack": WARMTH_TOLERANCE,
+        "slot": None,
+        "compatible": compatible,
+        # Climate matching needs the band set for this warmth level, which
+        # the taxonomy derives rather than storing per garment.
+        "climate_any": True,
+        "poor_wet": poor_when_wet,
+        "recent_days": RECENTLY_WORN_DAYS,
+    }
+    rows = await session.execute(text(POOL_SQL), params)
 
     pool = CandidatePool()
     for r in rows.mappings():
-        item = ScoredGarment(
-            garment_id=str(r["id"]),
-            slot=r["slot"],
-            subcategory=r["subcategory"],
-            primary_colour=r["primary_colour"],
-            secondary_colour=r["secondary_colour"],
-            pattern=r["pattern"],
-            material=r["material"],
-            formality=r["formality"],
-            warmth=r["warmth"],
-            wear_count=int(r["wear_count"]),
-            last_worn=r["last_worn"],
-            # pgvector comes back as a STRING through text() queries — the type
-            # adapter is registered for the ORM mapping, not for raw SQL. Same
-            # trap Phase 8 hit; `parse_embedding` is the shared answer.
-            embedding=tuple(parse_embedding(r["embedding"]) or ()) or None,
-        )
+        item = _to_garment(r)
         pool.by_slot.setdefault(item.slot, []).append(item)
 
     await _apply_avoids(session, pool)
+    await _rescue_required_slots(session, pool, ctx, params)
 
     # Fail fast and SAY WHY. A wardrobe with no footwear can produce no valid
     # outfit at all, and discovering that after scoring 400 candidates is both
@@ -425,6 +510,66 @@ async def load_style_vector(session: Any) -> tuple[Any | None, int]:
     return np.asarray(parsed, dtype=np.float64), int(found["events_applied"] or 0)
 
 
+def diversify(
+    scored: list[tuple[tuple[ScoredGarment, ...], OutfitScore]],
+    *,
+    limit: int,
+    overlap_penalty: float,
+) -> list[tuple[tuple[ScoredGarment, ...], OutfitScore]]:
+    """Pick `limit` outfits that are individually good AND different from each other.
+
+    THE PROBLEM THIS SOLVES IS A PROPERTY OF THE LIST, NOT OF ANY OUTFIT.
+    `score_outfit` judges one outfit at a time, so a wardrobe with one strong
+    shirt yields a top three that is the same shirt three times with the shoes
+    swapped. Every entry is correctly scored; the list still offers one
+    decision dressed up as three.
+
+    GREEDY, WITH A PENALTY, NOT A HARD BUDGET. A per-garment appearance cap
+    ("no item twice in the top five") is easier to explain and wrong on a small
+    wardrobe: with ten garments nearly every outfit shares something, so a cap
+    either empties the list or forces genuinely bad outfits into it. A penalty
+    degrades instead — when everything overlaps, every candidate is penalised
+    alike and the original ranking survives.
+
+    The penalty is measured against the WORST offender among the already-picked
+    outfits, not the average. Repeating one garment from rank 1 is the thing a
+    reader notices; averaging it against four unrelated outfits would dilute
+    exactly the signal that matters.
+
+    DETERMINISTIC. The nightly precompute and the request path must produce the
+    same order or `served_from: materialised` and `served_from: live` disagree,
+    which is the bug the precompute design exists to avoid. Ties break on the
+    garment-set hash, the same way `suggest` already breaks them.
+    """
+    if overlap_penalty <= 0 or limit <= 1:
+        return scored[:limit]
+
+    remaining = list(scored)
+    picked: list[tuple[tuple[ScoredGarment, ...], OutfitScore]] = []
+    picked_sets: list[frozenset[str]] = []
+
+    while remaining and len(picked) < limit:
+        best_index = 0
+        best_key: tuple[float, str] | None = None
+        for index, (items, result) in enumerate(remaining):
+            ids = frozenset(g.garment_id for g in items)
+            worst = max(
+                (len(ids & seen) / len(ids) for seen in picked_sets),
+                default=0.0,
+            )
+            adjusted = result.total - overlap_penalty * worst
+            # Negated score first so a higher score sorts earlier, then the
+            # set hash for a stable tie-break.
+            key = (-adjusted, garment_set_hash([g.garment_id for g in items]))
+            if best_key is None or key < best_key:
+                best_key, best_index = key, index
+        chosen = remaining.pop(best_index)
+        picked.append(chosen)
+        picked_sets.append(frozenset(g.garment_id for g in chosen[0]))
+
+    return picked
+
+
 def suggest(
     pool: CandidatePool,
     ctx: OutfitContext,
@@ -462,8 +607,18 @@ def suggest(
     # same score must rank identically across runs or the nightly precompute
     # and the request path disagree.
     scored.sort(key=lambda p: (-p[1].total, garment_set_hash([g.garment_id for g in p[0]])))
+
+    # Variety across the list, applied at the TRUNCATION rather than inside the
+    # score: an outfit's quality does not depend on what else is being shown,
+    # and mixing the two would make `score_breakdown` unexplainable.
+    diversity = load_scoring_config().get("diversity") or {}
+    penalty = (
+        float(diversity.get("overlap_penalty", 0.0))
+        if diversity.get("enabled", False)
+        else 0.0
+    )
     return SuggestionResult(
-        outfits=scored[:limit],
+        outfits=diversify(scored, limit=limit, overlap_penalty=penalty),
         candidates_considered=len(candidates),
         pool=pool,
     )

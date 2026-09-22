@@ -50,6 +50,21 @@ CROP_PAD_PCT = 0.04
 # and costs a re-encode.
 WHOLE_FRAME_AREA_PCT = 0.95
 
+# Below this share of the alpha in one connected blob, the mask SHATTERED the
+# garment and the cutout is confetti.
+#
+# Measured on this wardrobe 2026-09-21:
+#
+#   white sneakers, masked      55 blobs, largest share 0.56   <- shredded
+#   folded jeans, masked        41 blobs, largest share 0.55   <- shredded
+#   every cutout that looks ok   1-7 blobs, largest share 0.98-1.00
+#   both of the above, UNMASKED  1 blob,   largest share 1.00
+#
+# 0.80 sits in the empty middle of that gap. The re-matte is what fixes it:
+# dropping the mask and cropping to the bounding box turned both shredded
+# cases into a single clean blob.
+MIN_LARGEST_BLOB_SHARE = 0.80
+
 
 def _crop_to_bbox(image: bytes, bbox: Any) -> bytes:
     """Crop to `bbox`, or return the image unchanged.
@@ -112,11 +127,55 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
         # Cropping sidesteps that entirely. rembg then sees a single-garment
         # image, which is the case it handles cleanly, and the alpha it returns
         # is its own rather than an intersection with a segmentation guess.
+        mask_discarded = False
         subject = image
         if mask is None:
             subject = _crop_to_bbox(image, record.get("bbox"))
         try:
             result = await ml.matte(image_bytes=subject, mask_png=mask)
+
+            # A MASK THAT SHATTERS THE GARMENT IS NOT A MASK WORTH KEEPING.
+            #
+            # segformer's ATR classes are human-parsing labels. With no person
+            # in frame they become shape guesses that carve ONE object into
+            # several: a single pair of white sneakers came back as Left-shoe
+            # 11.9% + Pants 8.4% + Right-shoe 3.6% + Upper-clothes 1.8%, and
+            # matting against any one of those gives that label's share of the
+            # shoe with everything the other labels claimed punched out. The
+            # user's word for the result was "tired"; the cutout was 55
+            # disconnected fragments.
+            #
+            # This is NOT fixable by retuning WORN_SKIN_THRESHOLD, and the
+            # measurements are in `largest_blob_share` — the worn and flat-lay
+            # skin_pct distributions OVERLAP, so no threshold separates them.
+            # Face+Hair and mask solidity fail too.
+            #
+            # So the decision moves to where the evidence actually is: AFTER
+            # the matte, where the damage is visible and measurable. If the
+            # mask produced confetti, drop it and re-matte the bounding box
+            # with rembg alone — the path flat-lays already take, and the one
+            # that turned both measured failures into a single clean blob.
+            #
+            # Costs a second inference only on the frames that need it.
+            if mask is not None and result.largest_blob_share < MIN_LARGEST_BLOB_SHARE:
+                logger.warning(
+                    "job %s garment %s: mask shattered the cutout "
+                    "(largest blob %.0f%% < %.0f%%); re-matting without it",
+                    ctx.job_id,
+                    record["garment_id"],
+                    result.largest_blob_share * 100,
+                    MIN_LARGEST_BLOB_SHARE * 100,
+                )
+                retry = await ml.matte(
+                    image_bytes=_crop_to_bbox(image, record.get("bbox")), mask_png=None
+                )
+                # Keep the retry only if it is actually less fragmented. On a
+                # genuinely worn photo the mask is doing real work, and a
+                # maskless re-matte there would return the whole outfit — worse
+                # than a ragged shirt, and silently so.
+                if retry.largest_blob_share > result.largest_blob_share:
+                    result = retry
+                    mask_discarded = True
         except MLUnavailable as exc:
             raise Unavailable(exc.reason, retry_after=exc.retry_after) from exc
 
@@ -133,6 +192,10 @@ async def _run(ctx: JobContext) -> dict[str, Any]:
                 "cutout_height": result.height,
                 "needs_review": needs_review,
                 "matte_model": result.model,
+                # Recorded so "why does this garment have no mask" is
+                # answerable later without re-running the pipeline.
+                "mask_discarded": mask_discarded,
+                "largest_blob_share": result.largest_blob_share,
             }
         )
         if needs_review:

@@ -169,7 +169,7 @@ class LiteLLMClient:
         messages: list[dict[str, Any]],
         api_key: str,
         response_format: dict[str, Any] | None = None,
-        max_tokens: int = 2048,
+        max_tokens: int | None = None,
         timeout: float | None = None,
         num_retries: int | None = None,
     ) -> ChatResult:
@@ -193,9 +193,25 @@ class LiteLLMClient:
         body: dict[str, Any] = {
             "model": model,
             "messages": messages,
-            "max_tokens": max_tokens,
             "temperature": 0.0,
         }
+        # SENT ONLY WHEN THE CALLER ASKS FOR ONE. This used to default to 2048
+        # and go in the body unconditionally, and a body parameter OVERRIDES
+        # the gateway's config — so every `max_tokens` in litellm/config.yaml
+        # was dead.
+        #
+        # That silently undid a documented fix. The `vlm-tagger` row carries a
+        # comment explaining, with measurements, why it must be 4096 and not
+        # 2048 — and the client had been sending 2048 the whole time. The
+        # config said one thing, the wire said another, and the comment made
+        # the wrong one look deliberate.
+        #
+        # Omitting it makes the config row authoritative, which is what
+        # "weights live in config, not in code" was supposed to mean. Callers
+        # that genuinely need a different ceiling — the reranker — still pass
+        # one explicitly.
+        if max_tokens is not None:
+            body["max_tokens"] = max_tokens
         if response_format is not None:
             body["response_format"] = response_format
         if num_retries is not None:

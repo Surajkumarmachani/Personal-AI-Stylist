@@ -30,7 +30,14 @@ import {
   type BodyPhoto as Photo,
 } from "@/lib/api";
 
-export default function BodyPhotoPanel({ onChange }: { onChange?: (active: number) => void }) {
+export default function BodyPhotoPanel({
+  onChange,
+}: {
+  // (consented photos, third party the photo would go to or null).
+  // The SECOND value is how the caller learns whether a VTON provider is
+  // configured at all — the server only names a third party when one is.
+  onChange?: (active: number, thirdParty: string | null) => void;
+}) {
   const [photos, setPhotos] = useState<Photo[]>([]);
   const [active, setActive] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
@@ -40,13 +47,16 @@ export default function BodyPhotoPanel({ onChange }: { onChange?: (active: numbe
   const [err, setErr] = useState<string | null>(null);
   const [ok, setOk] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  // A ref, not the state: `refresh` is memoised and would capture a stale
+  // `thirdParty` if it read the state directly.
+  const thirdPartyRef = useRef<string | null>(null);
 
   const refresh = useCallback(async () => {
     try {
       const r = await listBodyPhotos();
       setPhotos(r.photos);
       setActive(r.active);
-      onChange?.(r.active);
+      onChange?.(r.active, thirdPartyRef.current);
     } catch (e) {
       setErr(String(e));
     }
@@ -60,6 +70,8 @@ export default function BodyPhotoPanel({ onChange }: { onChange?: (active: numbe
       .then((p) => {
         setNotice(p.notice);
         setThirdParty(p.sent_to_third_party);
+        thirdPartyRef.current = p.sent_to_third_party;
+        void refresh();
       })
       .catch(() => setNotice(null));
   }, [refresh]);

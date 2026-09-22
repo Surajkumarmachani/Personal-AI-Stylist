@@ -323,3 +323,54 @@ def test_unknown_is_never_a_trend() -> None:
     from stylist_worker.trends import _NOT_A_TREND
 
     assert "unknown" in _NOT_A_TREND
+
+
+# --------------------------------------------------- rank vs predicted_rank
+#
+# `/suggestions` stamps `rank` (what the user is shown) and `predicted_rank`
+# (where the scorer put it). The UI draws a "shown higher to vary what you
+# see" line when predicted > rank, and these tests pin the arithmetic that
+# makes that claim honest.
+
+
+def test_only_the_promoted_outfit_claims_promotion() -> None:
+    """Promoting one outfit SHIFTS every outfit after it.
+
+    With a budget of 1, a card lifted from 7th to 2nd pushes the old 2nd..6th
+    down one each — so five more cards have `predicted_rank != rank` while
+    only ONE was actually explored. A UI that drew its badge from "the numbers
+    differ" would announce six promotions for a one-slot budget.
+
+    This is the same artefact the router's own comment records about counting
+    positional diffs as `explored_slots`, one layer up. The condition that
+    survives it is `predicted > rank`: displacement moves a card DOWN, so its
+    predicted rank is smaller, never larger.
+    """
+    # The permutation the bandit produced: position -> original index.
+    order = [0, 6, 1, 2, 3, 4, 5, 7]
+    stamped = [
+        {"rank": position + 1, "predicted_rank": original + 1}
+        for position, original in enumerate(order)
+    ]
+
+    differ = [o for o in stamped if o["predicted_rank"] != o["rank"]]
+    claims = [o for o in stamped if o["predicted_rank"] > o["rank"]]
+
+    assert len(differ) == 6, "six cards are displaced by promoting one"
+    assert len(claims) == 1, "but only one was actually promoted"
+    assert claims[0] == {"rank": 2, "predicted_rank": 7}
+
+
+def test_rank_is_dense_and_one_based() -> None:
+    """Off-by-one here mislabels every card, and `ordinal()` would render a
+    `0th choice` on the recommendation the user is most likely to read."""
+    order = [2, 0, 1]
+    ranks = [position + 1 for position, _ in enumerate(order)]
+    assert ranks == [1, 2, 3]
+
+
+def test_an_unshuffled_list_claims_nothing() -> None:
+    """When the bandit does not move anything, no card may imply it was
+    promoted — `predicted_rank` defaults to the shown rank."""
+    stamped = [{"rank": i + 1, "predicted_rank": i + 1} for i in range(5)]
+    assert not [o for o in stamped if o["predicted_rank"] > o["rank"]]

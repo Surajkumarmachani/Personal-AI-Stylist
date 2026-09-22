@@ -51,6 +51,11 @@ class MatteResult:
     width: int
     height: int
     model: str
+    # Share of the opaque alpha in its single largest connected blob. 1.0 is
+    # one solid garment; 0.55 is the garment shattered into confetti. The
+    # caller uses this to decide whether the mask it supplied was worth using
+    # — see `largest_blob_share` for why this is the measurement that works.
+    largest_blob_share: float = 1.0
 
 
 def model_path() -> Path:
@@ -189,6 +194,58 @@ def _crop_to_mask(image_bytes: bytes, mask_png: bytes) -> tuple[bytes, Image.Ima
         return buffer.getvalue(), binary
 
 
+def largest_blob_share(alpha: Image.Image) -> float:
+    """How much of the cutout is one connected piece, in [0, 1].
+
+    WHY THIS AND NOT THE OBVIOUS ALTERNATIVES
+    -----------------------------------------
+    A segformer label mask can carve a single physical object into pieces,
+    because on a photo with no person in it the ATR classes are shape guesses:
+    one pair of white sneakers came back as Left-shoe 11.9% + Pants 8.4% +
+    Right-shoe 3.6% + Upper-clothes 1.8%, and matting against any one of those
+    labels yields that label's share of the shoe with the rest punched out.
+
+    Three cheaper tests were measured first and all three failed:
+
+      skin_pct          the distributions OVERLAP. Worn sherwani 0.0088 <
+                        flat-lay sneakers 0.0139 < worn kurta 0.0185. No
+                        threshold exists, so `WORN_SKIN_THRESHOLD` cannot be
+                        retuned out of this — see the table in split.py.
+      Face + Hair       0.0000 on the flat-lay, but also 0.0003 on a genuine
+                        worn photo (feet in sneakers, shot looking down). A
+                        real worn photo need not contain a head.
+      mask solidity     area / filled-area was 0.97-1.0 for EVERY case, good
+                        and bad alike. The gaps are open notches connected to
+                        the background, not enclosed holes, so filling finds
+                        nothing.
+
+    Measured on this wardrobe, this one separates with room to spare:
+
+        shredded sneakers   55 blobs, largest share 0.56
+        shredded jeans      41 blobs, largest share 0.55
+        every good cutout   1-7 blobs, largest share 0.98-1.00
+
+    It works because it measures the DEFECT rather than a proxy for it. A
+    garment is one connected object; a cutout that is not is wrong regardless
+    of which upstream decision made it that way.
+    """
+    import numpy as np
+    from scipy.ndimage import label
+
+    solid = np.asarray(alpha, dtype=np.uint8) > ALPHA_TRIM_THRESHOLD
+    total = int(solid.sum())
+    if total == 0:
+        # No subject at all. Not fragmented — empty. MIN_ALPHA_COVERAGE is the
+        # check that catches this, and returning 0.0 here would make the
+        # caller re-matte a blank frame for nothing.
+        return 1.0
+    labelled, count = label(solid)
+    if count <= 1:
+        return 1.0
+    sizes = np.bincount(labelled.ravel())[1:]
+    return float(sizes.max()) / total
+
+
 def matte(image_bytes: bytes, mask_png: bytes | None = None) -> MatteResult:
     """Remove the background and trim to the subject's bounding box.
 
@@ -274,6 +331,8 @@ def matte(image_bytes: bytes, mask_png: bytes | None = None) -> MatteResult:
         # Trim to content. A cutout padded with transparent margin wastes CDN
         # bytes and makes the compositor's slot layout (Phase 8) fight the
         # padding instead of the garment.
+        blob_share = largest_blob_share(alpha)
+
         bbox = solid.getbbox()
         trimmed = rgba.crop(bbox) if bbox else rgba
 
@@ -288,4 +347,5 @@ def matte(image_bytes: bytes, mask_png: bytes | None = None) -> MatteResult:
         width=width,
         height=height,
         model=MODEL_NAME,
+        largest_blob_share=blob_share,
     )

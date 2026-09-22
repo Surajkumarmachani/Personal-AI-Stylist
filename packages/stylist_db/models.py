@@ -115,6 +115,9 @@ class UserProfile(Base):
     display_name: Mapped[str | None] = mapped_column(String(120))
     # Weather coordinates are stored ROUNDED TO 2DP. Full precision plus a
     # timestamp is a home address; 2dp is ~1.1km, which is all a forecast needs.
+    # The city label behind the coordinates below. Shown back to the user so
+    # a wrong geocode is visible — see migration 0017 for the Bangalore case.
+    home_place: Mapped[str | None] = mapped_column(String(160))
     home_lat_2dp: Mapped[float | None] = mapped_column(Numeric(5, 2))
     home_lon_2dp: Mapped[float | None] = mapped_column(Numeric(5, 2))
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="Asia/Kolkata")

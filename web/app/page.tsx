@@ -8,6 +8,7 @@ import Link from "next/link";
 import Shell from "./Shell";
 import SignIn from "./SignIn";
 import OutfitCard from "./OutfitCard";
+import Image from "next/image";
 import { OCCASIONS } from "./OCCASIONS";
 import { askStylist, listGarments, type ChatOutfit } from "@/lib/api";
 import { restoreSession } from "./session";
@@ -136,8 +137,17 @@ export default function Home() {
               style={{ animationDelay: `${i * 40}ms`, textAlign: "left", padding: 0, border: "1px solid var(--line)" }}
               onClick={() => router.push(`/explore?o=${encodeURIComponent(o.ask)}`)}
             >
-              <div className="ui-frame" style={{ aspectRatio: "1 / 1" }}>
-                <span style={{ fontSize: 26, opacity: 0.35 }} aria-hidden="true">◇</span>
+              <div
+                className="ui-frame photo"
+                style={{ aspectRatio: "1 / 1" }}
+              >
+                <Image
+                  src={o.img}
+                  alt=""
+                  width={520}
+                  height={520}
+                  style={{ width: "100%", height: "100%", objectFit: "cover" }}
+                />
               </div>
               <div className="ui-cbody">
                 <span className="ui-name">{o.title}</span>

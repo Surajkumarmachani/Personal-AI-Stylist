@@ -67,6 +67,164 @@ model_list:
     model_info:
       mode: chat
 
+  # ---- open-weight taggers -------------------------------------------------
+  #
+  # ADDED so tagging can run while the Gemini key has no prepaid credit. The
+  # `vlm-tagger` row above is LEFT EXACTLY AS IT WAS — switching is a
+  # `VLM_MODEL` change, not an edit here, so going back to Gemini is one env
+  # var and no diff.
+  #
+  # THE HARD REQUIREMENT IS STRUCTURED OUTPUT. The tag stage sends
+  # `response_format: {type: json_schema, strict: true}` (see
+  # stylist_domain.vlm_schema), and a model that ignores it returns prose the
+  # stage discards as unparseable — which looks like the model being bad at
+  # clothes rather than bad at JSON. Both rows below were chosen for schema
+  # support, not for benchmark scores.
+
+  # Runs on YOUR machine. No key, no quota, no bill, nothing leaves the laptop
+  # — which also means garment photos stop being sent to a third party while
+  # testing. `host.docker.internal` is how this container reaches Ollama on the
+  # Mac; it resolves here (checked) because Docker Desktop provides it.
+  #
+  # qwen2.5vl:7b over llava: it is markedly better at reading small text and
+  # fine pattern detail, which is most of what tagging asks for, and it honours
+  # a JSON schema where llava tends to narrate.
+  - model_name: vlm-tagger-ollama
+    litellm_params:
+      model: ollama_chat/qwen2.5vl:7b
+      api_base: http://host.docker.internal:11434
+      max_tokens: 4096
+      temperature: 0.0
+      # Local inference is slow next to a hosted API; a 6-cell grid on a
+      # laptop GPU is tens of seconds, not hundreds of milliseconds. The tag
+      # stage is async-plane work nobody waits on, so this is affordable.
+      timeout: 600
+      input_cost_per_token: 0
+      output_cost_per_token: 0
+    model_info:
+      mode: chat
+
+  # Hosted open weights. Faster than local by a wide margin and free at low
+  # volume, but it IS a third party, so garment photos leave the machine — the
+  # same consideration as Gemini, just a different company.
+  #
+  # The `:free` suffix is OpenRouter's free tier. Those model slugs rotate, so
+  # if this 404s check https://openrouter.ai/models?q=free for a current one
+  # rather than assuming the row is broken.
+  - model_name: vlm-tagger-openrouter
+    litellm_params:
+      # VERIFIED AGAINST openrouter.ai/api/v1/models ON 2026-09-21. The slug
+      # this row originally carried (qwen2.5-vl-72b) had already been rotated
+      # out of the free tier — checking beat discovering it as a 404 mid-test.
+      #
+      # Chosen from the free models that declare BOTH image input and
+      # `structured_outputs`. That second filter is the binding one: the tag
+      # stage sends strict json_schema, and a model without it returns prose
+      # the stage throws away.
+      #
+      # If this 404s, re-run the same check — the free tier rotates, and
+      # google/gemma-4-31b-it:free was the equivalent alternative that day.
+      # PROBED LIVE 2026-09-21 against a real garment photo and this exact
+      # json_schema. Of the free vision models, qwen3.8-27b and both gemma-4
+      # variants returned 429 from the SHARED UPSTREAM POOL (not an account
+      # limit — nothing you can fix with a key), and `openrouter/free`
+      # auto-routed to a content-safety model that cannot do extraction.
+      # This one answered in 33s with schema-valid JSON.
+      #
+      # Free-tier availability moves daily. When this 429s, re-run the same
+      # probe rather than assuming the integration broke.
+      # PROBED LIVE 2026-09-21 against a real garment photo and this exact
+      # json_schema. It returned schema-valid JSON in 36s and read a blue
+      # khadi kurta correctly as subcategory=kurta, material=cotton.
+      #
+      # WHAT THE OTHER FREE MODELS DID, so this is not re-litigated:
+      #   qwen3.8-27b, gemma-4-31b, gemma-4-26b  429 from the SHARED upstream
+      #                                          pool — not an account limit
+      #   openrouter/free                        auto-routed to a
+      #                                          content-safety model
+      #   ling-3.0-flash-vl                      400 on this request shape
+      #   nex-n2.5-pro                           spent 4174 of 4096 tokens
+      #                                          REASONING and emitted no JSON
+      #
+      # That last one is the trap the `vlm-tagger` row documents for Gemini
+      # 3.x, and it is not provider-specific: a reasoning model charges its
+      # thinking against max_tokens before the answer, and its upstream cap
+      # was 4096 no matter what was requested.
+      #
+      # Free-tier availability moves daily. When this 429s, re-probe rather
+      # than assuming the integration broke.
+      model: openrouter/dots-studio/dots-3-note-preview:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      # 16384, AND reasoning_effort low. This model THINKS, and measured here
+      # it spent 4174 reasoning tokens of a 4096 budget and emitted zero
+      # characters of JSON — finish_reason `length`, content empty, which the
+      # tag stage discards as unparseable and reports as the model failing.
+      #
+      # This is the same trap the `vlm-tagger` row above documents for Gemini
+      # 3.x. It is not a Gemini quirk; it is what any reasoning model does when
+      # the ceiling is set for the ANSWER and not for the thinking that
+      # precedes it. Reasoning length also varies run to run, so a budget that
+      # works once is not a budget that works.
+      # 8192, not 4096. Measured on ONE cell: 2961 reasoning + 255 content =
+      # 3216, already 79% of a 4096 ceiling. The tag stage batches SIX
+      # garments to a grid, so the content grows ~6x while the reasoning does
+      # not shrink — at 4096 a full grid truncates mid-object and the whole
+      # batch is discarded as unparseable.
+      # 8192. The model's own ceiling is 460800, so this is ours, not theirs —
+      # measured usage is 1475-4084 completion tokens per garment and a
+      # six-cell grid grows the answer while the reasoning does not shrink.
+      max_tokens: 8192
+      # THE REAL LEVER. Measured 2178-2961 REASONING tokens to tag one
+      # garment — for extraction against a fixed vocabulary, where the model
+      # is choosing from enums, not solving anything. That thinking is most of
+      # the 29s latency and most of the truncation risk, and one garment in
+      # six failed to parse because of it.
+      # NO REASONING CAP, and that is a finding rather than an omission.
+      #
+      # This model spends ~2400 tokens THINKING to pick enum values, which is
+      # most of the ~30s latency and the reason roughly one garment in six
+      # truncates. Calling OpenRouter directly, `reasoning: {effort: low}`
+      # cuts that to 1420 tokens and 23s — measured, a 42% reduction.
+      #
+      # It cannot be reached through this gateway. Three routes were tried and
+      # all were stripped before the provider saw them:
+      #     reasoning_effort: low       (config)        -> 2139 tokens, no change
+      #     reasoning: {effort: low}    (config)        -> 2543 tokens, no change
+      #     reasoning / extra_body      (request body)  -> 3764 tokens, no change
+      #
+      # A no-op setting left in here would read as a tuning decision that had
+      # been made. It has not been, so there is nothing here instead. Revisit
+      # if LiteLLM adds OpenRouter reasoning passthrough; until then the cost
+      # is latency on async-plane work nobody waits for, which is affordable.
+      temperature: 0.0
+      # Generous because tagging is async-plane work nobody waits on, and a
+      # timeout shorter than the work is a self-inflicted failure.
+      timeout: 600
+    model_info:
+      mode: chat
+
+  # Groq. NO PAYMENT METHOD REQUIRED — the free tier needs only a signup,
+  # where OpenRouter asks for a spending cap on key creation even though it
+  # never charges a $0 balance. Also by far the fastest of the three: Groq
+  # runs open weights on their own inference hardware, so a tag call is
+  # seconds rather than the minutes local inference took.
+  #
+  # Rate-limited per minute and per day rather than by cost. That suits the
+  # tag stage, which is async-plane work behind a queue — a 429 is backpressure
+  # the state machine already knows how to wait on (see UNAVAILABLE_BUDGET).
+  #
+  # Llama 4 Scout is the vision model on the free tier; if this name 404s,
+  # check console.groq.com/docs/models for the current one.
+  - model_name: vlm-tagger-groq
+    litellm_params:
+      model: groq/meta-llama/llama-4-scout-17b-16e-instruct
+      api_key: os.environ/GROQ_API_KEY
+      max_tokens: 4096
+      temperature: 0.0
+      timeout: 120
+    model_info:
+      mode: chat
+
   # ---- local development: a deterministic stand-in ------------------------
   #
   # mock_response makes the gateway answer without any provider, so the whole
@@ -135,6 +293,53 @@ model_list:
   # Routed through the gateway for uniform observability, and priced at zero so
   # LiteLLM skips budget checks. This row IS the degrade path: when a tenant's
   # budget is gone, embeddings and matting keep working.
+  # ---- intent classification (Phase 12) ----------------------------------
+  #
+  # Reached ONLY when the lexicon in stylist_domain/intent.py finds nothing.
+  # "Diwali", "client meeting" and the other 130-odd phrases never get here,
+  # so this row carries the long tail — "visiting Patna as a tourist",
+  # "meeting my girlfriend's parents" — and nothing on the hot path.
+  #
+  # A TEXT model, not the vision row. The tagger's OpenRouter slug is chosen
+  # for image input plus structured outputs; this needs neither the image
+  # capability nor its 30-second latency, and reusing it would put a vision
+  # model's cold start in front of a chat reply.
+  #
+  # Free tier, because Gemini's credits are depleted and an intent classifier
+  # that only works when billing does is an intent classifier that will be
+  # off exactly when someone is trying the product for the first time. When
+  # this 429s or 404s the caller degrades to the clarifying question, which
+  # is the behaviour that shipped before this row existed.
+  - model_name: intent-classifier
+    litellm_params:
+      # PROBED LIVE 2026-09-21 against this exact json_schema and a real
+      # long-tail query ("my cousin's daughter has her naming ceremony").
+      # Chosen from the free models declaring text input AND structured
+      # outputs; of the eight that qualified, only this one answered:
+      #
+      #   nemotron-3-super-120b          4.0s, schema-valid JSON  <- this row
+      #   nex-n2.5-mini                  3.7s, EMPTY content
+      #   dots-3-note-preview            7.2s, EMPTY content  (the tagger's
+      #                                  row — it does images, not this)
+      #   lfm-2.5-2.6b                   9.5s, EMPTY content
+      #   qwen3.8-27b, gemma-4-26b,      429 from the SHARED upstream pool,
+      #   gemma-4-31b                    exactly as the tagger row records
+      #
+      # The row this replaced was meta-llama/llama-3.3-70b-instruct:free,
+      # which I wrote from memory without probing. It 404s: OpenRouter's own
+      # message is "This model is unavailable for free. The paid version is
+      # available now". That is the trap the tagger rows document, walked
+      # straight into — check the live list, do not recall it.
+      model: openrouter/nvidia/nemotron-3-super-120b-a12b:free
+      api_key: os.environ/OPENROUTER_API_KEY
+      # Small answer, no reasoning wanted. The traps documented on the tagger
+      # rows are about reasoning models spending the whole budget thinking;
+      # this asks an instruct model for three fields, so 512 is generous.
+      max_tokens: 512
+      temperature: 0.0
+    model_info:
+      mode: chat
+
   - model_name: embed-fashion
     litellm_params:
       model: openai/marqo_fashionsiglip_vision

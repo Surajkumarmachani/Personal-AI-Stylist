@@ -185,6 +185,9 @@
 .ui-grid.tight { grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 14px; }
 
 .ui-card {
+  /* So a card used as a <button> looks identical to one used as an <article>.
+     Without it the UA button styles leak in — see .ui-name below. */
+  color: var(--ink); font: inherit; text-align: inherit;
   background: var(--surface); border: 1px solid var(--line);
   border-radius: var(--r); overflow: hidden;
   animation: ui-in .38s ease both;
@@ -198,8 +201,20 @@
   display: flex; align-items: center; justify-content: center;
   gap: 5px; padding: 12px; flex-wrap: wrap; overflow: hidden;
 }
+/* Garment CUTOUTS: contained, and small enough that four fit one frame.
+   `contain` is right for a cutout — cropping a shirt is losing the shirt. */
 .ui-frame img { max-height: 46%; max-width: 44%; object-fit: contain; }
 .ui-frame.one img { max-height: 88%; max-width: 88%; }
+
+/* A PHOTOGRAPH, not a cutout: fills the frame edge to edge.
+   Without this the rule above applied — occasion tiles rendered at 44% of
+   their card, a stamp floating in grey. `cover` rather than `contain`: these
+   are pre-cropped squares, so there is nothing to letterbox. */
+.ui-frame.photo { padding: 0; }
+.ui-frame.photo img {
+  max-height: 100%; max-width: 100%;
+  width: 100%; height: 100%; object-fit: cover; display: block;
+}
 
 /* A garment the pipeline has not matted yet. Its slot name beats a broken
  * image icon, because "no cutout" is an ordinary state here. */
@@ -214,10 +229,31 @@
   transition: color .16s, transform .14s;
 }
 .ui-heart:hover { transform: scale(1.1); }
+
+/* The preference number, top-LEFT, opposite the heart.
+   A number rather than a medal or a colour ramp: the list is ordered 1..n and
+   the reader's question is "which one first", which a digit answers exactly.
+   Rank 1 is filled so the recommendation is findable at a glance in a grid;
+   the rest are outlined so they read as a sequence, not as nine badges. */
+.ui-rank {
+  position: absolute; top: 9px; left: 9px; z-index: 1;
+  min-width: 24px; height: 24px; padding: 0 6px;
+  display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 999px; font-size: 12px; font-weight: 640; line-height: 1;
+  background: rgba(255,255,255,.92); color: var(--ink-2);
+  box-shadow: 0 2px 8px rgba(0,0,0,.07);
+}
+.ui-rank[data-top="1"] { background: var(--accent, #4f46e5); color: #fff; }
 .ui-heart.on { color: var(--heart); }
 
 .ui-cbody { padding: 12px 13px 14px; }
-.ui-name { font-size: 14.5px; font-weight: 570; display: block; }
+/* STATES ITS OWN COLOUR, deliberately. `.ui-card` is an <article> on most
+   screens and a <button> on /occasions, and a button does not inherit `color`
+   from the page — it resolves the UA default, which computed to WHITE here.
+   Every occasion tile's title was white text on a white card: present in the
+   DOM, readable by a screen reader, invisible to everyone else. `.ui-sub` was
+   unaffected only because it happened to set a colour. */
+.ui-name { font-size: 14.5px; font-weight: 570; display: block; color: var(--ink); }
 .ui-sub { margin: 3px 0 0; font-size: 12.5px; color: var(--muted); }
 
 .ui-tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }

@@ -24,7 +24,10 @@ so it stops being a caveat on its own when real tags arrive.
 from __future__ import annotations
 
 import json
+import logging
+import uuid
 from collections import Counter
+from dataclasses import replace
 from datetime import date
 from typing import Annotated, Any
 
@@ -39,18 +42,157 @@ from stylist_api.deps import (
     SettingsDep,
     TenantDB,
 )
+from stylist_db.session import tenant_session
 from stylist_domain.bandit import Arm, daily_seed, explore_slots, reorder
 from stylist_domain.context import resolve_context
+from stylist_domain.scoring import load_scoring_config
 from stylist_domain.taxonomy import load_taxonomy
-from stylist_suggest import TEMPLATE_RATIONALE, load_wardrobe, rerank, suggest
+from stylist_suggest import (
+    TEMPLATE_RATIONALE,
+    garment_set_hash,
+    load_wardrobe,
+    rerank,
+    suggest,
+)
 from stylist_suggest.pipeline import load_style_vector
 from stylist_worker.trends import load_trends
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["suggestions"])
 
 # Default when the caller gives no weather. Not a forecast — an honest
 # mid-scale placeholder, reported in the response as `weather_source`.
 DEFAULT_FEELS_LIKE_C = 26.0
+
+
+async def _persist_live_outfits(user_id: Any, ctx: Any, rows: list[dict[str, Any]]) -> None:
+    """Write live-generated outfits to `outfits`, so their hash RESOLVES.
+
+    A HASH THE API HANDS OUT MUST BE A HASH THE API CAN LOOK UP.
+    Only `precompute.py` wrote this table, so every outfit produced on the
+    live path existed solely inside one response. The response still carried
+    `garment_set_hash` — the client needs it for the Try On button — and
+    `POST /outfits/{hash}/tryon` then answered 404 "outfit not found", which
+    is the one genuine 404 that endpoint has, raised on a hash the same
+    service had just issued.
+
+    Measured on this wardrobe: `outfits` held ZERO rows for the owner, because
+    the nightly precompute has never had a reason to run for a brand-new
+    account. So try-on was not "sometimes broken" — it could never once have
+    worked from a live suggestion, which is every suggestion this account has
+    ever seen. `GET /outfits/{hash}/board` has the same dependency.
+
+    The same INSERT and the same ON CONFLICT as the precompute, deliberately:
+    a second shape for the same row is how the two drift. Re-requesting the
+    same context refreshes the score rather than erroring on the unique key.
+
+    Best effort. This is a WRITE on a read path, and an outfit the user can
+    see but not try on beats an error page — so a failure here is logged and
+    swallowed rather than turned into a 500 on `GET /suggestions`.
+    """
+    if not rows:
+        return
+    version = int(load_scoring_config().get("version", 1))
+    try:
+        async with tenant_session(user_id) as session:
+            for r in rows:
+                ids = [str(g) for g in r["garment_ids"]]
+                await session.execute(
+                    text(
+                        """
+                        INSERT INTO outfits (
+                            id, user_id, garment_ids, garment_set_hash, occasion,
+                            warmth_target, formality_target, wet, score,
+                            score_breakdown, scoring_version
+                        ) VALUES (
+                            :id, :uid, CAST(:ids AS uuid[]), :hash, :occasion,
+                            :warmth, :formality, :wet, :score,
+                            CAST(:breakdown AS jsonb), :version
+                        )
+                        ON CONFLICT (user_id, garment_set_hash, occasion, warmth_target)
+                        DO UPDATE SET
+                            score = EXCLUDED.score,
+                            score_breakdown = EXCLUDED.score_breakdown,
+                            scoring_version = EXCLUDED.scoring_version,
+                            created_at = now()
+                        """
+                    ),
+                    {
+                        "id": uuid.uuid4(),
+                        "uid": user_id,
+                        "ids": ids,
+                        "hash": garment_set_hash(ids),
+                        "occasion": ctx.occasion,
+                        "warmth": ctx.warmth_target,
+                        "formality": ctx.formality_target,
+                        "wet": ctx.wet,
+                        "score": r["score"],
+                        "breakdown": json.dumps(r["score_breakdown"]),
+                        "version": version,
+                    },
+                )
+    except Exception:
+        logger.exception("could not persist live outfits; try-on will 404 for these")
+
+
+async def _resolve_weather(
+    db: Any, cache: Any, feels_like_c: float | None, precip: float, wind: float
+) -> tuple[float, float, float, str]:
+    """(feels_like_c, precip_probability, wind_kmh, weather_source).
+
+    THE CALLER'S VALUES WIN. An explicit `?feels_like_c=` is a deliberate
+    override — the chat uses it to honour "it's freezing outside" — and a
+    forecast for the user's home city must not silently replace what they
+    just told us.
+
+    Otherwise: the user's stored city, through the Phase 6 weather client that
+    had NO CALLERS until now. `weather_fit` carries 0.15 of the score and
+    `monsoon_suitability` is a hard filter, and both ran on the constant 26.0
+    for every request ever made.
+
+    Degrades in one direction only, and SAYS WHICH:
+
+      user-stated    the caller passed a temperature
+      forecast       real apparent temperature for the stored city
+      placeholder    no city stored, or the provider is unreachable
+
+    `weather_source` is returned to the client because the difference matters
+    to a reader: "dressed for 26C" is a claim, and the honest version of it is
+    either "your city is 31C right now" or "I do not know where you are".
+    The module comment has claimed since Phase 6 that this was "reported in
+    the response as `weather_source`"; nothing reported it until now.
+    """
+    if feels_like_c is not None:
+        return feels_like_c, precip, wind, "user-stated"
+
+    row = await db.execute(
+        text("SELECT home_lat_2dp, home_lon_2dp FROM user_profile LIMIT 1")
+    )
+    got = row.mappings().one_or_none()
+    lat = got["home_lat_2dp"] if got else None
+    lon = got["home_lon_2dp"] if got else None
+    if lat is None or lon is None:
+        return DEFAULT_FEELS_LIKE_C, precip, wind, "placeholder-no-location"
+
+    from stylist_clients.weather import WeatherClient, WeatherUnavailable
+
+    try:
+        weather = await WeatherClient(cache=cache).fetch(float(lat), float(lon))
+    except WeatherUnavailable as exc:
+        # Suggestions are the product; weather is an input. A provider outage
+        # degrades the ranking's accuracy, never the response.
+        logger.info("weather unavailable, using the placeholder: %s", exc)
+        return DEFAULT_FEELS_LIKE_C, precip, wind, "placeholder-provider-down"
+
+    # Caller-supplied precip/wind still win when non-zero — same override rule
+    # as the temperature, since the chat sets precip from "it's raining".
+    return (
+        weather.feels_like_c,
+        precip or weather.precip_probability,
+        wind or weather.wind_kmh,
+        "forecast-cached" if weather.from_cache else "forecast",
+    )
 
 
 @router.get("/suggestions")
@@ -73,6 +215,14 @@ async def get_suggestions(
     # that phase's 7.5ms/58ms numbers were measured on and how they stay
     # re-measurable rather than becoming history.
     rerank_enabled: Annotated[bool, Query(alias="rerank")] = True,
+    # NOT query parameters. These come from a CUSTOM OCCASION the user defined
+    # (see routers/occasions.py), and the chat passes them through after
+    # resolving the alias. Deliberately keyword-only and undocumented in the
+    # HTTP surface: letting a client dial formality directly would make every
+    # measured ranking number depend on an unaudited request field, where an
+    # alias is a stored, listable, deletable object the user created.
+    formality_override: int | None = None,
+    dress_code_override: str | None = None,
 ) -> dict[str, Any]:
     taxonomy = load_taxonomy()
     if occasion not in {o["id"] for o in taxonomy.raw["occasions"]}:
@@ -81,12 +231,34 @@ async def get_suggestions(
             detail=f"unknown occasion; taxonomy defines {sorted(taxonomy.occasions)}",
         )
 
+    feels, precip, wind, weather_source = await _resolve_weather(
+        db, cache, feels_like_c, precip_probability, wind_kmh
+    )
     ctx = resolve_context(
         occasion=occasion,
-        feels_like_c=DEFAULT_FEELS_LIKE_C if feels_like_c is None else feels_like_c,
-        precip_probability=precip_probability,
-        wind_kmh=wind_kmh,
+        feels_like_c=feels,
+        precip_probability=precip,
+        wind_kmh=wind,
     )
+    # A CUSTOM OCCASION'S NUDGES, applied after the base context is built.
+    #
+    # `resolve_context` stays the single place that turns an occasion into
+    # targets — it is pure, tested, and shared with the precompute — so the
+    # override replaces a field on the result rather than adding a branch
+    # inside it. "My office is more formal than most" becomes a different
+    # `formality_target`, and everything downstream is unchanged.
+    if formality_override is not None or dress_code_override is not None:
+        ctx = replace(
+            ctx,
+            formality_target=(
+                formality_override if formality_override is not None else ctx.formality_target
+            ),
+            dress_code_target=(
+                dress_code_override
+                if dress_code_override is not None
+                else ctx.dress_code_target
+            ),
+        )
 
     served_from = "materialised"
     rows: list[dict[str, Any]] = []
@@ -143,11 +315,12 @@ async def get_suggestions(
             }
             for items, score in live.outfits
         ]
+        await _persist_live_outfits(user.id, ctx, rows)
         if not rows:
             return {
                 "outfits": [],
                 "served_from": served_from,
-                "context": _context_payload(ctx),
+                "context": _context_payload(ctx, weather_source),
                 # WHY it is empty, not just that it is. "No suggestions" with
                 # no reason is the least actionable screen in the product.
                 "notes": pool.notes
@@ -189,12 +362,13 @@ async def get_suggestions(
             }
             for items, score in live.outfits
         ]
+        await _persist_live_outfits(user.id, ctx, rows)
         outfits, rows_by_id = await _hydrate(db, store, rows)
         if not outfits:
             return {
                 "outfits": [],
                 "served_from": served_from,
-                "context": _context_payload(ctx),
+                "context": _context_payload(ctx, weather_source),
                 "notes": pool.notes
                 or ["no outfit satisfied your preferences and today's slot rules"],
             }
@@ -268,6 +442,15 @@ async def get_suggestions(
         ranked = [(str(i), o.get("dress_code")) for i, o in enumerate(outfits)]
         order = reorder(ranked, arms, seed=daily_seed(str(user.id), date.today()))
         reordered = [outfits[int(i)] for i in order]
+        # WHAT THE SCORER THOUGHT, kept alongside what is actually shown.
+        #
+        # `reorder` is allowed to promote a worse-predicted outfit — that is
+        # the whole point of exploration. Labelling the top card "1st choice"
+        # while the scorer ranked it 5th would be a small lie, and the UI can
+        # only be honest about it if the pre-bandit position survives the
+        # permutation. `order[k]` is the original index of the item now at k.
+        for position, original in enumerate(order):
+            reordered[position]["predicted_rank"] = int(original) + 1
         # THE COUNT IS THE EXPLORE BUDGET, not the number of positions that
         # moved. Promoting one outfit shifts every outfit after it, so a
         # positional diff reported 7 of 12 "explored" for a 2-slot budget —
@@ -278,7 +461,22 @@ async def get_suggestions(
         if explored:
             ranking_source = f"{ranking_source}+bandit"
 
-    for o in outfits:
+    # RANK IS STATED, NOT INFERRED FROM ARRAY POSITION.
+    #
+    # The list has always been ordered — scorer, then reranker, then bandit —
+    # but nothing said so, and every screen rendered the cards as an unlabelled
+    # grid. "Which of these do you actually recommend?" was unanswerable from
+    # the UI even though the server had a definite answer.
+    #
+    # An explicit field rather than leaving the client to count: a client that
+    # filters or re-sorts (the Saved screen does) would otherwise renumber the
+    # ranking into nonsense, and the server is the only thing that knows the
+    # real order.
+    for position, o in enumerate(outfits):
+        o["rank"] = position + 1
+        # Absent when the bandit did not run (no outfits, or it was skipped),
+        # and then the predicted order IS the shown order.
+        o.setdefault("predicted_rank", position + 1)
         o.pop("_ids", None)
         o.pop("dress_code", None)
 
@@ -294,7 +492,7 @@ async def get_suggestions(
         # someone asks why this morning's suggestion is different.
         "ranking_source": ranking_source,
         "validator_reject_rule": reject_rule,
-        "context": _context_payload(ctx),
+        "context": _context_payload(ctx, weather_source),
         "notes": rerank_notes,
     }
 
@@ -395,6 +593,16 @@ async def _hydrate(
         outfits.append(
             {
                 "_ids": [str(g) for g in r["garment_ids"]],
+                # THE OUTFIT'S IDENTITY, and the UI cannot request a try-on or
+                # a board without it. Omitting it made the Try On button a
+                # dead control: it fell through to "this look has no saved id
+                # yet" for every outfit, on every screen.
+                #
+                # Recomputed here rather than selected: the live path builds
+                # outfits that are not in the `outfits` table at all, so there
+                # is no column to read. `garment_set_hash` is over the SORTED
+                # ids, so both paths produce the same value for the same set.
+                "garment_set_hash": garment_set_hash([str(g) for g in r["garment_ids"]]),
                 "garments": items,
                 "score": float(r["score"]),
                 "informative_weight": (breakdown or {}).get("informative_weight"),
@@ -405,9 +613,15 @@ async def _hydrate(
     return outfits, rows_by_id
 
 
-def _context_payload(ctx: Any) -> dict[str, Any]:
+def _context_payload(ctx: Any, weather_source: str | None = None) -> dict[str, Any]:
     return {
         "occasion": ctx.occasion,
+        # WHERE THE TEMPERATURE CAME FROM. Three returns in this module build a
+        # context payload, so the parameter lives here rather than being added
+        # at each call site — the empty-wardrobe replies are exactly the ones a
+        # user is most likely to question, and "dressed for 26C" with no
+        # provenance is the claim they cannot check.
+        "weather_source": weather_source,
         "warmth_target": ctx.warmth_target,
         "formality_target": ctx.formality_target,
         "dress_code_target": ctx.dress_code_target,

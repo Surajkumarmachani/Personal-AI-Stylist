@@ -17,8 +17,14 @@
 
 import { useEffect, useState } from "react";
 import Shell from "../Shell";
+import HomeCity from "../HomeCity";
 import SignIn from "../SignIn";
-import { addPreference, listPreferences, type PreferenceFact } from "@/lib/api";
+import {
+  addPreference,
+  deletePreference,
+  listPreferences,
+  type PreferenceFact,
+} from "@/lib/api";
 import { restoreSession } from "../session";
 import "../ui.css";
 
@@ -47,11 +53,27 @@ export default function ProfilePage() {
     if (email) refresh();
   }, [email]);
 
-  async function prefer(colour: string) {
+  /** Toggle, not add-only.
+   *
+   * These chips looked like a toggle — tapping one filled it in — and only
+   * ever ADDED a preference fact. There was no way to undo a mis-tap from
+   * this screen, and the facts are not decoration: the suggest pipeline reads
+   * `prefers` when it ranks, so a colour added by accident kept steering
+   * every suggestion with nothing on screen to take it back.
+   *
+   * The delete endpoint already existed and nothing called it.
+   */
+  async function toggleColour(colour: string) {
+    if (busy) return;
     setBusy(true);
     setErr(null);
     try {
-      await addPreference("prefers", "primary_colour", colour);
+      const existing = facts.find(
+        (f) =>
+          f.kind === "prefers" && f.field_name === "primary_colour" && f.field_value === colour,
+      );
+      if (existing) await deletePreference(existing.id);
+      else await addPreference("prefers", "primary_colour", colour);
       refresh();
     } catch (e) {
       setErr(String(e));
@@ -76,6 +98,10 @@ export default function ProfilePage() {
         <p className="ui-sub">{email}</p>
       </div>
 
+      <div style={{ marginBottom: 18 }}>
+        <HomeCity />
+      </div>
+
       <div className="ui-panel" style={{ marginBottom: 18 }}>
         <h2 className="ui-h3">Preferred colours</h2>
         <p className="ui-sub" style={{ marginBottom: 12 }}>
@@ -87,9 +113,12 @@ export default function ProfilePage() {
               key={c}
               className={`ui-pill${chosen.has(c) ? " on" : ""}`}
               disabled={busy}
-              onClick={() => void prefer(c)}
+              aria-pressed={chosen.has(c)}
+              title={chosen.has(c) ? `Tap to stop preferring ${c.replace(/_/g, " ")}` : undefined}
+              onClick={() => void toggleColour(c)}
             >
               {c.replace(/_/g, " ")}
+              {chosen.has(c) ? <span aria-hidden="true"> ×</span> : null}
             </button>
           ))}
         </div>

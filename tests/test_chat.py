@@ -158,3 +158,242 @@ async def test_chat_requires_auth(api) -> None:
     """It reads a wardrobe. An unauthenticated caller must not reach it."""
     resp = await api.post("/chat", json={"message": "Diwali"})
     assert resp.status_code in (401, 403)
+
+
+# ---------------------------------------------------------------- intent_llm
+#
+# The LLM fallback is reached only on a lexicon MISS, so these tests use
+# queries the lexicon deliberately does not know. The gateway is faked for the
+# same reason tests/test_rerank.py fakes it: the real free-tier slug rotates
+# and rate-limits, and a test that depends on a third party's daily quota
+# tells you about the quota, not about this code.
+
+
+class FakeIntentGateway:
+    def __init__(self, *, content: str | None = None, raises: Exception | None = None):
+        self.calls: list[dict[str, object]] = []
+        self._content = content
+        self._raises = raises
+
+    async def chat(self, **kwargs: object) -> object:
+        self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
+
+        class R:
+            content = self._content or "{}"
+
+        return R()
+
+
+def test_the_schema_enum_is_the_taxonomy_plus_unknown() -> None:
+    """The enum must be generated from taxonomy.yaml, not typed out.
+
+    A hard-coded list would keep accepting an occasion after it was renamed,
+    and the classifier would then hand `resolve_context` an id it rejects —
+    a 500 on a chat message.
+    """
+    from stylist_domain.intent_llm import UNKNOWN, build_schema
+
+    enum = build_schema()["json_schema"]["schema"]["properties"]["occasion"]["enum"]
+    assert set(enum) == set(load_taxonomy().occasions) | {UNKNOWN}
+
+
+def test_an_invented_occasion_is_rejected_not_passed_through() -> None:
+    """`strict` is a request the provider may ignore. The validator is the gate.
+
+    This is the failure that matters most: an id outside the taxonomy reaching
+    `resolve_context` raises inside a user-facing request.
+    """
+    from stylist_domain.intent_llm import validate
+
+    assert validate({"occasion": "brunch_with_friends", "confidence": 0.99}) is None
+
+
+def test_unknown_is_understood_as_not_an_occasion() -> None:
+    from stylist_domain.intent_llm import UNKNOWN, validate
+
+    got = validate({"occasion": UNKNOWN, "confidence": 0.9, "alternatives": []})
+    assert got is not None
+    assert got.occasion is None
+    assert not got.confident
+
+
+def test_a_low_confidence_answer_is_not_acted_on() -> None:
+    from stylist_domain.intent_llm import MIN_CONFIDENCE, validate
+
+    got = validate({"occasion": "workout", "confidence": MIN_CONFIDENCE - 0.01})
+    assert got is not None and got.occasion == "workout"
+    assert not got.confident, "a coin-flip classification must ask, not dress"
+
+
+def test_alternatives_are_filtered_to_real_occasions() -> None:
+    """A bad SUGGESTION is cosmetic where a bad classification is not, so
+    unknown ids are dropped rather than failing the whole answer."""
+    from stylist_domain.intent_llm import validate
+
+    got = validate(
+        {
+            "occasion": "casual_outing",
+            "confidence": 0.9,
+            "alternatives": ["travel_day", "not_a_real_occasion", "casual_outing"],
+        }
+    )
+    assert got is not None
+    assert got.alternatives == ("travel_day",), "self and invented ids must be dropped"
+
+
+@pytest.mark.asyncio
+async def test_classifier_rescues_a_query_the_lexicon_cannot_parse(api, registered) -> None:
+    """The reported failure: an ordinary sentence with no lexicon keyword got
+    "I'm not sure what the occasion is" and five unrelated examples."""
+    import json as _json
+
+    from stylist_api.routers import chat as chat_router
+
+    gateway = FakeIntentGateway(
+        content=_json.dumps(
+            {"occasion": "casual_outing", "confidence": 0.92, "alternatives": ["travel_day"]}
+        )
+    )
+    got = await chat_router._classify(gateway, "sk-tenant", "my cousin's naming ceremony")
+    assert got is not None and got.confident
+    assert got.occasion == "casual_outing"
+    assert gateway.calls, "the classifier must actually call the gateway"
+
+
+@pytest.mark.asyncio
+async def test_every_gateway_failure_degrades_to_asking(api, registered) -> None:
+    """Timeout, 429, 404 on a rotated slug, prose instead of JSON — each one
+    must return None so the caller asks. This is what keeps the classifier an
+    enhancement rather than a dependency."""
+    from stylist_api.routers import chat as chat_router
+
+    for failure in (
+        FakeIntentGateway(raises=TimeoutError("read timeout")),
+        FakeIntentGateway(raises=RuntimeError("HTTP 429 free-models-per-day")),
+        FakeIntentGateway(content="I think you should wear something nice!"),
+        FakeIntentGateway(content='{"occasion": "made_up", "confidence": 1.0}'),
+    ):
+        assert await chat_router._classify(failure, "sk-tenant", "anything") is None
+
+    # And with no tenant key there is no budget to bill it to, so it must not
+    # call at all rather than land on someone else's key.
+    unused = FakeIntentGateway(content='{"occasion":"workout","confidence":1.0}')
+    assert await chat_router._classify(unused, None, "gym time") is None
+    assert not unused.calls
+
+
+# ------------------------------------------------------- custom occasions
+#
+# A custom occasion is an ALIAS for a taxonomy one, never a nineteenth enum
+# value — taxonomy.yaml is frozen and its enums generate Postgres types. See
+# migration 0018.
+
+
+@pytest.mark.asyncio
+async def test_a_custom_occasion_must_name_a_real_base(api, registered) -> None:
+    """`base_occasion` is a plain varchar in the database, deliberately: a FK
+    onto a generated enum would couple this table to the freeze it exists to
+    avoid. That moves the check into the router, so the check has to be real —
+    an unknown base would otherwise reach `resolve_context` and raise inside a
+    user-facing request."""
+    r = await api.post(
+        "/me/occasions",
+        json={"name": "brunch o'clock", "base_occasion": "brunch_o_clock"},
+        headers=registered.auth,
+    )
+    assert r.status_code == 400
+    assert "base_occasion must be one of" in r.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_a_custom_name_beats_the_built_in_lexicon(api, registered) -> None:
+    """The ordering IS the feature.
+
+    The lexicon maps bare `office` to `office_casual`, and "office" is longer
+    than "party" so it wins the longest-phrase rule. Someone who has named an
+    occasion "office party" would therefore get desk clothes for a night out —
+    their own words losing to a generic keyword inside them, in their own
+    wardrobe.
+
+    Measured against the running API: without the alias the message resolves
+    to `office_casual via office`; with it, `party_night via your occasion
+    'office party'`; after deleting it, back to `office_casual`.
+    """
+    from stylist_domain.intent import parse
+
+    msg = "what do i wear to the office party"
+    assert parse(msg).occasion == "office_casual", "the control the alias has to beat"
+
+    created = await api.post(
+        "/me/occasions",
+        json={"name": "office party", "base_occasion": "party_night"},
+        headers=registered.auth,
+    )
+    assert created.status_code == 201
+
+    reply = await api.post("/chat", json={"message": msg}, headers=registered.auth)
+    assert reply.json()["understood"]["occasion"] == "party_night"
+
+    gone = await api.delete(
+        f"/me/occasions/{created.json()['id']}", headers=registered.auth
+    )
+    assert gone.status_code == 200
+    back = await api.post("/chat", json={"message": msg}, headers=registered.auth)
+    assert back.json()["understood"]["occasion"] == "office_casual", (
+        "deleting an alias must restore the built-in answer, not leave a hole"
+    )
+
+
+@pytest.mark.asyncio
+async def test_two_names_differing_only_in_case_collide(api, registered) -> None:
+    """The unique index is on (user_id, lower(name)) because the intent matcher
+    lower-cases before comparing — a second alias differing only in case could
+    never win a lookup, so accepting it would create a row that does nothing."""
+    body = {"name": "Farmhouse Haldi", "base_occasion": "mehendi"}
+    first = await api.post("/me/occasions", json=body, headers=registered.auth)
+    assert first.status_code == 201
+    clash = await api.post(
+        "/me/occasions",
+        json={"name": "farmhouse haldi", "base_occasion": "mehendi"},
+        headers=registered.auth,
+    )
+    assert clash.status_code == 409, "a user-fixable collision is a 409, not a 500"
+
+
+@pytest.mark.asyncio
+async def test_a_formality_override_reaches_the_scorer(api, registered) -> None:
+    """Without overrides this is just a nickname. What people mean by "my own
+    occasion" is usually a calibration — "my office is dressier than yours" —
+    and formality is the knob `resolve_context` reads.
+
+    `wfh` has `formality_target: 1` in the taxonomy, so an override to 2 is
+    only observable if it actually replaced the resolved target.
+    """
+    created = await api.post(
+        "/me/occasions",
+        json={"name": "Friday standup", "base_occasion": "wfh", "formality_override": 2},
+        headers=registered.auth,
+    )
+    assert created.status_code == 201
+
+    reply = await api.post(
+        "/chat", json={"message": "friday standup in an hour"}, headers=registered.auth
+    )
+    body = reply.json()
+    assert body["understood"]["occasion"] == "wfh"
+    assert body["context"]["formality_target"] == 2, "the override must replace the base target"
+
+
+@pytest.mark.asyncio
+async def test_an_out_of_range_formality_is_refused(api, registered) -> None:
+    """A target no garment can satisfy presents to the user as "no outfits"
+    with no reason given, which is the least debuggable screen in the product.
+    Refused at the edge instead."""
+    r = await api.post(
+        "/me/occasions",
+        json={"name": "very formal", "base_occasion": "wfh", "formality_override": 9},
+        headers=registered.auth,
+    )
+    assert r.status_code == 422

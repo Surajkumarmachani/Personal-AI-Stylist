@@ -185,10 +185,125 @@ export async function login(email: string, password: string) {
   return body;
 }
 
+export type HomeLocation = {
+  place: string | null;
+  latitude: number | null;
+  longitude: number | null;
+  timezone: string | null;
+  /** Stated by the server. Do not infer it from `place` being non-null —
+   *  the coordinates are what drive the forecast, and only the server knows
+   *  whether they are set. */
+  weather_is_real?: boolean;
+};
+
+export type LocationChoice = HomeLocation & {
+  /** Same-named cities the geocoder also matched, so a wrong resolution is
+   *  correctable. "Bangalore" resolves ONLY to Bangalore Town, Sindh,
+   *  Pakistan — the Indian city is indexed as Bengaluru — so this list is
+   *  the difference between a visible mistake and a silently wrong forecast. */
+  alternatives: { place: string; index: number }[];
+};
+
+export async function getLocation(): Promise<HomeLocation> {
+  const res = await authedFetch(`${API_BASE}/me/location`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as HomeLocation;
+}
+
+export async function setLocation(place: string, choice = 0): Promise<LocationChoice> {
+  const res = await authedFetch(`${API_BASE}/me/location`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ place, choice }),
+  });
+  if (!res.ok) {
+    // 404 is a typo and 503 is the provider; the two need different advice,
+    // so the status is carried rather than flattened to "failed".
+    const detail = await res.text();
+    throw new Error(
+      res.status === 404
+        ? `No city matched that. Check the spelling — some cities are indexed under another name (Bengaluru, not Bangalore).`
+        : res.status === 503
+          ? `Couldn't look that up right now. Try again in a moment.`
+          : `HTTP ${res.status} ${detail.slice(0, 120)}`,
+    );
+  }
+  return (await res.json()) as LocationChoice;
+}
+
+export async function clearLocation(): Promise<void> {
+  const res = await authedFetch(`${API_BASE}/me/location`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+export type CustomOccasion = {
+  id: string;
+  name: string;
+  base_occasion: string;
+  formality_override: number | null;
+  dress_code_override: string | null;
+};
+
+export async function listCustomOccasions(): Promise<{ items: CustomOccasion[] }> {
+  const res = await authedFetch(`${API_BASE}/me/occasions`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as { items: CustomOccasion[] };
+}
+
+export async function createCustomOccasion(
+  name: string,
+  baseOccasion: string,
+  formality?: number | null,
+): Promise<CustomOccasion> {
+  const res = await authedFetch(`${API_BASE}/me/occasions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      name,
+      base_occasion: baseOccasion,
+      formality_override: formality ?? null,
+    }),
+  });
+  if (!res.ok) {
+    // 409 is a name you already used and 400 is an unknown base — different
+    // fixes, so they get different sentences rather than "failed".
+    const detail = await res.text();
+    throw new Error(
+      res.status === 409
+        ? `You already have an occasion called "${name}".`
+        : res.status === 400
+          ? `That base occasion isn't one the scorer knows.`
+          : `HTTP ${res.status} ${detail.slice(0, 100)}`,
+    );
+  }
+  return (await res.json()) as CustomOccasion;
+}
+
+export async function deleteCustomOccasion(id: string): Promise<void> {
+  const res = await authedFetch(`${API_BASE}/me/occasions/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
 export async function listGarments(): Promise<Garment[]> {
   return json<Garment[]>(
     await authedFetch(`${API_BASE}/garments`, { cache: "no-store" }),
   );
+}
+
+export type RemoveResult = {
+  garment_id: string;
+  removed: boolean;
+  already_removed: boolean;
+  outfits_pruned?: number;
+  /** The row is retired; the photograph is NOT deleted. Full erasure is
+   *  DELETE /me. The UI must not claim more than this. */
+  photo_retained: boolean;
+};
+
+export async function removeGarment(id: string): Promise<RemoveResult> {
+  const res = await authedFetch(`${API_BASE}/garments/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as RemoveResult;
 }
 
 export async function presign(contentType: string): Promise<PresignResponse> {
@@ -544,6 +659,9 @@ export type EvalItem = {
   fields: EvalField[];
   climate_bands: string[];
   tag_source: string;
+  // The model that tagged THIS row, from `model_calls`. null = tagged before
+  // the ledger existed, or a cache hit that skipped it.
+  tagged_by: string | null;
   tag_is_real: boolean;
   tag_degraded: boolean;
   tag_reason: string | null;
@@ -568,6 +686,13 @@ export type EvalPage = {
   // different facts and must not collapse into false.
   tagging_is_mock: boolean | null;
   tagging_config_disagrees: boolean;
+  // The models that actually tagged the rows ON THIS PAGE, most-common first.
+  // A page-level banner cannot answer a per-row question ("which model made
+  // this tag"), but it can answer this one, and the per-row label carries the
+  // rest. Before this, the banner asserted every row came from the last call's
+  // model, which was wrong about four of nine rows on a real account.
+  tagging_models_on_page: { model: string; garments: number }[];
+  tagging_mixed_on_page: boolean;
 };
 
 export async function evalView(opts: {
@@ -652,6 +777,18 @@ export type ChatGarment = {
 export type ChatOutfit = {
   garments: ChatGarment[];
   score: number;
+  /** 1-based preference order, stated by the server. Do NOT recompute from
+   *  array position: screens that filter or re-sort would renumber the
+   *  ranking into nonsense, and only the server knows the real order. */
+  rank?: number | null;
+  /** Where the SCORER put it, before the bandit's exploration reshuffled the
+   *  list. When this differs from `rank`, the card is being shown higher (or
+   *  lower) than predicted on purpose, and the UI says so rather than
+   *  claiming the scorer's endorsement. */
+  predicted_rank?: number | null;
+  // The outfit's identity. Required to request a try-on or a board — without
+  // it the Try On button has nothing to ask for.
+  garment_set_hash?: string | null;
   rationale?: string | null;
   informative_weight?: number | null;
   score_breakdown?: Record<string, unknown> | null;
