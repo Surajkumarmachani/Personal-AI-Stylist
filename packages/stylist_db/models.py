@@ -100,6 +100,10 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True)
     password_hash: Mapped[str] = mapped_column(Text, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="true")
+    # Grants /ops, which serves CROSS-TENANT aggregates through SECURITY
+    # DEFINER functions. Set by SQL only — no endpoint grants it, because
+    # an API that can escalate its own callers defeats the boundary.
+    is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
@@ -117,6 +121,9 @@ class UserProfile(Base):
     # timestamp is a home address; 2dp is ~1.1km, which is all a forecast needs.
     # The city label behind the coordinates below. Shown back to the user so
     # a wrong geocode is visible — see migration 0017 for the Bangalore case.
+    # Profile picture, under its own `avatars/` prefix — see migration 0020
+    # for why it is not filed with body photos or garment originals.
+    avatar_key: Mapped[str | None] = mapped_column(String(512))
     home_place: Mapped[str | None] = mapped_column(String(160))
     home_lat_2dp: Mapped[float | None] = mapped_column(Numeric(5, 2))
     home_lon_2dp: Mapped[float | None] = mapped_column(Numeric(5, 2))
@@ -200,6 +207,10 @@ class Garment(Base):
     # ---- Phase 5 ---------------------------------------------------------
     # Laundry state. Phase 6's suggester excludes what is in the basket.
     needs_wash: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default="false")
+    # FREE TEXT, user-entered, not scored. See migration 0021 for why
+    # these two are not taxonomy enums like every other descriptive field.
+    brand: Mapped[str | None] = mapped_column(String(80))
+    size_label: Mapped[str | None] = mapped_column(String(40))
     # Minor units (paise), never a float: cost-per-wear divides this, and
     # binary floating point accumulates error across a wardrobe.
     purchase_price_minor: Mapped[int | None] = mapped_column(BigInteger, nullable=True)

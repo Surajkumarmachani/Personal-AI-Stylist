@@ -412,3 +412,65 @@ async def test_an_unlisted_origin_gets_no_allow_origin_header(api: AsyncClient) 
         },
     )
     assert resp.headers.get("access-control-allow-origin") is None, dict(resp.headers)
+
+
+# ------------------------------------------------------------ admin boundary
+#
+# `/ops` serves CROSS-TENANT aggregates through SECURITY DEFINER functions
+# that deliberately bypass RLS. `routers/ops.py` had said since Phase 5 that it
+# "belongs behind an admin authorisation boundary rather than a user token";
+# migration 0019 built it. These tests are what stop it being removed by
+# accident, because nothing else would notice.
+
+
+async def test_ops_is_refused_to_an_ordinary_account(api, registered) -> None:
+    """The gap this closes: any registered user could read the whole
+    deployment's ingest funnel, latency, DLQ depth and model spend."""
+    for path in ("/ops/alerts", "/ops/dashboards", "/ops/rerank"):
+        resp = await api.get(path, headers=registered.auth)
+        assert resp.status_code == 403, f"{path} must not answer an ordinary account"
+
+
+async def test_tenant_scoped_ops_stays_open(api, registered) -> None:
+    """`/ops/correction-rate` is deliberately tenant-scoped — it reports on the
+    caller's OWN garments — so gating it would remove a legitimate feature in
+    the name of a boundary it does not need."""
+    resp = await api.get("/ops/correction-rate", headers=registered.auth)
+    assert resp.status_code == 200
+
+
+async def test_admin_is_not_grantable_through_the_api(api, registered) -> None:
+    """An API that can escalate its own callers defeats the boundary entirely:
+    compromise one account, call one endpoint, read everyone's data. There is
+    no such endpoint, and this asserts it stays that way."""
+    paths = [r.path for r in api._transport.app.routes if hasattr(r, "path")]  # type: ignore[attr-defined]
+    grants = [p for p in paths if "admin" in p.lower()]
+    assert not grants, f"no route may grant admin; found {grants}"
+
+
+async def test_put_survives_a_browser_preflight(api) -> None:
+    """CORS must allow every method the UI actually uses.
+
+    PUT was missing from `allow_methods`, and the failure was invisible from
+    the server side: a browser preflights PUT, gets 400 "Disallowed CORS
+    method", and `fetch` throws "Failed to fetch" — a network error with no
+    status, no body and NOTHING in the API log, because the request the app
+    cared about was never made.
+
+    Every PUT endpoint therefore passed its own tests (httpx does not
+    preflight) and was dead in the browser: `PUT /me/location` silently never
+    saved a city, and `PUT /me/avatar` reported "Failed to fetch".
+
+    Asserted per METHOD rather than by reading the header, so adding a route
+    with a method nobody allowed fails here instead of in someone's browser.
+    """
+    for method in ("GET", "POST", "PUT", "PATCH", "DELETE"):
+        resp = await api.options(
+            "/me/avatar",
+            headers={
+                "Origin": "http://localhost:3100",
+                "Access-Control-Request-Method": method,
+                "Access-Control-Request-Headers": "authorization,content-type",
+            },
+        )
+        assert resp.status_code == 200, f"{method} is refused by the CORS preflight"

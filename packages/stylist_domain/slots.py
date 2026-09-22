@@ -93,6 +93,18 @@ def evaluate(items: tuple[OutfitItem, ...] | list[OutfitItem]) -> RuleResult:
         if count != 1:
             violations.append(f"needs exactly one {slot} (has {count})")
 
+    # ---- prefer_one: at most one, never required ------------------------
+    #
+    # Checked like `at_most_one` on purpose. Whether the slot SHOULD have been
+    # filled is a question about the wardrobe, which `evaluate` cannot see —
+    # it takes a list of garments, not a pool. The generator is what knows
+    # there were shoes available and used them; this only enforces that an
+    # outfit never carries two pairs.
+    for slot in rules.get("prefer_one", []):
+        count = slots.get(slot, 0)
+        if count > 1:
+            violations.append(f"at most one {slot} (has {count})")
+
     # ---- at_most_one: optional, never doubled --------------------------
     for slot in rules.get("at_most_one", []):
         count = slots.get(slot, 0)
@@ -131,14 +143,37 @@ def evaluate(items: tuple[OutfitItem, ...] | list[OutfitItem]) -> RuleResult:
 
 
 def required_slots() -> tuple[str, ...]:
-    """Slots an outfit cannot be assembled without.
+    """Slots an outfit genuinely cannot be assembled without.
 
-    Used by the candidate generator to fail fast: a wardrobe with no `feet`
-    item can produce no valid outfit at all, and discovering that after
-    scoring 400 candidates is wasted work.
+    EMPTY NOW, and that is the point. `feet` used to be here, which meant a
+    wardrobe with no catalogued footwear produced zero outfits — see
+    `preferred_slots`. The function stays because `exactly_one_of` (the base
+    structure) is still mandatory and a future rule may want this tier again;
+    an empty tuple is a real answer, not a stub.
     """
     rules = load_taxonomy().raw["outfit_rules"]
     return tuple(rules.get("exactly_one", []))
+
+
+def preferred_slots() -> tuple[str, ...]:
+    """Slots to fill WHENEVER the wardrobe can, without which an outfit is
+    still valid.
+
+    The middle tier between required and optional, and both neighbours are
+    wrong for footwear:
+
+      required   a wardrobe with no shoes produced NOTHING. Correct about
+                 dressing, wrong about software — someone who has catalogued
+                 six shirts and no shoes has told us plenty.
+      optional   shoes become merely allowed, so a shoeless outfit can
+                 outrank a shod one for someone who owns shoes. The generator
+                 would sometimes not bother.
+
+    Preferred means: include one if there is one, never two, and never fail
+    for want of it.
+    """
+    rules = load_taxonomy().raw["outfit_rules"]
+    return tuple(rules.get("prefer_one", []))
 
 
 def base_structures() -> tuple[tuple[str, ...], ...]:

@@ -19,6 +19,7 @@ from sqlalchemy.exc import InterfaceError, OperationalError
 from stylist_api.middleware import RequestOutcomeMiddleware
 from stylist_api.routers import (
     auth,
+    avatar,
     boards,
     calendar,
     chat,
@@ -144,7 +145,19 @@ def create_app() -> FastAPI:
         # cookie, so credentialed CORS buys nothing — and turning it on would
         # forbid the wildcard some deploy is bound to reach for later.
         allow_credentials=False,
-        allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+        # PUT was MISSING, and its absence was invisible from the server side.
+        # A browser preflights `PUT` and gets 400 "Disallowed CORS method", so
+        # `fetch` throws "Failed to fetch" — a network error with no status,
+        # no response body and nothing in the API log, because the request the
+        # app cared about was never made. Every PUT endpoint therefore worked
+        # perfectly when called with curl or httpx and failed from the UI:
+        # `PUT /me/location` (your city) and `PUT /me/avatar` were both dead in
+        # the browser while their tests passed.
+        #
+        # Listed explicitly rather than switched to ["*"]: the wildcard would
+        # have hidden this class of bug forever, and the point of enumerating
+        # methods is to notice when a new one is added.
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         # Idempotency-Key is required on ingest, so it MUST be allowed here or
         # every upload preflight fails while auth appears to work.
         allow_headers=["Authorization", "Content-Type", "Idempotency-Key"],
@@ -152,6 +165,7 @@ def create_app() -> FastAPI:
 
     app.include_router(health.router)
     app.include_router(auth.router)
+    app.include_router(avatar.router)
     app.include_router(garments.router)
     app.include_router(jobs.router)
     app.include_router(corrections.router)

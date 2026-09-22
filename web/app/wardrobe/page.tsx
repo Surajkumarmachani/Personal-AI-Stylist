@@ -13,7 +13,16 @@ import Shell from "../Shell";
 import SignIn from "../SignIn";
 import AddGarments from "../AddGarments";
 import GarmentEditor from "../GarmentEditor";
-import { listGarments, removeGarment, type Garment } from "@/lib/api";
+import {
+  listGarments,
+  logWear,
+  pendingDuplicates,
+  removeGarment,
+  resolveDuplicate,
+  setLaundry,
+  type DuplicatePair,
+  type Garment,
+} from "@/lib/api";
 import { restoreSession } from "../session";
 import "../ui.css";
 
@@ -62,6 +71,15 @@ export default function WardrobePage() {
   // waiting to happen. Only one card can be armed at a time.
   const [armed, setArmed] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  // Free-text filter over what is already loaded. NOT `GET /wardrobe/search`:
+  // that endpoint does semantic search across the whole wardrobe and belongs
+  // on a screen of its own; this is the "where is my black shirt" filter on a
+  // grid the user is already looking at, and a round trip per keystroke would
+  // be slower and worse.
+  const [q, setQ] = useState("");
+  const [dupes, setDupes] = useState<DuplicatePair[]>([]);
+  const [acting, setActing] = useState<string | null>(null);
+  const [toast, setToast] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
 
   useEffect(() => {
@@ -70,7 +88,14 @@ export default function WardrobePage() {
       .finally(() => setChecking(false));
   }, []);
   useEffect(() => {
-    if (email) listGarments().then(setItems).catch((e) => setErr(String(e)));
+    if (!email) return;
+    listGarments().then(setItems).catch((e) => setErr(String(e)));
+    // The pipeline flags near-identical uploads and parks them as
+    // `duplicate_suspect`, which EXCLUDES them from every suggestion until
+    // someone resolves the pair. That queue only existed in the build
+    // console, so a user's wardrobe could quietly hold items nothing would
+    // ever suggest.
+    pendingDuplicates().then((r) => setDupes(r.items)).catch(() => undefined);
   }, [email]);
 
   const counts = useMemo(() => {
@@ -82,10 +107,62 @@ export default function WardrobePage() {
     return c;
   }, [items]);
 
-  const shown = useMemo(
-    () => (tab === "all" ? items : items.filter((g) => categoryOf(g.slot) === tab)),
-    [items, tab],
-  );
+  const shown = useMemo(() => {
+    const byTab = tab === "all" ? items : items.filter((g) => categoryOf(g.slot) === tab);
+    const needle = q.trim().toLowerCase();
+    if (!needle) return byTab;
+    // Matches subcategory, colour and slot — the three things written on a
+    // card — so what the user searches for is what they can see.
+    return byTab.filter((g) =>
+      // Brand and size are searchable BECAUSE they are on the card: what the
+      // user can read, the filter should match.
+      [g.subcategory, g.primary_colour, g.slot, g.brand, g.size_label]
+        .filter(Boolean)
+        .some((v) => String(v).toLowerCase().replace(/_/g, " ").includes(needle)),
+    );
+  }, [items, tab, q]);
+
+  async function wore(g: Garment) {
+    if (acting) return;
+    setActing(g.id);
+    setErr(null);
+    try {
+      await logWear(g.id);
+      setToast(`Logged a wear for ${g.subcategory ?? "that"}.`);
+      setItems(await listGarments());
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setActing(null);
+    }
+  }
+
+  async function toggleWash(g: Garment) {
+    if (acting) return;
+    setActing(g.id);
+    setErr(null);
+    try {
+      await setLaundry(g.id, !g.needs_wash);
+      setItems(await listGarments());
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setActing(null);
+    }
+  }
+
+  async function resolve(id: string, resolution: "same" | "different") {
+    setActing(id);
+    try {
+      await resolveDuplicate(id, resolution);
+      setDupes((d) => d.filter((x) => x.garment_id !== id));
+      setItems(await listGarments());
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setActing(null);
+    }
+  }
 
   async function remove(id: string) {
     setRemoving(id);
@@ -130,6 +207,14 @@ export default function WardrobePage() {
         />
       ) : null}
 
+      <input
+        value={q}
+        onChange={(e) => setQ(e.target.value)}
+        placeholder="Filter — black shirt, Levi\u2019s, size M…"
+        aria-label="Filter your wardrobe"
+        style={{ width: "100%", marginBottom: 12, fontSize: 13 }}
+      />
+
       <div className="ui-pills" style={{ marginBottom: 22 }}>
         {TABS.map((t) => (
           <button
@@ -143,6 +228,45 @@ export default function WardrobePage() {
         ))}
       </div>
 
+      {dupes.length > 0 ? (
+        <div className="ui-panel" style={{ marginBottom: 18 }}>
+          <h2 className="ui-h3">
+            {dupes.length} possible duplicate{dupes.length > 1 ? "s" : ""}
+          </h2>
+          <p className="ui-sub" style={{ marginBottom: 10 }}>
+            These are parked as <code>duplicate_suspect</code>, which excludes them from every
+            suggestion until you say. Resolving them is the only way they come back.
+          </p>
+          {dupes.map((d) => (
+            <div
+              key={d.garment_id}
+              style={{ display: "flex", gap: 10, alignItems: "center", marginTop: 8, flexWrap: "wrap" }}
+            >
+              <span className="ui-sub">
+                <b style={{ color: "var(--ink)" }}>{d.subcategory ?? "item"}</b>{" "}
+                ({d.primary_colour ?? "?"}) vs {d.duplicate_of?.subcategory ?? "an earlier item"}
+              </span>
+              <button
+                className="ui-btn"
+                disabled={acting === d.garment_id}
+                onClick={() => void resolve(d.garment_id, "different")}
+              >
+                Different items
+              </button>
+              <button
+                className="ui-btn"
+                disabled={acting === d.garment_id}
+                onClick={() => void resolve(d.garment_id, "same")}
+                title="Merges the wear history onto the original and retires this one"
+              >
+                Same thing — merge
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : null}
+
+      {toast ? <p className="ui-sub" style={{ color: "var(--ok)" }}>{toast}</p> : null}
       {err ? <p className="ui-err">{err}</p> : null}
 
       {editing ? (
@@ -181,6 +305,15 @@ export default function WardrobePage() {
                   {g.subcategory ?? g.slot ?? "unidentified"}
                 </span>
                 <p className="ui-sub">{g.primary_colour ?? "colour pending"}</p>
+                {/* Shown only when set. An empty "brand: —" on every card is
+                    noise for the many wardrobes that will never fill these in. */}
+                {g.brand || g.size_label ? (
+                  <p className="ui-sub" style={{ fontSize: 11.5 }}>
+                    {[g.brand, g.size_label && `size ${g.size_label}`]
+                      .filter(Boolean)
+                      .join(" · ")}
+                  </p>
+                ) : null}
                 {/* Named, not an icon. "Edit" next to the slot is what tells
                     the user the SLOT is the thing they can change — the field
                     most worth correcting, because a wrong slot silently
@@ -188,8 +321,45 @@ export default function WardrobePage() {
                 <p className="ui-sub" style={{ fontSize: 11.5, opacity: 0.75 }}>
                   {g.slot ?? "slot unknown"} · Edit
                 </p>
-                {/* stopPropagation, or removing a garment also opens the
-                    editor for the row that is about to disappear. */}
+                {/* THE THREE ACTIONS THAT WERE ONLY IN THE BUILD CONSOLE.
+                    Each stops propagation, or it would also open the tag
+                    editor for the card being acted on. */}
+                <div style={{ display: "flex", gap: 6, marginTop: 8, flexWrap: "wrap" }}>
+                  <button
+                    className="ui-btn"
+                    style={{ fontSize: 11.5, padding: "4px 9px" }}
+                    disabled={acting === g.id}
+                    title="Log that you wore this today — feeds novelty and your style vector"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void wore(g);
+                    }}
+                  >
+                    {acting === g.id ? "…" : "Wore it"}
+                    {g.wear_count ? ` · ${g.wear_count}` : ""}
+                  </button>
+                  <button
+                    className="ui-btn"
+                    style={{
+                      fontSize: 11.5,
+                      padding: "4px 9px",
+                      color: g.needs_wash ? "var(--bad, #b4232a)" : undefined,
+                    }}
+                    disabled={acting === g.id}
+                    aria-pressed={g.needs_wash}
+                    title={
+                      g.needs_wash
+                        ? "In the wash — excluded from every suggestion. Tap when clean."
+                        : "Mark as in the wash"
+                    }
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void toggleWash(g);
+                    }}
+                  >
+                    {g.needs_wash ? "In the wash" : "Wash"}
+                  </button>
+                </div>
                 <button
                   className="ui-btn"
                   style={{
@@ -219,9 +389,13 @@ export default function WardrobePage() {
         </div>
       )}
 
+      {/* This used to say sizes and brands did not exist. They do now — but
+          the honest half of that old note still holds and is kept: they are
+          NOT guessed from your photos, and they do not steer suggestions. */}
       <div className="ui-unavailable" style={{ marginTop: 22 }}>
-        <b>No sizes or brands.</b> The taxonomy records slot, colour, pattern, material, fit and
-        formality — it has no size or brand field, so neither is shown rather than invented.
+        <b>Brand and size are yours to fill in.</b> Tap a garment to add them. They are never
+        read from a photo — a logo guessed wrong is worse than a blank — and they do not affect
+        which outfits are suggested, only what you can search and see.
       </div>
     </Shell>
   );

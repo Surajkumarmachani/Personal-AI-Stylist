@@ -54,7 +54,7 @@ from stylist_suggest import (
     rerank,
     suggest,
 )
-from stylist_suggest.pipeline import load_style_vector
+from stylist_suggest.pipeline import CandidatePool, load_style_vector
 from stylist_worker.trends import load_trends
 
 logger = logging.getLogger(__name__)
@@ -64,6 +64,11 @@ router = APIRouter(tags=["suggestions"])
 # Default when the caller gives no weather. Not a forecast — an honest
 # mid-scale placeholder, reported in the response as `weather_source`.
 DEFAULT_FEELS_LIKE_C = 26.0
+
+# Used only when the occasion was neither requested NOR derivable from a
+# calendar. Named rather than inline so the response can say `default` and
+# mean something specific.
+DEFAULT_OCCASION = "casual_outing"
 
 
 async def _persist_live_outfits(user_id: Any, ctx: Any, rows: list[dict[str, Any]]) -> None:
@@ -195,6 +200,42 @@ async def _resolve_weather(
     )
 
 
+async def _occasion_from_calendar(
+    db: Any, settings: Any, user: Any
+) -> tuple[str | None, str | None, int | None]:
+    """(occasion, why, events_seen) from today's calendar, or (None, None, None).
+
+    CONFIDENT MATCHES ONLY. `classify` reports `confident` as its own flag
+    precisely so a caller does not have to know the threshold, and an
+    unconfident classification is a guess — which is what this is here to
+    avoid. An unconfident day falls through to the ordinary default rather
+    than dressing someone for a meeting the rules were unsure about.
+
+    `why` is the classifier's own explanation, which names the RULE PHRASE it
+    matched ("Matched 'client meeting'") and never the event title. That
+    distinction is load-bearing: the calendar panel promises the user that
+    titles are never sent to this app, and a reason line that quoted their
+    diary would break that promise in the one place they would notice.
+    """
+    from stylist_api.routers.calendar import today as calendar_today
+
+    try:
+        result = await calendar_today(user=user, db=db, settings=settings)
+    except Exception:
+        # No link, revoked token, Google down — none of them are reasons to
+        # fail a suggestion request. Fall through to the default.
+        logger.info("calendar unavailable for occasion resolution", exc_info=True)
+        return None, None, None
+
+    if not result.get("confident") or result.get("is_fallback"):
+        return None, None, result.get("events_seen")
+    return (
+        str(result["occasion"]),
+        str(result.get("explanation") or ""),
+        result.get("events_seen"),
+    )
+
+
 @router.get("/suggestions")
 async def get_suggestions(
     user: CurrentUser,
@@ -203,7 +244,14 @@ async def get_suggestions(
     settings: SettingsDep,
     gateway: LiteLLMDep,
     cache: CacheRedisDep,
-    occasion: Annotated[str, Query()] = "casual_outing",
+    # OPTIONAL, and omitting it now means "work it out". It used to default
+    # silently to `casual_outing`, which is the exact move `resolve_context`
+    # refuses to make on the caller's behalf: dressing someone for a casual
+    # outing when they never said so is confidently answering a question they
+    # did not ask. With a calendar connected there is real evidence to use
+    # instead of a guess; without one, the honest default is still casual and
+    # the response SAYS which of the two happened.
+    occasion: Annotated[str | None, Query()] = None,
     feels_like_c: Annotated[float | None, Query(ge=-30, le=60)] = None,
     precip_probability: Annotated[float, Query(ge=0, le=1)] = 0.0,
     wind_kmh: Annotated[float, Query(ge=0, le=200)] = 0.0,
@@ -225,6 +273,20 @@ async def get_suggestions(
     dress_code_override: str | None = None,
 ) -> dict[str, Any]:
     taxonomy = load_taxonomy()
+
+    # WHERE THE OCCASION CAME FROM, carried into the response. A user looking
+    # at an outfit they did not ask for is entitled to know what it was
+    # dressed for and why.
+    occasion_source = "requested"
+    occasion_reason: str | None = None
+    events_seen: int | None = None
+    if occasion is None:
+        from_calendar, why, events_seen = await _occasion_from_calendar(db, settings, user)
+        if from_calendar:
+            occasion, occasion_source, occasion_reason = from_calendar, "calendar", why
+        else:
+            occasion, occasion_source = DEFAULT_OCCASION, "default"
+
     if occasion not in {o["id"] for o in taxonomy.raw["occasions"]}:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -262,6 +324,10 @@ async def get_suggestions(
 
     served_from = "materialised"
     rows: list[dict[str, Any]] = []
+    # None on the materialised path, which reads precomputed rows and never
+    # builds a pool. Declared here so the notes below can be collected without
+    # either branch having to remember to.
+    pool: CandidatePool | None = None
 
     if not force_live:
         result = await db.execute(
@@ -321,6 +387,9 @@ async def get_suggestions(
                 "outfits": [],
                 "served_from": served_from,
                 "context": _context_payload(ctx, weather_source),
+        "occasion_source": occasion_source,
+        "occasion_reason": occasion_reason,
+        "calendar_events_seen": events_seen,
                 # WHY it is empty, not just that it is. "No suggestions" with
                 # no reason is the least actionable screen in the product.
                 "notes": pool.notes
@@ -369,12 +438,24 @@ async def get_suggestions(
                 "outfits": [],
                 "served_from": served_from,
                 "context": _context_payload(ctx, weather_source),
+        "occasion_source": occasion_source,
+        "occasion_reason": occasion_reason,
+        "calendar_events_seen": events_seen,
                 "notes": pool.notes
                 or ["no outfit satisfied your preferences and today's slot rules"],
             }
 
     ranking_source = "deterministic"
     reject_rule: str | None = None
+    # POOL NOTES SURVIVE A SUCCESSFUL RESPONSE.
+    #
+    # They were returned only from the two EMPTY branches, so "no wearable
+    # feet — these outfits are shown without one" was dropped in exactly the
+    # case it describes: outfits exist, and the user is looking at shoeless
+    # ones with no explanation. `pool` is bound only on the live path (the
+    # materialised path reads precomputed rows and never builds one), so this
+    # collects what there is rather than assuming.
+    pool_notes: list[str] = list(pool.notes) if pool is not None else []
     rerank_notes: list[str] = []
 
     if rerank_enabled and outfits:
@@ -493,7 +574,12 @@ async def get_suggestions(
         "ranking_source": ranking_source,
         "validator_reject_rule": reject_rule,
         "context": _context_payload(ctx, weather_source),
-        "notes": rerank_notes,
+        "occasion_source": occasion_source,
+        "occasion_reason": occasion_reason,
+        "calendar_events_seen": events_seen,
+        # Pool notes first: "these outfits have no shoes" is about the
+        # OUTFITS, where a reranker note is about how they were ordered.
+        "notes": [*pool_notes, *rerank_notes],
     }
 
 

@@ -56,7 +56,19 @@ CORRECTABLE: dict[str, str | None] = {
     "dress_code": "dress_code",
     "formality": None,
     "warmth": None,
+    # FREE TEXT, and the only two fields here that are. Every other entry is
+    # held to a taxonomy enum because the VLM produces it and a value outside
+    # the vocabulary is a bug. These are typed by the user, about their own
+    # clothes, and there is no closed list of brands or a single size system —
+    # see migration 0021.
+    "brand": None,
+    "size_label": None,
 }
+
+# Length caps matching the columns. Not validation of CONTENT — there is
+# nothing to validate a brand against — but a bound, so a paste of a whole
+# webpage is a 400 rather than a database error.
+FREE_TEXT_LIMITS: dict[str, int] = {"brand": 80, "size_label": 40}
 
 
 class CorrectionRequest(BaseModel):
@@ -103,6 +115,20 @@ def _validate_value(field_name: str, value: Any) -> Any:
         "fit": taxonomy.fits,
         "dress_code": taxonomy.dress_codes,
     }
+    if field_name in FREE_TEXT_LIMITS:
+        text_value = str(value).strip()
+        if not text_value:
+            # Clearing is a legitimate correction: "I was wrong, I don't know
+            # the brand". Stored as NULL rather than an empty string so the UI
+            # has one falsy state to render, not two.
+            return None
+        if len(text_value) > FREE_TEXT_LIMITS[field_name]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"{field_name} must be at most {FREE_TEXT_LIMITS[field_name]} characters",
+            )
+        return text_value
+
     if field_name in allowed:
         if value not in allowed[field_name]:
             raise HTTPException(
@@ -255,6 +281,7 @@ async def garment_detail(garment_id: uuid.UUID, user: CurrentUser, db: TenantDB)
             """
             SELECT id, slot, subcategory, primary_colour, secondary_colour,
                    pattern, material, fit, dress_code, formality, warmth,
+                   brand, size_label,
                    state, needs_review, cutout_key, field_confidence,
                    user_verified_fields, extractor_version, moderation,
                    -- Phase 5: the correction UI shows laundry state and any

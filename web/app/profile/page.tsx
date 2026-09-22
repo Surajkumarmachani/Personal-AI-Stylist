@@ -17,7 +17,11 @@
 
 import { useEffect, useState } from "react";
 import Shell from "../Shell";
+import AvatarUpload from "../AvatarUpload";
 import HomeCity from "../HomeCity";
+import CalendarConnect from "../CalendarConnect";
+import PushNotifications from "../PushNotifications";
+import PrivacyControls from "../PrivacyControls";
 import SignIn from "../SignIn";
 import {
   addPreference,
@@ -98,9 +102,17 @@ export default function ProfilePage() {
         <p className="ui-sub">{email}</p>
       </div>
 
+      <AvatarUpload email={email} />
+
       <div style={{ marginBottom: 18 }}>
         <HomeCity />
       </div>
+
+      <CalendarConnect />
+
+      <PushNotifications />
+
+      <PrivacyControls email={email} />
 
       <div className="ui-panel" style={{ marginBottom: 18 }}>
         <h2 className="ui-h3">Preferred colours</h2>

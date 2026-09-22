@@ -23,6 +23,7 @@ from typing import Any
 
 import pytest
 import pytest_asyncio
+import sqlalchemy as sa
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -312,6 +313,35 @@ async def registered(api):
     tenant.token = token  # type: ignore[attr-defined]
     tenant.auth = auth  # type: ignore[attr-defined]
     return tenant
+
+
+@pytest_asyncio.fixture
+async def admin(api, owner_engine):
+    """An authenticated account with `is_admin`.
+
+    `/ops` serves CROSS-TENANT aggregates and is gated by `CurrentAdmin`
+    (migration 0019). Tests about what those endpoints REPORT need an account
+    that can read them; tests about the boundary itself use `registered` and
+    assert 403. Keeping the two fixtures separate is what stops a future
+    change from quietly widening the gate to make a behaviour test pass.
+
+    The flag is set by SQL through the owner engine, deliberately mirroring
+    production: no endpoint grants admin, so no fixture may pretend one does.
+    """
+    email, token = await _register(api)
+    async with owner_engine.begin() as conn:
+        await conn.execute(
+            sa.text("UPDATE users SET is_admin = true WHERE email = :e"), {"e": email}
+        )
+
+    class _Admin:
+        pass
+
+    who = _Admin()
+    who.email = email  # type: ignore[attr-defined]
+    who.token = token  # type: ignore[attr-defined]
+    who.auth = {"Authorization": f"Bearer {token}"}  # type: ignore[attr-defined]
+    return who
 
 
 @pytest_asyncio.fixture

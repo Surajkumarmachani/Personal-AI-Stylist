@@ -94,6 +94,10 @@ class Settings(BaseSettings):
     # Google compares the string, so a trailing slash is a different URI and
     # produces `redirect_uri_mismatch` with no hint about which part differs.
     google_redirect_uri: str = Field(default="http://localhost:8080/calendar/callback")
+    # Where to send the browser AFTER the OAuth callback. Google redirects to
+    # the API, which is not a page anyone should end up looking at — without
+    # this the user finishes a consent flow staring at `{"connected": true}`.
+    web_base_url: str = Field(default="http://localhost:3100")
 
     # ---- push notifications (Phase 8) ----
     # PATH to a Firebase service-account JSON, never the key itself. A

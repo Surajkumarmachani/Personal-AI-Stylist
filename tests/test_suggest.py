@@ -104,11 +104,46 @@ def test_an_empty_wardrobe_yields_nothing_rather_than_raising() -> None:
     assert generate_candidates(CandidatePool(), ctx) == []
 
 
-def test_a_wardrobe_with_no_footwear_produces_no_outfit() -> None:
-    """`feet` is exactly_one in the taxonomy, so this is unsatisfiable."""
+def test_a_wardrobe_with_no_footwear_still_produces_an_outfit() -> None:
+    """`feet` is `prefer_one`, not `exactly_one`.
+
+    THIS TEST ASSERTED THE OPPOSITE, and the old behaviour was defensible
+    about dressing and wrong about software: a wardrobe with no catalogued
+    footwear produced ZERO outfits, not a worse ranking — nothing at all, with
+    "no wearable feet" as the only thing on screen. Someone who has
+    photographed six shirts and no shoes has told us plenty, and answering
+    with an empty screen teaches them the product does not work.
+
+    The pool is unchanged from the original test; only the expectation moved.
+    """
     pool = _pool(g("upper_base", "shirt_oxford"), g("lower", "chinos"))
     ctx = resolve_context(occasion="office_casual", feels_like_c=26.0)
-    assert generate_candidates(pool, ctx) == []
+    candidates = generate_candidates(pool, ctx)
+    assert candidates, "a shirt and trousers is a wearable outfit"
+    assert all(
+        not any(item.slot == "feet" for item in combo) for combo in candidates
+    ), "there is no footwear to include"
+
+
+def test_footwear_is_included_whenever_the_wardrobe_has_any() -> None:
+    """The other half, and the reason `feet` is PREFERRED rather than optional.
+
+    Plain `at_most_one` would let the generator produce shoeless variants
+    alongside shod ones for someone who owns shoes — and a 3-piece outfit can
+    outscore a 4-piece one, so the shoeless variant could rank first. Nobody
+    with shoes in their wardrobe should be shown an outfit without them.
+    """
+    pool = _pool(
+        g("upper_base", "shirt_oxford"),
+        g("lower", "chinos"),
+        g("feet", "oxford_shoes"),
+    )
+    ctx = resolve_context(occasion="office_casual", feels_like_c=26.0)
+    candidates = generate_candidates(pool, ctx)
+    assert candidates
+    assert all(
+        any(item.slot == "feet" for item in combo) for combo in candidates
+    ), "every candidate must be shod when footwear exists"
 
 
 def test_ranking_puts_the_best_score_first() -> None:

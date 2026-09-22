@@ -136,6 +136,16 @@ export type Garment = {
   primary_colour: string | null;
   state: string;
   needs_review: boolean;
+  /** In the wash. A HARD exclusion in the candidate pool, so a garment with
+   *  this set cannot appear in any suggestion — which made "why is my
+   *  favourite shirt never suggested?" unanswerable from the app. */
+  needs_wash: boolean;
+  /** `novelty` is 10% of the outfit score and reads exactly these. */
+  wear_count: number;
+  last_worn: string | null;
+  /** Free text, user-entered, NOT scored and never inferred from a photo. */
+  brand: string | null;
+  size_label: string | null;
   cutout_url: string | null;
   created_at: string;
 };
@@ -281,6 +291,247 @@ export async function createCustomOccasion(
 
 export async function deleteCustomOccasion(id: string): Promise<void> {
   const res = await authedFetch(`${API_BASE}/me/occasions/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+// ------------------------------------------------- insights & privacy
+//
+// These endpoints all existed and NOTHING in the product called them. The
+// style vector and wear-through rate had no screen at all; export and account
+// deletion had no screen either, which for deletion is a compliance gap and
+// not merely a missing feature — the erasure saga is built and audited, and
+// the user has to be able to start it.
+
+export type StyleSummary = {
+  events_applied: number;
+  last_event_id: string | null;
+  alpha: number;
+  dimensions: number;
+  feedback_by_kind: Record<string, number>;
+};
+
+export async function styleSummary(): Promise<StyleSummary> {
+  return json(await authedFetch(`${API_BASE}/me/style`, { cache: "no-store" }));
+}
+
+export type WearThrough = {
+  suggested_outfits: number;
+  worn_outfits: number;
+  wear_through_rate: number | null;
+  window_days: number;
+};
+
+export async function wearThrough(): Promise<WearThrough> {
+  return json(await authedFetch(`${API_BASE}/me/wear-through`, { cache: "no-store" }));
+}
+
+export async function requestExport(): Promise<{ export_id: string; state: string }> {
+  const res = await authedFetch(`${API_BASE}/me/export`, { method: "POST" });
+  if (!res.ok) {
+    // 409 means one is already running — that is not an error to shout about.
+    throw new Error(
+      res.status === 409
+        ? "An export is already being prepared. Check back shortly."
+        : `HTTP ${res.status}`,
+    );
+  }
+  return (await res.json()) as { export_id: string; state: string };
+}
+
+export type ExportStatus = {
+  id: string;
+  state: string;
+  size_bytes: number | null;
+  download_url?: string | null;
+  last_error?: string | null;
+};
+
+export async function exportStatus(id: string): Promise<ExportStatus> {
+  return json(await authedFetch(`${API_BASE}/me/export/${id}`, { cache: "no-store" }));
+}
+
+/** Start the erasure saga. Irreversible.
+ *
+ * `?confirm=DELETE` is required by the API and is NOT a formality the client
+ * should paper over — the endpoint's own comment calls it "one stray request
+ * away from deleting an account". The UI asks for the word too, rather than
+ * sending it on the user's behalf behind a single button. */
+export async function deleteAccount(): Promise<{ state: string }> {
+  const res = await authedFetch(`${API_BASE}/me?confirm=DELETE`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
+  return (await res.json()) as { state: string };
+}
+
+// ------------------------------------------------------------- calendar
+//
+// Five endpoints with real Google OAuth, and nothing in the product called
+// any of them. Note what `/calendar/today` returns: a CLASSIFICATION and a
+// COUNT of events, never the titles — the backend deliberately never sends
+// calendar contents to the client and never stores them.
+
+export type CalendarStatus = {
+  connected: boolean;
+  account_email?: string | null;
+  scope?: string | null;
+  connected_at?: string | null;
+  last_synced_at?: string | null;
+  revoked_at?: string | null;
+};
+
+export type CalendarToday = {
+  occasion: string;
+  dress_code: string | null;
+  formality_target: number | null;
+  confidence: number;
+  /** The gate as its own flag, so the client does not have to know the
+   *  threshold to decide between presenting a finding and a guess. */
+  confident: boolean;
+  is_fallback: boolean;
+  explanation: string;
+  source: string;
+  reconnect_required: boolean;
+  /** A COUNT. The titles are never sent. */
+  events_seen?: number;
+};
+
+export async function calendarStatus(): Promise<CalendarStatus> {
+  return json(await authedFetch(`${API_BASE}/calendar/status`, { cache: "no-store" }));
+}
+
+export async function calendarAuthorizeUrl(): Promise<{ authorize_url: string; scopes: string[] }> {
+  const res = await authedFetch(`${API_BASE}/calendar/connect`, { cache: "no-store" });
+  if (!res.ok) {
+    throw new Error(
+      res.status === 503
+        ? "Calendar isn't configured on this deployment (no Google client id/secret)."
+        : `HTTP ${res.status}`,
+    );
+  }
+  return (await res.json()) as { authorize_url: string; scopes: string[] };
+}
+
+export async function calendarToday(): Promise<CalendarToday> {
+  return json(await authedFetch(`${API_BASE}/calendar/today`, { cache: "no-store" }));
+}
+
+export async function calendarDisconnect(): Promise<{
+  disconnected: boolean;
+  revoked_at_provider: boolean;
+}> {
+  const res = await authedFetch(`${API_BASE}/calendar`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as { disconnected: boolean; revoked_at_provider: boolean };
+}
+
+export type TodaysLook = {
+  outfits: ChatOutfit[];
+  context?: Record<string, unknown> | null;
+  notes?: string[];
+  /** `requested` | `calendar` | `default`. A user looking at an outfit they
+   *  did not ask for is entitled to know what it was dressed for. */
+  occasion_source?: string | null;
+  /** The classifier's own line — names the RULE PHRASE it matched, never the
+   *  event title. The calendar panel promises titles are never sent here. */
+  occasion_reason?: string | null;
+  calendar_events_seen?: number | null;
+};
+
+/** Suggestions with NO occasion named: the server works it out from today's
+ *  calendar, and falls back to casual when there is nothing to go on. */
+export async function todaysLook(limit = 4): Promise<TodaysLook> {
+  return json(
+    await authedFetch(`${API_BASE}/suggestions?limit=${limit}`, { cache: "no-store" }),
+  );
+}
+
+// ------------------------------------------------------------------ ops
+//
+// ADMIN ONLY. These serve CROSS-TENANT aggregates through SECURITY DEFINER
+// functions — the whole deployment's ingest funnel, latency, DLQ depth and
+// model spend. They answered for any logged-in account until migration 0019
+// added `users.is_admin` and a 403.
+
+export type OpsAlert = {
+  alert: string;
+  firing: boolean;
+  [k: string]: unknown;
+};
+
+export async function opsAlerts(): Promise<{ firing: number; alerts: OpsAlert[] }> {
+  return json(await authedFetch(`${API_BASE}/ops/alerts`, { cache: "no-store" }));
+}
+
+export async function opsDashboards(): Promise<Record<string, unknown>> {
+  return json(await authedFetch(`${API_BASE}/ops/dashboards`, { cache: "no-store" }));
+}
+
+export async function opsRerank(): Promise<{ checks: OpsAlert[] }> {
+  return json(await authedFetch(`${API_BASE}/ops/rerank`, { cache: "no-store" }));
+}
+
+// ------------------------------------------------------------------ push
+//
+// The SERVER half has existed since Phase 8 and is scheduled: `hourly_digest`
+// runs every hour and sends only to tenants for whom it is currently 07:00
+// where they are. What was missing was a device to send to — nothing in the
+// product ever called `POST /push/devices`.
+
+export type PushDevice = {
+  id: string;
+  platform: string;
+  timezone: string | null;
+  enabled?: boolean;
+  created_at?: string;
+};
+
+export async function listPushDevices(): Promise<{ devices: PushDevice[] }> {
+  return json(await authedFetch(`${API_BASE}/push/devices`, { cache: "no-store" }));
+}
+
+export async function registerPushDevice(
+  token: string,
+  timezone: string,
+): Promise<{ device_id: string }> {
+  const res = await authedFetch(`${API_BASE}/push/devices`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ token, platform: "web", timezone }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
+  return (await res.json()) as { device_id: string };
+}
+
+export async function disablePushDevices(): Promise<void> {
+  const res = await authedFetch(`${API_BASE}/push/devices`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
+// ---------------------------------------------------------------- avatar
+
+export async function getAvatar(): Promise<{ avatar_url: string | null }> {
+  return json(await authedFetch(`${API_BASE}/me/avatar`, { cache: "no-store" }));
+}
+
+export async function uploadAvatar(file: File): Promise<string> {
+  const pre = await json<PresignResponse>(
+    await authedFetch(`${API_BASE}/me/avatar/presign`, { method: "POST" }),
+  );
+  await uploadToStorage(pre, file);
+  // Committed as a SECOND call, so a pointer is only stored once the bytes
+  // are really there — the server re-checks with a HEAD before saving it.
+  // Otherwise a failed upload leaves the profile pointing at a 404 and the
+  // avatar shows broken forever.
+  const res = await authedFetch(`${API_BASE}/me/avatar`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: pre.key }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
+  return ((await res.json()) as { avatar_url: string }).avatar_url;
+}
+
+export async function clearAvatar(): Promise<void> {
+  const res = await authedFetch(`${API_BASE}/me/avatar`, { method: "DELETE" });
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 

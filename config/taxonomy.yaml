@@ -72,7 +72,24 @@ outfit_rules:
     - [upper_base, lower]         # shirt + trousers, kurta + churidar
     - [full_body]                 # dress, jumpsuit, sherwani, anarkali
 
-  exactly_one:
+  # NOTHING is exactly-one any more. `feet` moved to `prefer_one` below.
+  exactly_one: []
+
+  # PREFER ONE: include exactly one if the wardrobe can supply one, and do not
+  # invalidate the outfit if it cannot.
+  #
+  # `feet` was `exactly_one`, which meant a wardrobe with no catalogued
+  # footwear produced ZERO outfits — not a worse ranking, nothing at all, with
+  # "no wearable feet" as the only explanation. That is correct about dressing
+  # and wrong about software: someone who has photographed six shirts and no
+  # shoes has told us plenty, and answering with an empty screen teaches them
+  # the product does not work.
+  #
+  # It is NOT `at_most_one`, which would make shoes merely allowed and let a
+  # shoeless outfit outrank a shod one for someone who owns shoes. Preferred
+  # means the generator fills it whenever it can; optional would mean it
+  # sometimes does not bother.
+  prefer_one:
     - feet
 
   at_most_one:

@@ -36,6 +36,22 @@ const FIELDS = [
   "warmth",
 ] as const;
 
+/** The two free-text fields — a TEXT INPUT, not a dropdown.
+ *
+ * Every field above is a closed taxonomy vocabulary, so a `<select>` makes a
+ * wrong value impossible. These two have no vocabulary to pick from: there is
+ * no complete list of brands, and no single size system across shirts (M),
+ * trousers (32) and shoes (UK 9 / EU 42). A dropdown here would have to
+ * invent one and would be wrong for most wardrobes.
+ *
+ * Neither is scored — see migration 0021 — and the panel says so, because a
+ * field that looks like it steers suggestions and does not is the kind of
+ * quiet promise this project keeps having to take back. */
+const TEXT_FIELDS = [
+  { name: "brand", label: "brand", placeholder: "Fabindia, Zara, Levi's…", max: 80 },
+  { name: "size_label", label: "size", placeholder: "M, 32, UK 9, 42 EU…", max: 40 },
+] as const;
+
 export default function GarmentEditor({
   garmentId,
   onClose,
@@ -176,8 +192,47 @@ export default function GarmentEditor({
               </tr>
             );
           })}
+          {TEXT_FIELDS.map((f) => (
+            <tr key={f.name} style={{ borderTop: "1px solid var(--line)" }}>
+              <td style={{ padding: "8px 6px", color: "var(--muted)", width: 150 }}>{f.label}</td>
+              <td style={{ padding: "8px 6px" }}>
+                <input
+                  defaultValue={g[f.name] === null || g[f.name] === undefined ? "" : String(g[f.name])}
+                  maxLength={f.max}
+                  placeholder={f.placeholder}
+                  disabled={saving === f.name}
+                  /* Saved on BLUR, not on every keystroke: a text field has no
+                     natural "chosen" moment the way a select does, and a PATCH
+                     per character would be one write per letter of "Fabindia". */
+                  onBlur={(e) => {
+                    const next = e.target.value.trim();
+                    const current = g[f.name] == null ? "" : String(g[f.name]);
+                    if (next !== current) void save(f.name, next);
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") (e.target as HTMLInputElement).blur();
+                  }}
+                  style={{
+                    width: "100%",
+                    padding: "6px 8px",
+                    border: "1px solid var(--line)",
+                    borderRadius: 6,
+                    background: "#fff",
+                    font: "inherit",
+                  }}
+                />
+              </td>
+              <td style={{ padding: "8px 6px", width: 150, textAlign: "right" }}>
+                <span className="ui-sub" style={{ fontSize: 11 }}>yours</span>
+              </td>
+            </tr>
+          ))}
         </tbody>
       </table>
+      <p className="ui-sub" style={{ marginTop: 8, fontSize: 11.5 }}>
+        Brand and size are yours to record — the stylist never guesses them from a photo, and
+        they do not affect which outfits are suggested.
+      </p>
 
       {error && <div className="err">{error}</div>}
       <div className="progress" style={{ marginTop: 12 }}>

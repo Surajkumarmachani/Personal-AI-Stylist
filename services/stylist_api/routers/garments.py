@@ -25,7 +25,7 @@ transaction inline, and it is committed before this function returns.
 from __future__ import annotations
 
 import uuid
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Header, HTTPException, Query, Response, status
 from sqlalchemy import select, text
@@ -173,6 +173,24 @@ async def list_garments(
         .offset(offset)
     )
     garments = list(rows.scalars())
+
+    # WEAR COUNTS IN ONE QUERY, not one per garment. A page of 50 would
+    # otherwise be 50 round trips for a number shown on a card.
+    by_id: dict[str, tuple[int, Any]] = {}
+    if garments:
+        # Skipped entirely on an empty page: `= ANY('{}')` is valid but the
+        # round trip is not, and an empty wardrobe is the common first request.
+        wears = await db.execute(
+            text(
+                "SELECT garment_id, count(*) AS n, max(worn_on) AS last_worn "
+                "FROM wear_log WHERE garment_id = ANY(CAST(:ids AS uuid[])) GROUP BY garment_id"
+            ),
+            {"ids": [str(g.id) for g in garments]},
+        )
+        by_id = {
+            str(r["garment_id"]): (int(r["n"] or 0), r["last_worn"]) for r in wears.mappings()
+        }
+
     return [
         GarmentSummary(
             id=g.id,
@@ -181,6 +199,11 @@ async def list_garments(
             primary_colour=g.primary_colour,
             state=g.state,
             needs_review=g.needs_review,
+            needs_wash=bool(g.needs_wash),
+            brand=g.brand,
+            size_label=g.size_label,
+            wear_count=by_id.get(str(g.id), (0, None))[0],
+            last_worn=by_id.get(str(g.id), (0, None))[1],
             cutout_url=store.presign_download(g.cutout_key) if g.cutout_key else None,
             created_at=g.created_at,
         )

@@ -10,7 +10,8 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
-import type { ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
+import { getAvatar } from "@/lib/api";
 
 const NAV = [
   { href: "/", label: "Home", ic: "⌂" },
@@ -19,6 +20,7 @@ const NAV = [
   { href: "/tryon", label: "Try On", ic: "☰" },
   { href: "/stylist", label: "AI Stylist", ic: "✦" },
   { href: "/occasions", label: "Occasions", ic: "◷" },
+  { href: "/insights", label: "Insights", ic: "▤" },
   { href: "/profile", label: "Profile", ic: "☺" },
 ];
 
@@ -35,6 +37,16 @@ export default function Shell({
 }) {
   const path = usePathname();
   const router = useRouter();
+  // The signed URL EXPIRES, so it is fetched per mount rather than cached
+  // into the session — a stale one renders as a broken image in the chrome of
+  // every screen, which looks worse than no picture at all.
+  const [avatar, setAvatar] = useState<string | null>(null);
+  useEffect(() => {
+    if (!email) return;
+    void getAvatar()
+      .then((r) => setAvatar(r.avatar_url))
+      .catch(() => undefined);
+  }, [email]);
   return (
     <div className="ui">
       <aside className="ui-side">
@@ -72,7 +84,29 @@ export default function Shell({
             <span style={{ color: "var(--muted)", fontSize: 15 }} aria-hidden="true">
               ◔
             </span>
-            <span className="ui-avatar">{email ? email[0]!.toUpperCase() : "·"}</span>
+            {/* A LINK, not a decorative span. Every app puts the account
+                behind the avatar, so people click it — and this one was inert,
+                which reads as the app being broken rather than as the control
+                not existing. `title` and `aria-label` carry the address: the
+                initial alone is not an accessible name, and a screen reader
+                announcing "S" is no better than silence. */}
+            <Link
+              href="/profile"
+              className="ui-avatar"
+              aria-label={email ? `Profile — ${email}` : "Profile"}
+              title={email ?? "Profile"}
+            >
+              {avatar ? (
+                // eslint-disable-next-line @next/next/no-img-element
+                <img
+                  src={avatar}
+                  alt=""
+                  style={{ width: "100%", height: "100%", objectFit: "cover", borderRadius: "50%" }}
+                />
+              ) : (
+                email ? email[0]!.toUpperCase() : "·"
+              )}
+            </Link>
           </div>
         </header>
         <div className="ui-body">{children}</div>

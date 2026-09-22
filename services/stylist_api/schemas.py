@@ -4,7 +4,7 @@ that clients are contract-tested against (§D2)."""
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -73,6 +73,19 @@ class GarmentSummary(BaseModel):
     primary_colour: str | None
     state: str
     needs_review: bool
+    # IN THE WASH. A hard exclusion in the candidate pool — `AND NOT
+    # g.needs_wash` — so a garment with this set silently cannot appear in any
+    # suggestion. The wardrobe grid had no way to see or change it, which made
+    # "why is my favourite shirt never suggested?" unanswerable from the app.
+    needs_wash: bool = False
+    # Free text, user-entered, not scored — see migration 0021.
+    brand: str | None = None
+    size_label: str | None = None
+    # Wear count and last worn, so the grid can show what is actually used.
+    # `novelty` is 10% of the outfit score and reads exactly these, and until
+    # now the only way to log a wear was the build console.
+    wear_count: int = 0
+    last_worn: date | None = None
     cutout_url: str | None
     created_at: datetime
 

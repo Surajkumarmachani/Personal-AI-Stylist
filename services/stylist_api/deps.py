@@ -106,7 +106,32 @@ async def tenant_db(
         yield session
 
 
+async def current_admin(
+    user: Annotated[User, Depends(current_user)],
+) -> User:
+    """A user with `is_admin`. 403 otherwise.
+
+    GUARDS CROSS-TENANT DATA, not a nicer screen. `/ops` serves aggregates
+    that deliberately read past RLS through SECURITY DEFINER functions —
+    ingest funnels, latency percentiles, DLQ depth, correction rates, model
+    spend — for the WHOLE deployment. `routers/ops.py` has said since Phase 5
+    that it "belongs behind an admin authorisation boundary rather than a user
+    token"; until this existed, any registered account could read all of it.
+
+    404 would be the usual choice for hiding a resource's existence, but these
+    paths are in the public OpenAPI document and pretending otherwise would be
+    theatre. 403 is the honest answer: the route exists, you may not have it.
+    """
+    if not user.is_admin:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="admin only",
+        )
+    return user
+
+
 CurrentUser = Annotated[User, Depends(current_user)]
+CurrentAdmin = Annotated[User, Depends(current_admin)]
 TenantDB = Annotated[AsyncSession, Depends(tenant_db)]
 SettingsDep = Annotated[Settings, Depends(settings_dep)]
 QueueRedisDep = Annotated[QueueRedis, Depends(queue_redis)]

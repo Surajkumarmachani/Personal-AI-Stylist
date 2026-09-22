@@ -9,7 +9,7 @@
  */
 
 import { useState } from "react";
-import { requestTryOn, saveOutfit, type ChatOutfit } from "@/lib/api";
+import { outfitBoard, requestTryOn, saveOutfit, type ChatOutfit } from "@/lib/api";
 
 /** A name for the look, DERIVED from its garments rather than invented.
  *
@@ -117,6 +117,36 @@ export default function OutfitCard({
     }
   }
 
+  /** The flat-lay board: the outfit composited into one image.
+   *
+   * `outfitBoard` existed and NOTHING called it. It is also what try-on
+   * degrades TO — the endpoint returns a board whenever a render is
+   * unavailable — so the fallback was reachable only as a side effect of a
+   * try-on that failed, never as a thing you could ask for.
+   *
+   * Worth asking for on its own: a board is pixel-accurate to clothes the
+   * user owns, where a render is a guess about how they would look.
+   */
+  async function board(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (busy || !hash) return;
+    setBusy(true);
+    setState("building the board…");
+    try {
+      const res = await outfitBoard(hash);
+      if (res.board_url) {
+        setTryonUrl(res.board_url);
+        setState("flat-lay");
+      } else {
+        setState("no board yet — it is built with the nightly precompute");
+      }
+    } catch (e2) {
+      setState(String(e2));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function save(e: React.MouseEvent) {
     e.stopPropagation();
     if (busy) return;
@@ -196,6 +226,17 @@ export default function OutfitCard({
         >
           {busy ? "…" : tryonUrl ? "Show garments" : "Try On"}
         </button>
+        {!tryonUrl ? (
+          <button
+            className="ui-btn"
+            style={{ marginTop: 6, fontSize: 11.5, padding: "4px 9px" }}
+            onClick={board}
+            disabled={busy || !hash}
+            title="A flat-lay of this outfit — your actual garments, composited"
+          >
+            Flat-lay
+          </button>
+        ) : null}
         {state ? <p className="ui-sub">{state}</p> : null}
       </div>
     </article>

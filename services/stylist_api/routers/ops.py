@@ -47,7 +47,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Query
 from sqlalchemy import text
 
-from stylist_api.deps import CacheRedisDep, CurrentUser
+from stylist_api.deps import CacheRedisDep, CurrentAdmin
 from stylist_db.session import system_session
 
 router = APIRouter(tags=["ops"])
@@ -244,7 +244,7 @@ async def _validator_reject_rate(counts: dict[str, int], days: int) -> dict[str,
 
 @router.get("/ops/rerank")
 async def rerank_health(
-    user: CurrentUser,
+    user: CurrentAdmin,
     cache: CacheRedisDep,
     days: Annotated[int, Query(ge=1, le=14)] = RERANK_WINDOW_DAYS,
 ) -> dict[str, Any]:
@@ -273,7 +273,7 @@ async def rerank_health(
 
 @router.get("/ops/alerts")
 async def alerts(
-    user: CurrentUser,
+    user: CurrentAdmin,
     cache: CacheRedisDep,
     window_hours: Annotated[int, Query(ge=1, le=168)] = 24,
     window_minutes: Annotated[int, Query(ge=1, le=1440)] = 15,
@@ -296,7 +296,7 @@ async def alerts(
 
 
 @router.get("/ops/dashboards")
-async def dashboards(user: CurrentUser) -> dict[str, Any]:
+async def dashboards(user: CurrentAdmin) -> dict[str, Any]:
     """The four dashboards, as data rather than as a Grafana JSON blob.
 
     There is no Grafana in this stack, and shipping a dashboard definition for

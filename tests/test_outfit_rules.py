@@ -245,6 +245,13 @@ def _independently_valid(items: list[OutfitItem]) -> bool:
         return False
     if any(counts[s] > 1 for s in rules["at_most_one"]):
         return False
+    # `prefer_one` is checked like `at_most_one`: never two, never required.
+    # Whether the slot SHOULD have been filled is a question about the
+    # wardrobe, and neither this reference nor `evaluate` can see one — they
+    # both take a list of garments. The generator is what knows footwear was
+    # available; this only forbids a second pair.
+    if any(counts[s] > 1 for s in rules.get("prefer_one", [])):
+        return False
     for spec in rules["ranges"]:
         if not (int(spec["min"]) <= counts[spec["slot"]] <= int(spec["max"])):
             return False

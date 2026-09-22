@@ -29,12 +29,14 @@ completing a consent flow into somebody else's account.
 from __future__ import annotations
 
 import logging
+import urllib.parse
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any
 
 import jwt
 from fastapi import APIRouter, HTTPException, Query, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy import text
 
 from stylist_api.deps import CurrentUser, SettingsDep, TenantDB
@@ -83,6 +85,32 @@ def _read_state(state: str, settings: Any) -> uuid.UUID:
         ) from exc
 
 
+def _back_to_app(settings: Any, *, connected: bool, **extra: Any) -> RedirectResponse:
+    """Send the browser back to the app, not to a JSON body.
+
+    Google redirects the USER here, so whatever this returns is a page a
+    person is looking at. Returning `{"connected": true}` ended a consent flow
+    on a raw JSON document with no way back — technically correct and a dead
+    end.
+
+    The outcome travels in the query string because the app cannot read this
+    response: it is a top-level navigation from Google's domain, not a fetch
+    the client made. `account` is the Google address the user just consented
+    with — their own, already on screen a moment ago — and no calendar content
+    ever appears here.
+    """
+    params = {"calendar": "connected" if connected else "failed", **{
+        k: str(v) for k, v in extra.items() if v
+    }}
+    query = urllib.parse.urlencode(params)
+    return RedirectResponse(
+        url=f"{settings.web_base_url.rstrip('/')}/profile?{query}",
+        # 303: the callback is a GET but the browser must not re-submit it if
+        # the user refreshes the destination — the one-time code is spent.
+        status_code=status.HTTP_303_SEE_OTHER,
+    )
+
+
 @router.get("/calendar/connect")
 async def connect(user: CurrentUser, settings: SettingsDep) -> dict[str, Any]:
     """The Google consent URL to send the user to."""
@@ -107,7 +135,9 @@ async def callback(
     code: Annotated[str | None, Query()] = None,
     state: Annotated[str | None, Query()] = None,
     error: Annotated[str | None, Query()] = None,
-) -> dict[str, Any]:
+    # A RedirectResponse, not a dict: this is a page the USER lands on after
+    # consent, so it has to take them somewhere.
+) -> RedirectResponse:
     """Google redirects here. NOT authenticated by a bearer token.
 
     The browser arriving from Google carries no Authorization header, so the
@@ -116,7 +146,7 @@ async def callback(
     """
     if error:
         # The user pressed cancel. That is a choice, not a failure.
-        return {"connected": False, "reason": error}
+        return _back_to_app(settings, connected=False, reason=error)
     if not code or not state:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="missing code or state")
 
@@ -173,7 +203,7 @@ async def callback(
                 "email": email,
             },
         )
-    return {"connected": True, "account_email": email}
+    return _back_to_app(settings, connected=True, account=email)
 
 
 @router.get("/calendar/status")

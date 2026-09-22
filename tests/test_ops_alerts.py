@@ -34,7 +34,7 @@ def _alert(body: dict, name: str) -> dict:
 
 
 async def test_ops_aggregates_see_across_tenants(
-    api: AsyncClient, registered, owner_engine
+    api: AsyncClient, admin, owner_engine
 ) -> None:
     """The regression test for the bug that made every alert blind.
 
@@ -58,7 +58,7 @@ async def test_ops_aggregates_see_across_tenants(
 
 
 async def test_dlq_age_fires_when_a_job_is_stuck(
-    api: AsyncClient, registered, owner_engine
+    api: AsyncClient, admin, owner_engine
 ) -> None:
     async with owner_engine.begin() as conn:
         uid = (await conn.execute(text("SELECT id FROM users LIMIT 1"))).scalar_one()
@@ -73,7 +73,7 @@ async def test_dlq_age_fires_when_a_job_is_stuck(
             {"id": uuid.uuid4(), "uid": uid, "age": DLQ_AGE_ALERT_SECONDS + 600},
         )
     try:
-        body = (await api.get("/ops/alerts", headers=registered.auth)).json()
+        body = (await api.get("/ops/alerts", headers=admin.auth)).json()
         dlq = _alert(body, "dlq_age")
         assert dlq["firing"] is True, dlq
         assert dlq["value_seconds"] > DLQ_AGE_ALERT_SECONDS
@@ -87,17 +87,17 @@ async def test_dlq_age_fires_when_a_job_is_stuck(
 
 
 async def test_dlq_age_is_quiet_when_nothing_is_stuck(
-    api: AsyncClient, registered, owner_engine
+    api: AsyncClient, admin, owner_engine
 ) -> None:
     """The other half. An alert that always fires is also useless."""
     async with owner_engine.begin() as conn:
         await conn.execute(text("DELETE FROM jobs WHERE dlq_at IS NOT NULL"))
-    body = (await api.get("/ops/alerts", headers=registered.auth)).json()
+    body = (await api.get("/ops/alerts", headers=admin.auth)).json()
     assert _alert(body, "dlq_age")["firing"] is False
 
 
 async def test_ingest_success_ignores_in_flight_jobs(
-    api: AsyncClient, registered, owner_engine
+    api: AsyncClient, admin, owner_engine
 ) -> None:
     """A burst of queued work must not look like a failure.
 
@@ -117,14 +117,14 @@ async def test_ingest_success_ignores_in_flight_jobs(
                 ),
                 {"id": uuid.uuid4(), "uid": uid},
             )
-    body = (await api.get("/ops/alerts", headers=registered.auth)).json()
+    body = (await api.get("/ops/alerts", headers=admin.auth)).json()
     ing = _alert(body, "ingest_success")
     assert ing["in_flight"] >= 30
     assert ing["firing"] is False, ing
 
 
 async def test_ingest_success_fires_when_jobs_actually_fail(
-    api: AsyncClient, registered, owner_engine
+    api: AsyncClient, admin, owner_engine
 ) -> None:
     async with owner_engine.begin() as conn:
         await conn.execute(text("DELETE FROM jobs"))
@@ -149,7 +149,7 @@ async def test_ingest_success_fires_when_jobs_actually_fail(
                 },
             )
     try:
-        body = (await api.get("/ops/alerts", headers=registered.auth)).json()
+        body = (await api.get("/ops/alerts", headers=admin.auth)).json()
         ing = _alert(body, "ingest_success")
         assert ing["rate"] is not None and ing["rate"] < INGEST_SUCCESS_FLOOR, ing
         assert ing["firing"] is True, ing
@@ -159,7 +159,7 @@ async def test_ingest_success_fires_when_jobs_actually_fail(
 
 
 async def test_a_rate_over_too_few_samples_does_not_fire(
-    api: AsyncClient, registered, owner_engine
+    api: AsyncClient, admin, owner_engine
 ) -> None:
     """2 failures out of 3 is 67% and means nothing.
 
@@ -181,7 +181,7 @@ async def test_a_rate_over_too_few_samples_does_not_fire(
                 {"id": uuid.uuid4(), "uid": uid},
             )
     try:
-        body = (await api.get("/ops/alerts", headers=registered.auth)).json()
+        body = (await api.get("/ops/alerts", headers=admin.auth)).json()
         ing = _alert(body, "ingest_success")
         assert ing["rate"] == 0.0
         assert ing["firing"] is False, "fired on 3 samples"
@@ -190,7 +190,7 @@ async def test_a_rate_over_too_few_samples_does_not_fire(
             await conn.execute(text("DELETE FROM jobs"))
 
 
-async def test_the_middleware_actually_counts_requests(api: AsyncClient, registered) -> None:
+async def test_the_middleware_actually_counts_requests(api: AsyncClient, admin) -> None:
     """The counter write must reach Redis.
 
     It did not for the first version: the middleware called `.pipeline()` on
@@ -200,22 +200,22 @@ async def test_the_middleware_actually_counts_requests(api: AsyncClient, registe
     not fire.
     """
     for _ in range(5):
-        await api.get("/garments", headers=registered.auth)
-    body = (await api.get("/ops/alerts", headers=registered.auth)).json()
+        await api.get("/garments", headers=admin.auth)
+    body = (await api.get("/ops/alerts", headers=admin.auth)).json()
     counts = _alert(body, "api_5xx")["counts"]
     assert sum(counts.values()) > 0, f"no requests counted: {counts}"
     assert "2xx" in counts, counts
 
 
 async def test_ops_endpoints_are_not_counted_by_the_middleware(
-    api: AsyncClient, registered
+    api: AsyncClient, admin
 ) -> None:
     """A monitoring loop must not dilute the rate it is measuring."""
-    before = (await api.get("/ops/alerts", headers=registered.auth)).json()
+    before = (await api.get("/ops/alerts", headers=admin.auth)).json()
     n_before = sum(_alert(before, "api_5xx")["counts"].values())
     for _ in range(3):
-        await api.get("/ops/alerts", headers=registered.auth)
-    after = (await api.get("/ops/alerts", headers=registered.auth)).json()
+        await api.get("/ops/alerts", headers=admin.auth)
+    after = (await api.get("/ops/alerts", headers=admin.auth)).json()
     assert sum(_alert(after, "api_5xx")["counts"].values()) == n_before
 
 

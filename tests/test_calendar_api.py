@@ -79,10 +79,27 @@ async def test_a_state_for_another_audience_is_rejected(api) -> None:
 
 async def test_cancelling_consent_is_not_an_error(api) -> None:
     """The user pressed "deny". That is a choice, not a failure, and rendering
-    it as a 4xx makes the app look broken for doing what it was told."""
-    resp = await api.get("/calendar/callback", params={"error": "access_denied"})
-    assert resp.status_code == 200
-    assert resp.json() == {"connected": False, "reason": "access_denied"}
+    it as a 4xx makes the app look broken for doing what it was told.
+
+    The SHAPE changed when the callback learned to redirect: Google performs a
+    top-level navigation here, so whatever this returns is a page a person is
+    looking at, and `{"connected": false}` ended a consent flow on a raw JSON
+    document with no way back. It is now a 303 to the app carrying the outcome
+    in the query string.
+
+    The assertion this test exists to make is unchanged — not a 4xx, and the
+    reason survives — so it is checked on the redirect instead of the body.
+    """
+    resp = await api.get(
+        "/calendar/callback",
+        params={"error": "access_denied"},
+        follow_redirects=False,
+    )
+    assert resp.status_code == 303, "denying consent is not a client error"
+    location = resp.headers["location"]
+    assert "calendar=failed" in location
+    assert "access_denied" in location, "the reason must survive the redirect"
+    assert "/profile" in location, "and it must land somewhere the user can act"
 
 
 # ------------------------------------------------- degrading to default
@@ -201,3 +218,97 @@ def test_a_narrower_grant_than_requested_is_detectable(scope_granted: str) -> No
     what we asked for is how a sync 403s with nothing pointing at the cause —
     the callback checks the returned scope for exactly this reason."""
     assert gcal.SCOPES[0] not in scope_granted
+
+
+# ------------------------------------------- the calendar drives the suggestion
+#
+# `GET /suggestions` with no `occasion` used to default silently to
+# `casual_outing` — the exact move `resolve_context` refuses to make on a
+# caller's behalf. It now asks the calendar first and REPORTS which of the two
+# happened, so a user looking at outfits they did not ask for can see what
+# they were dressed for.
+
+
+async def test_no_occasion_and_no_calendar_says_it_used_the_default(api, registered) -> None:
+    resp = await api.get("/suggestions?limit=1", headers=registered.auth)
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["context"]["occasion"] == "casual_outing"
+    assert body["occasion_source"] == "default", (
+        "a silent default is what this change exists to stop; it has to be named"
+    )
+
+
+async def test_an_explicit_occasion_is_never_overridden(api, registered) -> None:
+    """The calendar is evidence, not authority. Someone who typed 'interview'
+    is not asking what their diary thinks."""
+    resp = await api.get("/suggestions?occasion=interview&limit=1", headers=registered.auth)
+    body = resp.json()
+    assert body["context"]["occasion"] == "interview"
+    assert body["occasion_source"] == "requested"
+
+
+async def test_a_confident_calendar_match_drives_the_occasion(
+    api, registered, monkeypatch
+) -> None:
+    """Monkeypatched rather than driven through a live OAuth: the point under
+    test is what `/suggestions` does with a classification, not whether Google
+    returns one."""
+    from stylist_api.routers import suggestions as suggestions_router
+
+    async def fake_today(**_: object) -> dict[str, object]:
+        return {
+            "occasion": "client_meeting",
+            "confident": True,
+            "is_fallback": False,
+            "explanation": "Matched 'client meeting' → client_meeting.",
+            "events_seen": 2,
+        }
+
+    monkeypatch.setattr(
+        "stylist_api.routers.calendar.today", fake_today, raising=True
+    )
+    assert suggestions_router  # the router under test imports it lazily
+
+    resp = await api.get("/suggestions?limit=1", headers=registered.auth)
+    body = resp.json()
+    assert body["context"]["occasion"] == "client_meeting"
+    assert body["occasion_source"] == "calendar"
+    assert body["calendar_events_seen"] == 2
+    assert "client meeting" in (body["occasion_reason"] or "")
+
+
+async def test_an_unconfident_calendar_match_is_not_used(api, registered, monkeypatch) -> None:
+    """`confident` exists as its own flag so callers need not know the
+    threshold. An unsure classification is a guess, and dressing someone for a
+    meeting the rules were unsure about is worse than an everyday default."""
+
+    async def fake_today(**_: object) -> dict[str, object]:
+        return {
+            "occasion": "wedding_ceremony",
+            "confident": False,
+            "is_fallback": True,
+            "explanation": "Not sure — defaulting.",
+            "events_seen": 1,
+        }
+
+    monkeypatch.setattr("stylist_api.routers.calendar.today", fake_today, raising=True)
+
+    resp = await api.get("/suggestions?limit=1", headers=registered.auth)
+    body = resp.json()
+    assert body["context"]["occasion"] == "casual_outing"
+    assert body["occasion_source"] == "default"
+
+
+async def test_a_broken_calendar_never_fails_a_suggestion(api, registered, monkeypatch) -> None:
+    """No link, revoked token, Google down — none of them are reasons to fail
+    a suggestion request."""
+
+    async def boom(**_: object) -> dict[str, object]:
+        raise RuntimeError("google is down")
+
+    monkeypatch.setattr("stylist_api.routers.calendar.today", boom, raising=True)
+
+    resp = await api.get("/suggestions?limit=1", headers=registered.auth)
+    assert resp.status_code == 200
+    assert resp.json()["occasion_source"] == "default"

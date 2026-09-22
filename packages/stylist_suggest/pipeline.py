@@ -49,7 +49,13 @@ from stylist_domain.scoring import (
     load_scoring_config,
     score_outfit,
 )
-from stylist_domain.slots import base_structures, evaluate, optional_slots, required_slots
+from stylist_domain.slots import (
+    base_structures,
+    evaluate,
+    optional_slots,
+    preferred_slots,
+    required_slots,
+)
 from stylist_domain.style import parse_embedding
 from stylist_domain.taxonomy import load_taxonomy
 
@@ -236,7 +242,14 @@ async def _rescue_required_slots(
     garment below a true warmth match, so this changes what is POSSIBLE
     without changing what is PREFERRED.
     """
-    for slot in required_slots():
+    # REQUIRED AND PREFERRED BOTH. `feet` moved out of required when footwear
+    # stopped being mandatory, and dropping it from the rescue at the same
+    # time would have quietly undone the fix this function exists for: the
+    # owner's only shoes are `warmth=1` against a target of 3, so without the
+    # rescue they are filtered out and every outfit comes back shoeless — for
+    # someone who owns shoes. Optional slots are excluded: an outfit without a
+    # bag is not missing anything.
+    for slot in (*required_slots(), *preferred_slots()):
         if pool.by_slot.get(slot):
             continue
         rows = await session.execute(
@@ -302,14 +315,25 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
     await _apply_avoids(session, pool)
     await _rescue_required_slots(session, pool, ctx, params)
 
-    # Fail fast and SAY WHY. A wardrobe with no footwear can produce no valid
-    # outfit at all, and discovering that after scoring 400 candidates is both
-    # wasted work and an unexplained empty screen.
+    # Fail fast and SAY WHY, for slots an outfit genuinely cannot do without.
     for slot in required_slots():
         if not pool.by_slot.get(slot):
             pool.notes.append(
                 f"no wearable {slot} — every outfit needs one "
                 f"(check the laundry basket and the {ctx.dress_code_target} dress code)"
+            )
+
+    # A PREFERRED SLOT IS A NOTE, NOT A FAILURE. The outfits below are real
+    # and wearable; they are just missing a piece the wardrobe cannot supply.
+    # Said plainly rather than silently, because "why do none of these have
+    # shoes?" is the obvious next question and the answer is actionable.
+    for slot in preferred_slots():
+        if not pool.by_slot.get(slot):
+            pool.notes.append(
+                f"no wearable {slot} — these outfits are shown without one. "
+                f"Add footwear and I will include it."
+                if slot == "feet"
+                else f"no wearable {slot}; outfits are shown without one"
             )
     if not any(all(pool.by_slot.get(s) for s in structure) for structure in base_structures()):
         readable = " or ".join("+".join(s) for s in base_structures())
@@ -455,6 +479,23 @@ def generate_candidates(
                     option_lists = []
                     break
                 option_lists.append(items)
+
+            # PREFERRED SLOTS: filled when the wardrobe can, SKIPPED when it
+            # cannot — the difference between "no shoes, so no outfits" and
+            # "no shoes, so outfits without shoes".
+            #
+            # Appended to the same product as the required slots rather than
+            # to `extras`, deliberately. `extras` adds at most ONE optional
+            # garment to a combination, so routing footwear through it would
+            # make shoes compete with a bag for the same slot in the product —
+            # and would produce shoeless variants alongside shod ones for
+            # someone who owns shoes, which is exactly what `prefer_one`
+            # exists to avoid.
+            for slot in preferred_slots():
+                items = pool.by_slot.get(slot, [])[:COMPLEMENTS_PER_SLOT]
+                if items:
+                    option_lists.append(items)
+
             if not option_lists:
                 continue
 
