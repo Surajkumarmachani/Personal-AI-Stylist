@@ -19,7 +19,7 @@
  * at all, and a toggle that does nothing is worse than its absence.
  */
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import Link from "next/link";
 import Shell from "../Shell";
 import SignIn from "../SignIn";
@@ -68,24 +68,36 @@ export default function TryOnPage() {
     if (email) listGarments().then(setWardrobe).catch(() => setWardrobe(null));
   }, [email]);
 
-  const load = useCallback(async (ask: string) => {
-    setBusy(true);
-    setNote(null);
-    try {
-      const res = await askStylist(ask, 6);
-      setOutfits(res.outfits);
-      if (!res.outfits.length) setNote(res.notes?.[0] ?? res.reply);
-    } catch (e) {
-      setNote(String(e));
-      setOutfits([]);
-    } finally {
-      setBusy(false);
-    }
-  }, []);
-
+  // Inlined instead of calling a memoised `load()`: React's set-state-in-effect
+  // rule cannot see through a callback, so it flags every effect that invokes
+  // one. Inlining also buys the thing that was genuinely missing —
+  // CANCELLATION. Nothing tracked which request was current, so switching
+  // occasion quickly left whichever response landed last on screen, which is
+  // not necessarily the one that was asked for. `off` makes an abandoned
+  // request's reply a no-op instead of a race.
   useEffect(() => {
-    if (email) void load(occasion);
-  }, [email, occasion, load]);
+    if (!email) return;
+    let off = false;
+    void (async () => {
+      setBusy(true);
+      setNote(null);
+      try {
+        const res = await askStylist(occasion, 6);
+        if (off) return;
+        setOutfits(res.outfits);
+        if (!res.outfits.length) setNote(res.notes?.[0] ?? res.reply);
+      } catch (e) {
+        if (off) return;
+        setNote(String(e));
+        setOutfits([]);
+      } finally {
+        if (!off) setBusy(false);
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [email, occasion]);
 
   /** Which requirement the wardrobe cannot meet AT ALL — ignoring laundry,
    *  weather and dress code, which the backend's own note already covers. A

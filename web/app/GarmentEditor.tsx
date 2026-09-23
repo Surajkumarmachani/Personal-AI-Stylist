@@ -20,7 +20,7 @@
  *     in on their own.
  */
 
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { correctField, garmentDetail, type GarmentDetail } from "@/lib/api";
 
 const FIELDS = [
@@ -65,17 +65,26 @@ export default function GarmentEditor({
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState<string | null>(null);
 
-  const load = useCallback(async () => {
-    try {
-      setDetail(await garmentDetail(garmentId));
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [garmentId]);
-
+  // The effect owns the fetch so that it can CANCEL. This panel is opened
+  // straight from the wardrobe grid, and a detail response arriving after the
+  // user moved on used to overwrite the garment now on screen. `off` drops an
+  // abandoned reply instead. It also satisfies set-state-in-effect, which
+  // flags any effect calling a memoised loader because it cannot see inside
+  // one to tell whether the setState is synchronous.
   useEffect(() => {
-    void load();
-  }, [load]);
+    let off = false;
+    void (async () => {
+      try {
+        const d = await garmentDetail(garmentId);
+        if (!off) setDetail(d);
+      } catch (e) {
+        if (!off) setError(String(e));
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [garmentId]);
 
   async function save(field: string, raw: string) {
     setSaving(field);
@@ -91,7 +100,7 @@ export default function GarmentEditor({
             ? Number(raw)
             : raw;
       await correctField(garmentId, field, value);
-      await load();
+      setDetail(await garmentDetail(garmentId));
       onSaved();
     } catch (e) {
       setError(String(e));

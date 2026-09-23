@@ -197,3 +197,61 @@ def test_cosine_does_not_assume_the_other_side_is_normalised() -> None:
     v = apply_event(None, kind="like", outfit_vec=E1, event_id="1")
     assert math.isclose(v.cosine([5.0, 0.0, 0.0]), v.cosine([1.0, 0.0, 0.0]), abs_tol=1e-9)
     assert v.cosine([0.0, 0.0, 0.0]) == 0.0, "a zero garment vector is not NaN"
+
+
+def test_only_a_verdict_moves_the_bandit_and_the_ui_must_be_able_to_send_one() -> None:
+    """The loop was complete and UNREACHABLE.
+
+    `apply_feedback` moves a Thompson posterior for `like`, `worn` and
+    `dislike` only -- saving is intent, not evidence. The web UI could send
+    exactly one kind, `saved`, so no reaction the product could produce ever
+    moved an arm. `bandit_arm` was empty across the whole database: not a
+    broken loop, a loop with no input.
+
+    This pins the asymmetry that made it invisible, so a future change that
+    removes the rating buttons fails here rather than silently going quiet.
+    """
+    from stylist_domain.bandit import Arm, apply_feedback
+
+    start = Arm("smart_casual", 0, 0)
+    assert apply_feedback(start, "like").successes == 1
+    assert apply_feedback(start, "worn").successes == 1
+    assert apply_feedback(start, "dislike").failures == 1
+    # The two the UI used to be limited to.
+    assert apply_feedback(start, "saved") == start
+    assert apply_feedback(start, "dismissed") == start
+
+
+def test_the_style_vector_is_not_trusted_until_it_has_evidence() -> None:
+    """Why feedback can be recorded and change nothing yet.
+
+    Measured live: seven events moved the vector and the arms but left the
+    ranking identical, which reads exactly like a broken loop. It is the
+    MIN_EVENTS gate -- at thirteen events the ranking moved. Asserted here so
+    the threshold is a documented contract rather than a surprise.
+    """
+    from stylist_domain.scoring import MIN_EVENTS_FOR_STYLE_AFFINITY
+
+    assert MIN_EVENTS_FOR_STYLE_AFFINITY == 10
+
+
+def test_wearing_an_outfit_is_the_strongest_signal_and_was_never_sent() -> None:
+    """`worn` weighs the same as a like in the style vector and counts as a
+    Thompson success -- it is the strongest endorsement a user can give.
+
+    Nothing produced it. `wear.py` wrote `wear_log` and no `outfit_feedback`
+    row, so two things silently could not work: the bandit never saw the
+    signal, and `GET /me/wear-through` -- which the plan calls the only
+    quality metric that matters -- computes its numerator from
+    `outfit_feedback WHERE kind = 'worn'` and could therefore only ever report
+    0%, however good the suggestions were.
+
+    Measured after wiring it: the rate moved 0.0 -> 0.1429 on a real account.
+    """
+    from stylist_domain.bandit import Arm, apply_feedback
+    from stylist_domain.style import NEGATIVE, POSITIVE
+
+    assert POSITIVE["worn"] == POSITIVE["like"] == 1.0
+    assert POSITIVE["saved"] == 0.5
+    assert NEGATIVE["dislike"] == 1.0
+    assert apply_feedback(Arm("business", 0, 0), "worn").successes == 1

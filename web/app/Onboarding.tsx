@@ -35,15 +35,28 @@ export default function Onboarding() {
   const [dismissed, setDismissed] = useState(true);
 
   useEffect(() => {
-    try {
-      setDismissed(localStorage.getItem(DISMISSED_KEY) === "1");
-    } catch {
-      setDismissed(false);
-    }
-    listGarments().then(setItems).catch(() => setItems([]));
-    getLocation()
-      .then((l) => setHasCity(Boolean(l.weather_is_real)))
-      .catch(() => setHasCity(false));
+    let off = false;
+    void (async () => {
+      const [garments, location] = await Promise.allSettled([listGarments(), getLocation()]);
+      if (off) return;
+      // Read HERE and not in a lazy `useState` initialiser: this component is
+      // prerendered on the server, where `localStorage` does not exist, and
+      // seeding state from it would hydrate to a different value than the
+      // server sent. Deferring costs nothing, because the component renders
+      // null until both requests above have answered anyway.
+      try {
+        setDismissed(localStorage.getItem(DISMISSED_KEY) === "1");
+      } catch {
+        setDismissed(false);
+      }
+      setItems(garments.status === "fulfilled" ? garments.value : []);
+      setHasCity(
+        location.status === "fulfilled" ? Boolean(location.value.weather_is_real) : false,
+      );
+    })();
+    return () => {
+      off = true;
+    };
   }, []);
 
   if (items === null || hasCity === null) return null;

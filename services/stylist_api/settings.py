@@ -94,6 +94,24 @@ class Settings(BaseSettings):
     # Google compares the string, so a trailing slash is a different URI and
     # produces `redirect_uri_mismatch` with no hint about which part differs.
     google_redirect_uri: str = Field(default="http://localhost:8080/calendar/callback")
+    # THE GLOBAL CALENDAR. A separate credential from the OAuth pair above, and
+    # deliberately so: this reads a PUBLIC holiday calendar that belongs to
+    # nobody, needs no consent and is the same answer for every user in the
+    # country. The OAuth client reads one person's diary and is bound by the
+    # consent the UI collected.
+    #
+    # Unset degrades to `config/observances.yaml`, which holds the fixed-date
+    # holidays. That fallback cannot carry Diwali or Eid -- those move every
+    # year -- so without this key the app is blind to the festivals it most
+    # needs to dress people for.
+    google_calendar_api_key: str = Field(default="")
+    # Google's public holiday calendar for a country. `en.indian` is India;
+    # `en.usa`, `en.uk` and so on exist for others. A deployment serving one
+    # market sets one; serving several needs a per-user country, which this
+    # system does not collect yet.
+    google_holiday_calendar_id: str = Field(
+        default="en.indian#holiday@group.v.calendar.google.com"
+    )
     # Where to send the browser AFTER the OAuth callback. Google redirects to
     # the API, which is not a page anyone should end up looking at — without
     # this the user finishes a consent flow staring at `{"connected": true}`.
@@ -123,6 +141,25 @@ class Settings(BaseSettings):
     # One of: leffa | idm-vton | ootdiffusion. Unset degrades
     # `POST /outfits/{hash}/tryon` to the board, which is the exit criterion's
     # required behaviour anyway.
+    # Renders per tenant per rolling day. Configurable because the ceiling is
+    # a COST decision, not a correctness one, and it differs between a laptop
+    # pointed at a self-hosted GPU and a deployment paying per call. The
+    # default stays 10, matching TRYON_DAILY_QUOTA in routers/tryon.py.
+    #
+    # Raising it is the supported way to keep testing: the quota is counted
+    # from `audit_log`, which is also the record of what was transmitted to a
+    # third party, so deleting rows to free up quota destroys evidence to buy
+    # a render.
+    tryon_daily_quota: int = Field(default=10, ge=1, le=1000)
+    # Garments rendered per try-on. Each pass re-runs the provider on the
+    # PREVIOUS pass's output, so the whole frame is regenerated once per
+    # garment: 2 dresses the outfit more fully, 1 keeps the person looking
+    # more like themselves. See stylist_worker.tryon.
+    tryon_max_passes: int = Field(default=2, ge=1, le=3)
+    # Composite the user's real head back over the render. On by default: the
+    # provider regenerates the whole frame, so without this the person in the
+    # picture is a stranger wearing the right clothes.
+    tryon_restore_face: bool = Field(default=True)
     vton_provider: str = Field(default="")
     # A Hugging Face token. NOT optional in practice: all three candidate
     # Spaces run on ZeroGPU, which rejects anonymous programmatic calls in

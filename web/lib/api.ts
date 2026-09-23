@@ -67,6 +67,33 @@ export function clearSession(): void {
   writeRefresh(null);
 }
 
+/** Sign out: revoke the refresh token server-side, then forget it locally.
+ *
+ *  BOTH HALVES MATTER. `clearSession()` alone only forgets the token in this
+ *  browser -- the refresh token stays valid until it expires, so anyone
+ *  holding a copy could still mint access tokens. Revoking without clearing
+ *  leaves a dead token in storage that fails confusingly on next load.
+ *
+ *  The revoke is best-effort: if the network is down the local clear MUST
+ *  still happen, because a sign-out that visibly does nothing is worse than
+ *  one that is incomplete server-side.
+ */
+export async function signOut(): Promise<void> {
+  const refresh = readRefresh();
+  if (refresh) {
+    try {
+      await fetch(`${API_BASE}/auth/logout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refresh }),
+      });
+    } catch {
+      /* see the docstring: the local clear below is the part that must happen */
+    }
+  }
+  clearSession();
+}
+
 export function hasSession(): boolean {
   return accessToken !== null || readRefresh() !== null;
 }
@@ -535,6 +562,80 @@ export async function clearAvatar(): Promise<void> {
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
 }
 
+// ------------------------------------------------------------------ shop
+//
+// Answers ONE question: your wardrobe cannot dress this occasion, what single
+// item would fix it? Not a product feed — see routers/shop.py.
+
+export type ShopProduct = {
+  id: string;
+  merchant: string;
+  title: string;
+  brand: string | null;
+  slot: string;
+  subcategory: string | null;
+  primary_colour: string | null;
+  dress_code: string | null;
+  price_minor: number | null;
+  currency: string | null;
+  url: string;
+  image_url: string | null;
+};
+
+export type ShopGap = {
+  slot: string;
+  /** `blocking` = no outfit exists at all. `incomplete` = outfits are shown
+   *  but missing this piece. Different urgency, different sentence. */
+  severity: string;
+  reason: string;
+  products: ShopProduct[];
+};
+
+export type ShopGaps = {
+  occasion: string;
+  gaps: ShopGap[];
+  /** Rendered VERBATIM. Paid-link disclosure is a legal obligation, and
+   *  returning it as data means a new surface cannot forget it. */
+  affiliate: string;
+  catalogue_empty: boolean;
+};
+
+export async function shopGaps(occasion: string): Promise<ShopGaps> {
+  return json(
+    await authedFetch(`${API_BASE}/shop/gaps?occasion=${encodeURIComponent(occasion)}`, {
+      cache: "no-store",
+    }),
+  );
+}
+
+/** Records the click, then the caller opens the url it already has.
+ *  Deliberately not a redirect: our server must not sit in the path of an
+ *  outbound click, or an outage here becomes a broken link to the merchant. */
+export async function recordShopClick(productId: string): Promise<void> {
+  await authedFetch(`${API_BASE}/shop/click/${productId}`, { method: "POST" }).catch(
+    () => undefined,
+  );
+}
+
+export type OwnedProduct = {
+  garment_id: string;
+  created: boolean;
+  has_image: boolean;
+  note: string;
+};
+
+/** "I bought this" -> the product becomes a garment.
+ *
+ * Deliberately NOT fired by the click itself. A click is not a purchase, and
+ * filling a wardrobe with things the user merely looked at would make the
+ * whole wardrobe untrustworthy — every recommendation is built from it.
+ */
+export async function ownProduct(productId: string): Promise<OwnedProduct> {
+  return json(
+    await authedFetch(`${API_BASE}/shop/own/${productId}`, { method: "POST" }),
+  );
+}
+
 export async function listGarments(): Promise<Garment[]> {
   return json<Garment[]>(
     await authedFetch(`${API_BASE}/garments`, { cache: "no-store" }),
@@ -816,6 +917,42 @@ export type WearResponse = {
   currency: string | null;
 };
 
+export type WornToday = {
+  date: string;
+  items: {
+    id: string;
+    slot: string | null;
+    subcategory: string | null;
+    primary_colour: string | null;
+    cutout_url: string | null;
+    note: string | null;
+  }[];
+  /** Stated by the server. The home screen branches on "did they dress
+   *  today", which is not the same question as "how many garments". */
+  wore_something: boolean;
+};
+
+export async function wornToday(): Promise<WornToday> {
+  return json(
+    await authedFetch(`${API_BASE}/wardrobe/worn-on`, { cache: "no-store" }),
+  );
+}
+
+/** Undo a wear. The server keys it by (garment, date), so this needs both.
+ *
+ *  Marking something worn by mistake was previously permanent from the UI:
+ *  the endpoint existed and no client function called it, so the only way out
+ *  was the database. A log you cannot correct stops being a record and becomes
+ *  a nuisance -- and this one feeds cost-per-wear and repeat-avoidance, so a
+ *  wrong entry quietly skews suggestions too.
+ */
+export async function unlogWear(id: string, wornOn: string): Promise<void> {
+  const res = await authedFetch(`${API_BASE}/garments/${id}/wear/${wornOn}`, {
+    method: "DELETE",
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+}
+
 export async function logWear(id: string): Promise<WearResponse> {
   return json(
     await authedFetch(`${API_BASE}/garments/${id}/wear`, {
@@ -1093,6 +1230,10 @@ export type TryOnResult = {
   queued?: boolean;
   tryon_url?: string | null;
   board_url?: string | null;
+  /** Slots the render did NOT cover. No try-on provider renders footwear, so
+   *  `feet` is here on essentially every render and the shoes in the image are
+   *  the ones from the user's own body photo. */
+  skipped_slots?: string[];
   board_endpoint: string;
 };
 
@@ -1114,6 +1255,84 @@ export async function outfitBoard(garmentSetHash: string): Promise<OutfitBoard> 
 }
 
 // -------------------------------------------------- feedback / saved looks
+
+export type FeedbackResult = {
+  event_id: string;
+  kind: string;
+  style_vector_events: number;
+  style_vector_moved: boolean;
+  /** Which Thompson arm moved, or null when the reaction carried no evidence. */
+  bandit_arm?: string | null;
+};
+
+/** A VERDICT on a suggestion: `like` or `dislike`.
+ *
+ *  This is the signal the recommender was missing entirely. The only kind the
+ *  UI could previously send was `saved`, which moves the style vector at half
+ *  weight and moves the Thompson posteriors NOT AT ALL (`apply_feedback`
+ *  treats saving as intent, not evidence). So `bandit_arm` was empty across
+ *  the whole database: not a broken loop, a loop with no way to be fed.
+ */
+export async function rateOutfit(
+  garmentIds: string[],
+  kind: "like" | "dislike",
+  occasion = "casual_outing",
+): Promise<FeedbackResult> {
+  return json(
+    await authedFetch(`${API_BASE}/outfits/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        garment_ids: garmentIds,
+        occasion,
+        kind,
+        was_suggested: true,
+      }),
+    }),
+  );
+}
+
+/** "I WORE THIS" — the strongest signal the recommender can receive, and the
+ *  one it was never given.
+ *
+ *  Two gaps closed by one call:
+ *
+ *  1. LEARNING. `apply_feedback` counts `worn` as a success for the Thompson
+ *     arm and `style.POSITIVE` weights it 1.0 — the same as a like, because
+ *     actually wearing an outfit is a stronger endorsement than tapping a
+ *     thumb. Nothing ever sent it: `wear.py` writes `wear_log` and no
+ *     `outfit_feedback` row at all.
+ *
+ *  2. MEASUREMENT. `GET /me/wear-through` computes suggested -> actually worn
+ *     from `outfit_feedback WHERE kind = 'worn'`, and the plan calls that the
+ *     only quality metric that matters. With nothing writing those rows the
+ *     numerator was structurally zero, so the metric could only ever report
+ *     0% or "unmeasured" no matter how good the suggestions were.
+ *
+ *  The feedback event is sent FIRST and awaited: it is what both the learning
+ *  and the metric depend on. The per-garment wear rows follow and are allowed
+ *  to fail individually — they drive cost-per-wear and repeat-avoidance, which
+ *  degrade gracefully, unlike the event above.
+ */
+export async function markOutfitWorn(
+  garmentIds: string[],
+  occasion = "casual_outing",
+): Promise<FeedbackResult> {
+  const result = await json<FeedbackResult>(
+    await authedFetch(`${API_BASE}/outfits/feedback`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        garment_ids: garmentIds,
+        occasion,
+        kind: "worn",
+        was_suggested: true,
+      }),
+    }),
+  );
+  await Promise.allSettled(garmentIds.map((id) => logWear(id)));
+  return result;
+}
 
 /** Save a look. `saved` is a real `feedback_kind`, so the heart on a card
  *  writes an event the Saved Looks screen reads back — it is not decorative.

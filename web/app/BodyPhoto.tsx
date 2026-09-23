@@ -63,18 +63,39 @@ export default function BodyPhotoPanel({
   }, [onChange]);
 
   useEffect(() => {
-    void refresh();
-    // Fetch the notice up front so the user reads what they are agreeing to
-    // BEFORE choosing a file, not after.
-    presignBodyPhoto()
-      .then((p) => {
-        setNotice(p.notice);
-        setThirdParty(p.sent_to_third_party);
-        thirdPartyRef.current = p.sent_to_third_party;
-        void refresh();
-      })
-      .catch(() => setNotice(null));
-  }, [refresh]);
+    let off = false;
+    void (async () => {
+      // Both up front, in parallel. The notice has to be fetched before the
+      // user picks a file so they read what they are agreeing to first, not
+      // after. The RESULTS are applied in order, notice before list, so the
+      // `onChange` below can report the third-party answer together with the
+      // photos. The previous version called `refresh()` twice — once straight
+      // away, while `thirdPartyRef` was still null, telling the parent an
+      // answer that was not known yet, and again when the presign landed.
+      const [notice, list] = await Promise.allSettled([
+        presignBodyPhoto(),
+        listBodyPhotos(),
+      ]);
+      if (off) return;
+      if (notice.status === "fulfilled") {
+        setNotice(notice.value.notice);
+        setThirdParty(notice.value.sent_to_third_party);
+        thirdPartyRef.current = notice.value.sent_to_third_party;
+      } else {
+        setNotice(null);
+      }
+      if (list.status === "fulfilled") {
+        setPhotos(list.value.photos);
+        setActive(list.value.active);
+        onChange?.(list.value.active, thirdPartyRef.current);
+      } else {
+        setErr(String(list.reason));
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [onChange]);
 
   async function upload() {
     const file = fileRef.current?.files?.[0];

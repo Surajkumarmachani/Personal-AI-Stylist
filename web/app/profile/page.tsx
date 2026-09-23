@@ -27,6 +27,7 @@ import {
   addPreference,
   deletePreference,
   listPreferences,
+  signOut,
   type PreferenceFact,
 } from "@/lib/api";
 import { restoreSession } from "../session";
@@ -100,6 +101,26 @@ export default function ProfilePage() {
       <div className="ui-panel" style={{ marginBottom: 18 }}>
         <h2 className="ui-h3">Account</h2>
         <p className="ui-sub">{email}</p>
+        {/* SIGN OUT, which did not exist anywhere in the app. The only way to
+            leave an account was to delete it — the one button that was
+            offered — or to clear browser storage by hand. `signOut` revokes
+            the refresh token server-side as well as clearing it locally;
+            forgetting it in this browser alone would leave a valid token in
+            anyone else's hands. */}
+        <button
+          className="ui-btn"
+          style={{ marginTop: 10 }}
+          onClick={() => {
+            void signOut().then(() => {
+              // A full reload, not a route push: every screen holds its own
+              // in-memory state from the account being left. Same reasoning
+              // as account deletion in PrivacyControls.
+              window.location.href = "/";
+            });
+          }}
+        >
+          Sign out
+        </button>
       </div>
 
       <AvatarUpload email={email} />

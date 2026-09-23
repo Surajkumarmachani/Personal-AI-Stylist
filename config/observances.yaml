@@ -1,0 +1,112 @@
+# The universal calendar: days that dress people even when their own diary is
+# empty.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# Occasion resolution had two steps: the user's Google calendar, or the
+# default `casual_outing`. So on Diwali, a user without a connected calendar
+# was offered an everyday casual look. The information needed to do better is
+# not personal and needs no integration — it is the date.
+#
+# WHY A DATA FILE AND NOT AN API
+# -------------------------------
+# No key, no network on the request path, no third party learning which days
+# this product's users care about. It is also reviewable: a wrong date here is
+# visible in a diff, where a wrong date from an API is invisible until someone
+# is dressed for the wrong festival.
+#
+# THE COST IS THAT IT EXPIRES, AND THAT IS HANDLED EXPLICITLY
+# ------------------------------------------------------------
+# Fixed-date observances recur forever and are listed once under `recurring`.
+# Lunar and lunisolar ones — Diwali, Holi, Eid — move every year and CANNOT be
+# derived from a rule this system could implement honestly, so they are listed
+# per year under `dated` and simply run out. `observances.coverage_until` is
+# the last date this file can speak for; past it the resolver reports that it
+# does not know rather than pretending every day is ordinary. A calendar that
+# silently stops working is the failure mode this project keeps finding.
+#
+# `occasion` must be a taxonomy occasion id. `formality_hint` is optional and
+# unused today; it is here because "Diwali" and "a wedding reception" are both
+# festive and not equally dressy, and the scorer will eventually want it.
+
+version: 1
+
+# The last date the `dated` entries below are complete to. NOT a guess: it is
+# the end of the last year someone actually entered.
+coverage_until: "2026-12-31"
+
+# Fixed Gregorian dates. These do not move, so they are written once.
+recurring:
+  - name: Republic Day
+    month_day: "01-26"
+    occasion: festival_day
+    note: national holiday, India
+  - name: Independence Day
+    month_day: "08-15"
+    occasion: festival_day
+    note: national holiday, India
+  - name: Gandhi Jayanti
+    month_day: "10-02"
+    occasion: festival_day
+    note: national holiday, India
+  - name: Christmas Day
+    month_day: "12-25"
+    occasion: festival_day
+  - name: New Year's Day
+    month_day: "01-01"
+    occasion: party_night
+
+# Moving observances, one line per occurrence.
+#
+# DELIBERATELY SPARSE. Every date here has to be correct or it dresses someone
+# for the wrong day, and lunar dates are not something to fill in from memory.
+# The entries below are the ones to verify and extend — see the README note
+# this file's loader prints when coverage runs out.
+dated: []
+
+# NAME -> OCCASION, for holidays fetched from Google's public calendar.
+#
+# Google returns a name ("Diwali", "Independence Day"); deciding that Diwali
+# means `festival_day` is this product's judgement, not Google's, so it lives
+# here where it can be reviewed rather than in the client.
+#
+# Matched case-insensitively on substring, most specific first, because
+# Google's summaries vary by locale ("Diwali" vs "Deepavali", "Holi" vs
+# "Holi (Festival of Colours)").
+holiday_occasions:
+  - match: "new year"
+    occasion: party_night
+  - match: "christmas"
+    occasion: festival_day
+  - match: "diwali"
+    occasion: festival_day
+  - match: "deepavali"
+    occasion: festival_day
+  - match: "holi"
+    occasion: festival_day
+  - match: "eid"
+    occasion: festival_day
+  - match: "navratri"
+    occasion: festival_day
+  - match: "dussehra"
+    occasion: festival_day
+  - match: "raksha bandhan"
+    occasion: festival_day
+  - match: "pongal"
+    occasion: festival_day
+  - match: "onam"
+    occasion: festival_day
+  - match: "baisakhi"
+    occasion: festival_day
+  - match: "ganesh"
+    occasion: festival_day
+  - match: "janmashtami"
+    occasion: temple_visit
+  - match: "good friday"
+    occasion: temple_visit
+
+# What an unrecognised public holiday means. `festival_day` rather than
+# `casual_outing`: a holiday nobody mapped is still more likely to be a day
+# people dress up for than an ordinary one -- but a bank holiday is not a
+# festival, so this is a guess and is reported as one.
+holiday_default_occasion: festival_day

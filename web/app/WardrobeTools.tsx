@@ -42,25 +42,46 @@ export default function WardrobeTools({ onChanged }: { onChanged: () => void }) 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Fetching and applying are SPLIT so the mount effect and the
+  // post-mutation refresh share one network path, while the effect keeps a
+  // cancellation guard the click handler does not need. Calling the memoised
+  // loader straight from the effect would trip set-state-in-effect: the rule
+  // cannot see inside a callback to tell whether its setState is synchronous.
+  const fetchAll = useCallback(
+    () => Promise.all([pendingDuplicates(), fetchFacets(), fetchMostWorn(20)]),
+    [],
+  );
+
+  const apply = useCallback((r: Awaited<ReturnType<typeof fetchAll>>) => {
+    const [d, f, m] = r;
+    setDupes(d.items);
+    setFacetData(f);
+    setRanking(m);
+    setError(null);
+  }, []);
+
   const reload = useCallback(async () => {
     try {
-      const [d, f, m] = await Promise.all([
-        pendingDuplicates(),
-        fetchFacets(),
-        fetchMostWorn(20),
-      ]);
-      setDupes(d.items);
-      setFacetData(f);
-      setRanking(m);
-      setError(null);
+      apply(await fetchAll());
     } catch (e) {
       setError(String(e));
     }
-  }, []);
+  }, [fetchAll, apply]);
 
   useEffect(() => {
-    void reload();
-  }, [reload]);
+    let off = false;
+    void (async () => {
+      try {
+        const r = await fetchAll();
+        if (!off) apply(r);
+      } catch (e) {
+        if (!off) setError(String(e));
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [fetchAll, apply]);
 
   const runSearch = useCallback(
     async (next: SearchFilters) => {

@@ -294,7 +294,12 @@ export default function WardrobePage() {
               title="Click to review and correct this item's tags"
             >
               <div className="ui-frame one" style={{ aspectRatio: "1 / 1" }}>
+                {/* `<img>` not `next/image`: `cutout_url` is a presigned
+                    MinIO URL whose signature expires and whose query string
+                    changes every request, so the optimizer would re-encode on
+                    every render and cache output that outlives its own URL. */}
                 {g.cutout_url ? (
+                  // eslint-disable-next-line @next/next/no-img-element -- presigned URL; see above
                   <img src={g.cutout_url} alt={g.subcategory ?? "garment"} loading="lazy" />
                 ) : (
                   <span className="ui-ph">{g.state}</span>

@@ -52,18 +52,31 @@ export default function CalendarConnect() {
 
   useEffect(refresh, [refresh]);
 
+  // Latched during render rather than set from an effect. The banner cannot
+  // simply be DERIVED from the URL, because the effect below deletes that
+  // query the moment it is read — so the outcome has to survive its own
+  // source. Tracking the last outcome seen, rather than a boolean, means a
+  // second connection attempt shows its banner again while a plain re-render
+  // does not.
+  const outcome = params.get("calendar");
+  const [seenOutcome, setSeenOutcome] = useState<string | null>(null);
+  if (outcome !== seenOutcome) {
+    setSeenOutcome(outcome);
+    if (outcome) {
+      setNote(
+        outcome === "connected"
+          ? "Calendar connected."
+          : "Google did not complete the connection. Nothing was saved.",
+      );
+    }
+  }
+
   useEffect(() => {
-    const outcome = params.get("calendar");
     if (!outcome) return;
-    setNote(
-      outcome === "connected"
-        ? "Calendar connected."
-        : "Google did not complete the connection. Nothing was saved.",
-    );
     // Clear the query so a refresh does not replay the banner.
     router.replace("/profile");
     refresh();
-  }, [params, router, refresh]);
+  }, [outcome, router, refresh]);
 
   async function connect() {
     setBusy(true);

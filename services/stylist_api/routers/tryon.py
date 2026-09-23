@@ -85,6 +85,12 @@ TRYON_DAILY_QUOTA = 10
 # immutable for its key and a short TTL would protect against nothing.
 TRYON_URL_TTL_SECONDS = 24 * 3600
 
+# How long a request stays "in flight" before another one may be enqueued.
+# Generous, because a render is 30-120s on shared hardware and the queue is
+# other people's traffic -- but FINITE, so a worker that dies mid-render does
+# not leave an outfit stuck at "in progress" with no way to retry it.
+RENDER_INFLIGHT_TTL_S = 15 * 60
+
 # Named in the consent notice. Storing a body photo and transmitting it to a
 # third party are different things to agree to, and the second one is the one
 # people care about.
@@ -242,12 +248,32 @@ async def tryon(
     if not force_board and store.head(rendered_key) is not None:
         # The render finished. Serve it — and NOT the board, because the whole
         # point of the feature is the picture of them in it.
+        # WHICH SLOTS THE RENDER COVERED. No provider does footwear, so the
+        # shoes in the image are the user's own from their body photo -- not
+        # the ones in this outfit. Returned so the client can say so, instead
+        # of leaving the user to spot the difference and mistrust the render.
+        covered = await db.execute(
+            text(
+                """
+                SELECT detail ->> 'skipped_slots' AS skipped
+                FROM audit_log
+                WHERE action = 'tryon.rendered'
+                  AND user_id = :uid
+                  AND detail ->> 'garment_set_hash' = :h
+                ORDER BY created_at DESC
+                LIMIT 1
+                """
+            ),
+            {"uid": user.id, "h": garment_set_hash},
+        )
+        raw = covered.scalar_one_or_none()
         return {
             "garment_set_hash": garment_set_hash,
             "rendered": True,
             "reason": None,
             "tryon_url": store.presign_download(rendered_key, ttl_seconds=TRYON_URL_TTL_SECONDS),
             "board_endpoint": f"/outfits/{garment_set_hash}/board",
+            "skipped_slots": json.loads(raw) if raw else [],
         }
 
     consented = await db.execute(text("SELECT count(*) FROM body_photo WHERE revoked_at IS NULL"))
@@ -255,20 +281,117 @@ async def tryon(
     provider = getattr(settings, "vton_provider", "")
 
     queued = False
+
+    # A RENDER THAT ALREADY FAILED MUST NOT READ AS "still working".
+    #
+    # There is no object in storage either way, so a failure and a job still
+    # in flight look identical from here -- and this endpoint used to answer
+    # "queued" for both. A render that died in under two seconds against an
+    # unreachable provider therefore invited the user to keep tapping, and
+    # every tap spent quota re-enqueueing a job that would fail the same way.
+    #
+    # The worker records the reason (stylist_worker.tryon._record_failure).
+    # This reads the most recent one for this outfit and, when it is NEWER
+    # than the last request, reports it rather than re-enqueueing. An older
+    # failure is ignored on purpose: the user may have fixed the cause, and
+    # refusing to try again would make one bad render permanent.
+    last_failure = await db.execute(
+        text(
+            """
+            SELECT detail ->> 'reason' AS reason
+            FROM audit_log
+            WHERE action = 'tryon.failed'
+              AND user_id = :uid
+              AND detail ->> 'garment_set_hash' = :h
+              -- SCOPED TO THIS OUTFIT. Without the hash filter this
+              -- compared against the newest request for ANY outfit, so
+              -- tapping a second card made the first card's failure look
+              -- historic and it was suppressed. With several cards tapped,
+              -- every failure was hidden and the screen polled for twelve
+              -- minutes against a provider that had been answering 404 in
+              -- two seconds the whole time.
+              AND created_at > (
+                  SELECT coalesce(max(created_at), to_timestamp(0))
+                  FROM audit_log
+                  WHERE action = 'tryon.requested'
+                    AND user_id = :uid
+                    AND detail ->> 'garment_set_hash' = :h
+              )
+            ORDER BY created_at DESC
+            LIMIT 1
+            """
+        ),
+        {"uid": user.id, "h": garment_set_hash},
+    )
+    failed = last_failure.scalar_one_or_none()
+
+    # IS A RENDER ALREADY IN FLIGHT FOR THIS OUTFIT?
+    #
+    # Without this, every poll re-enqueues. The card tells the user to "tap
+    # again to check", each tap lands here, finds no image, and spends another
+    # unit of a TEN-PER-DAY quota starting a duplicate of the job already
+    # running. Polling the screen automatically would have made that far
+    # worse -- which is why this lands in the same change as the polling.
+    #
+    # In flight = a request for THIS outfit that has not since been answered
+    # by a success or a failure, and is younger than the render timeout. The
+    # timeout matters: without it a worker that died mid-render would leave
+    # the outfit permanently "queued" and unretryable.
+    inflight = await db.execute(
+        text(
+            """
+            SELECT count(*) FROM audit_log
+            WHERE action = 'tryon.requested'
+              AND user_id = :uid
+              AND detail ->> 'garment_set_hash' = :h
+              AND created_at > now() - make_interval(secs => :ttl)
+              AND created_at > coalesce((
+                    SELECT max(created_at) FROM audit_log
+                    WHERE action IN ('tryon.rendered', 'tryon.failed')
+                      AND user_id = :uid
+                      AND detail ->> 'garment_set_hash' = :h
+                  ), to_timestamp(0))
+            """
+        ),
+        {"uid": user.id, "h": garment_set_hash, "ttl": float(RENDER_INFLIGHT_TTL_S)},
+    )
+    already_running = int(inflight.scalar_one() or 0) > 0
+
     if force_board:
         reason = "board requested"
     elif not has_consent:
         reason = "no body photo consented; add one to enable try-on"
     elif not provider:
         reason = "try-on is not enabled on this deployment"
+    elif failed is not None:
+        # Stated plainly instead of another wait. The board is still
+        # returned, so the screen still shows the outfit accurately.
+        reason = "render failed: " + str(failed)
+    elif already_running:
+        # Do NOT enqueue a second job, and do NOT charge quota for asking.
+        queued = True
+        reason = "render in progress"
     else:
+        # `user_id` IS IN THE PREDICATE, not left to RLS.
+        #
+        # `audit_log` has row security DISABLED (relrowsecurity = false) -- it
+        # is a cross-tenant operational log by design. So this count, which had
+        # no tenant predicate, was counting EVERY user's renders against every
+        # user's cap: the first ten try-ons on the deployment would have locked
+        # out the whole tenancy for a day.
+        #
+        # It read as correct because the comment above says "per-tenant" and
+        # because a single-user database cannot tell the two apart -- 10 mine,
+        # 10 total.
         used = await db.execute(
             text(
                 "SELECT count(*) FROM audit_log WHERE action = 'tryon.requested' "
-                "AND created_at > now() - interval '1 day'"
-            )
+                "AND user_id = :uid AND created_at > now() - interval '1 day'"
+            ),
+            {"uid": user.id},
         )
-        if int(used.scalar_one() or 0) >= TRYON_DAILY_QUOTA:
+        quota = getattr(settings, "tryon_daily_quota", TRYON_DAILY_QUOTA)
+        if int(used.scalar_one() or 0) >= quota:
             # §B3: a quota is a feature downgrade, not an outage. The user
             # still gets an accurate picture of the outfit.
             reason = "daily try-on limit reached; showing the flat-lay instead"

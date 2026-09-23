@@ -259,6 +259,11 @@ services:
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8080/calendar/callback}
+      # The GLOBAL calendar: a public holiday feed read with an API key,
+      # not OAuth. Unset degrades to config/observances.yaml, which holds
+      # fixed dates only and cannot carry Diwali, Holi or Eid.
+      GOOGLE_CALENDAR_API_KEY: ${GOOGLE_CALENDAR_API_KEY:-}
+      GOOGLE_HOLIDAY_CALENDAR_ID: ${GOOGLE_HOLIDAY_CALENDAR_ID:-en.indian#holiday@group.v.calendar.google.com}
       # ---- Virtual try-on (Phase 10) ----
       # The API does not RENDER — the worker does — but it decides whether to
       # enqueue at all, and it names the third party in the body-photo consent
@@ -269,6 +274,11 @@ services:
       VTON_API_TOKEN: ${VTON_API_TOKEN:-}
       VTON_BASE_URL: ${VTON_BASE_URL:-}
       VTON_TIMEOUT_S: ${VTON_TIMEOUT_S:-900}
+      # Renders per tenant per rolling day. Listed HERE as well as in .env:
+      # this compose file passes variables through EXPLICITLY, so a value set
+      # only in .env would look configured and never reach the container.
+      TRYON_DAILY_QUOTA: ${TRYON_DAILY_QUOTA:-10}
+      TRYON_MAX_PASSES: ${TRYON_MAX_PASSES:-2}
     ports:
       - "8080:8000"
     command: uvicorn stylist_api.main:app --host 0.0.0.0 --port 8000 --reload
@@ -334,6 +344,9 @@ services:
       VTON_API_TOKEN: ${VTON_API_TOKEN:-}
       VTON_BASE_URL: ${VTON_BASE_URL:-}
       VTON_TIMEOUT_S: ${VTON_TIMEOUT_S:-900}
+      # The WORKER is what renders, so the pass cap belongs here too.
+      # Setting it only on the api service would change nothing at all.
+      TRYON_MAX_PASSES: ${TRYON_MAX_PASSES:-2}
     command: arq stylist_worker.main.WorkerSettings
     volumes:
       - ../../packages:/app/packages

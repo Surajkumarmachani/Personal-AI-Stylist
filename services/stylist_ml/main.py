@@ -297,6 +297,33 @@ async def segment(request: Request) -> dict[str, Any]:
     }
 
 
+@app.post("/head-mask")
+async def head_mask(request: Request) -> Response:
+    """Where the person's head is, as a 1-bit PNG.
+
+    Exists for try-on. A provider regenerates the whole frame, so the rendered
+    person has an invented face; this stencil is what lets the caller put the
+    user's OWN head back over the render, pixel for pixel.
+
+    Raw PNG rather than a JSON envelope, matching /matte: one image, and the
+    33% base64 overhead would be the dominant cost.
+    """
+    data = await _body(request)
+    model = _require(registry.SEGFORMER.name)
+    try:
+        async with _inference_slot("segment"):
+            png = await asyncio.to_thread(segmentation.head_mask, model, data)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("head-mask failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"head-mask failed: {type(exc).__name__}",
+        ) from exc
+    return Response(content=png, media_type="image/png")
+
+
 @app.post("/matte")
 async def matte(request: Request) -> Response:
     """Raw image bytes in, RGBA cutout PNG out.

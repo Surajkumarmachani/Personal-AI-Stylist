@@ -228,10 +228,20 @@ async def test_the_materialised_path_obeys_never_rules(wardrobe) -> None:
     async with tenant_session(wardrobe) as db:
         keep = await _garment(db, wardrobe, primary_colour="maroon")
         banned = await _garment(db, wardrobe, primary_colour="yellow")
+        # A BOTTOM, so each row is a structurally real outfit. These used to be
+        # single-garment rows, which `_hydrate` now rejects for having no base
+        # structure -- it re-checks stored outfits against the slot rules, to
+        # stop precomputed rows that a later tag correction made impossible
+        # (two pairs of jeans; jeans with no top) from being served. A
+        # one-garment outfit is not something this system can produce, so the
+        # fixture was the unrealistic part, not the check.
+        bottom = await _garment(
+            db, wardrobe, slot="lower", subcategory="jeans", primary_colour="denim_indigo"
+        )
 
         rows = [
-            {"garment_ids": [keep], "score": 0.9, "score_breakdown": {}},
-            {"garment_ids": [banned], "score": 0.8, "score_breakdown": {}},
+            {"garment_ids": [keep, bottom], "score": 0.9, "score_breakdown": {}},
+            {"garment_ids": [banned, bottom], "score": 0.8, "score_breakdown": {}},
         ]
 
         before, _ = await _hydrate(db, FakeStore(), rows)
@@ -241,7 +251,7 @@ async def test_the_materialised_path_obeys_never_rules(wardrobe) -> None:
         after, _ = await _hydrate(db, FakeStore(), rows)
 
     assert len(after) == 1, "the outfit containing a 'never' garment is dropped"
-    assert after[0]["_ids"] == [str(keep)]
+    assert after[0]["_ids"] == [str(keep), str(bottom)]
 
 
 async def test_a_never_rule_does_not_produce_a_blank_screen(wardrobe) -> None:

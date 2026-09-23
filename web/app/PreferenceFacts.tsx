@@ -87,20 +87,42 @@ export default function PreferenceFacts() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // Fetching and applying are SPLIT so the mount effect and the
+  // post-mutation refresh share one network path, while the effect keeps a
+  // cancellation guard the click handler does not need. Calling the memoised
+  // loader straight from the effect would trip set-state-in-effect: the rule
+  // cannot see inside a callback to tell whether its setState is synchronous.
+  const fetchAll = useCallback(() => Promise.all([listPreferences(), facets()]), []);
+
+  const apply = useCallback((r: Awaited<ReturnType<typeof fetchAll>>) => {
+    const [prefs, f] = r;
+    setFactsList(prefs.facts);
+    setOptions(f);
+    setError(null);
+  }, []);
+
   const refresh = useCallback(async () => {
     try {
-      const [prefs, f] = await Promise.all([listPreferences(), facets()]);
-      setFactsList(prefs.facts);
-      setOptions(f);
-      setError(null);
+      apply(await fetchAll());
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     }
-  }, []);
+  }, [fetchAll, apply]);
 
   useEffect(() => {
-    void refresh();
-  }, [refresh]);
+    let off = false;
+    void (async () => {
+      try {
+        const r = await fetchAll();
+        if (!off) apply(r);
+      } catch (e) {
+        if (!off) setError(e instanceof Error ? e.message : String(e));
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [fetchAll, apply]);
 
   // Only values the user ACTUALLY OWNS. A picker listing all 144 subcategories
   // invites a rule about a garment type they do not have, which then does
@@ -113,11 +135,18 @@ export default function PreferenceFacts() {
     return list ?? [];
   }, [options, field]);
 
-  useEffect(() => {
-    // Reset the value whenever the field changes, so a stale selection cannot
-    // be submitted against the wrong field.
+  // Adjusted DURING RENDER, not in an effect. This is the pattern React
+  // documents for "reset state when something changes": an effect renders
+  // once with the stale selection and then immediately renders again, so for
+  // one frame the form shows a value belonging to the PREVIOUS field — which
+  // is the exact thing this reset exists to prevent. Comparing against the
+  // previous `values` keeps the trigger identical, because `values` is
+  // memoised on exactly [options, field].
+  const [prevValues, setPrevValues] = useState(values);
+  if (prevValues !== values) {
+    setPrevValues(values);
     setValue(values[0]?.value ?? "");
-  }, [values]);
+  }
 
   const add = async () => {
     if (!value) return;

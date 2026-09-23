@@ -411,3 +411,158 @@ def test_everything_overlapping_preserves_the_original_order() -> None:
     scored = [_fake(["a", "b"], 0.9), _fake(["a", "b"], 0.8), _fake(["a", "b"], 0.7)]
     got = diversify(scored, limit=3, overlap_penalty=0.15)
     assert [s.total for _, s in got] == [0.9, 0.8, 0.7]
+
+
+async def test_a_stored_outfit_that_breaks_todays_rules_is_not_served(
+    api, registered, owner_engine
+) -> None:
+    """A precomputed outfit is a claim about garments as they were tagged.
+
+    Correcting a slot -- or changing the rules -- can make that claim false
+    underneath it. Two such rows were served as FIRST CHOICE from one
+    precompute run: two pairs of jeans with no top, and jeans with shoes and
+    no top. Neither is something the generator can produce; both had been
+    materialised before a mis-tagged garment was corrected.
+
+    The garments are INSERTED here rather than taken from the fixture, which
+    owns a single untagged garment. An earlier version of this test asked the
+    fixture for two `lower` garments and skipped when it found none -- so it
+    reported success while never once exercising the guard.
+    """
+    import uuid as _uuid
+
+    import sqlalchemy as sa
+
+    async with owner_engine.begin() as conn:
+        user_id = (
+            await conn.execute(
+                sa.text("SELECT id FROM users WHERE email = :e"), {"e": registered.email}
+            )
+        ).scalar_one()
+
+        ids = [_uuid.uuid4(), _uuid.uuid4()]
+        for gid in ids:
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO garments (id, user_id, original_key, slot, subcategory,"
+                    " primary_colour, dress_code, formality, warmth, attributes_raw,"
+                    " field_confidence, user_verified_fields, state, needs_review,"
+                    " is_active, moderation, needs_wash, created_at, updated_at)"
+                    " VALUES (:id, :u, :key, CAST('lower' AS slot),"
+                    " CAST('jeans' AS subcategory), CAST('denim_indigo' AS colour),"
+                    " CAST('casual' AS dress_code), 2, 2, '{}'::jsonb, '{}'::jsonb,"
+                    " '{}', 'matted', false, true, '{}'::jsonb, false, now(), now())"
+                ),
+                {"id": gid, "u": user_id, "key": f"originals/{user_id}/{gid}"},
+            )
+
+        # TWO BOTTOMS AND NOTHING ELSE: no base structure, so not an outfit.
+        # Score 0.99 puts it first if it is served at all.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO outfits (id, user_id, garment_ids, garment_set_hash,"
+                " occasion, warmth_target, formality_target, wet, score,"
+                " score_breakdown, scoring_version, created_at) VALUES"
+                " (gen_random_uuid(), :u, ARRAY[CAST(:a AS uuid), CAST(:b AS uuid)],"
+                " 'impossible-outfit-hash', 'casual_outing', :w, 3, false, 0.99,"
+                " '{}'::jsonb, 1, now())"
+            ),
+            # warmth_target is only ever 1, 3 or 5 -- `resolve_context` maps
+            # every temperature into those three bands. An earlier version of
+            # this test stored 2, which the serving query could never match
+            # (it filters on warmth_target), so the row was never read and the
+            # test passed WITH THE GUARD DISABLED.
+            {"u": user_id, "a": ids[0], "b": ids[1], "w": 3},
+        )
+
+    # 26 C -> warmth band 3, matching the row above.
+    resp = await api.get(
+        "/suggestions?occasion=casual_outing&feels_like_c=26", headers=registered.auth
+    )
+    assert resp.status_code == 200, resp.text
+    served = resp.json()["outfits"]
+
+    for outfit in served:
+        slots = [g["slot"] for g in outfit["garments"]]
+        assert len(slots) == len(set(slots)), f"two garments in one slot: {slots}"
+        assert "upper_base" in slots or "full_body" in slots, f"no top: {slots}"
+
+
+def test_the_universal_calendar_dresses_a_user_with_no_diary() -> None:
+    """Occasion resolution was: your Google calendar, else `casual_outing`.
+
+    So on Independence Day a user who had not connected a calendar was offered
+    an everyday casual look -- from information the system already had, since
+    the date is not personal data and needs no integration.
+    """
+    import datetime as dt
+
+    from stylist_domain.observances import observance_for
+
+    o = observance_for(dt.date(2026, 8, 15))
+    assert o is not None and o.occasion == "festival_day"
+    assert observance_for(dt.date(2026, 9, 23)) is None
+
+
+def test_every_observance_names_a_real_taxonomy_occasion() -> None:
+    """A typo here is a 400 on the day of the festival, for every user at
+    once, and only on that day."""
+    import yaml
+
+    from stylist_domain.observances import CONFIG
+    from stylist_domain.taxonomy import load_taxonomy
+
+    ids = {o["id"] for o in load_taxonomy().raw["occasions"]}
+    table = yaml.safe_load(CONFIG.open())
+    for row in (table.get("recurring") or []) + (table.get("dated") or []):
+        assert row["occasion"] in ids, f"{row['name']} -> unknown occasion {row['occasion']}"
+
+
+def test_the_calendar_admits_when_it_has_run_out() -> None:
+    """Moving festivals are listed by hand and simply stop.
+
+    Returning "no observance" for an uncovered year would make a calendar that
+    has expired indistinguishable from one reporting an ordinary day -- the
+    exact failure this codebase keeps turning up. `is_stale` is what lets the
+    caller say so.
+    """
+    import datetime as dt
+
+    from stylist_domain.observances import coverage_until, is_stale
+
+    assert is_stale(dt.date(coverage_until().year + 2, 6, 1)) is True
+    assert is_stale(coverage_until()) is False
+
+
+def test_a_bank_holiday_is_not_holi() -> None:
+    """The first version of the holiday mapper matched on plain substrings,
+    and "holi" is inside "Bank **Holi**day".
+
+    Every UK bank holiday would have resolved to Holi and dressed people in
+    festive ethnic wear for a long weekend. Found by testing the mapper
+    against names it would actually see rather than only the ones it was
+    written for.
+    """
+    from stylist_domain.observances import occasion_for_holiday_name
+
+    assert occasion_for_holiday_name("Holi")[1] is True
+    assert occasion_for_holiday_name("Holi (Festival of Colours)")[1] is True
+    # Recognised must be False: the occasion may still default to festive, but
+    # the reason shown to the user has to be phrased as a guess.
+    assert occasion_for_holiday_name("Spring Bank Holiday")[1] is False
+    assert occasion_for_holiday_name("August Bank Holiday")[1] is False
+
+
+def test_every_holiday_mapping_names_a_real_occasion() -> None:
+    """Including the default. A typo here is a 400 for every user, on a
+    festival, and only on that day."""
+    import yaml
+
+    from stylist_domain.observances import CONFIG
+    from stylist_domain.taxonomy import load_taxonomy
+
+    ids = {o["id"] for o in load_taxonomy().raw["occasions"]}
+    table = yaml.safe_load(CONFIG.open())
+    for row in table.get("holiday_occasions") or []:
+        assert row["occasion"] in ids, f"{row['match']} -> {row['occasion']}"
+    assert table["holiday_default_occasion"] in ids

@@ -294,9 +294,28 @@ dress_codes:
   - {id: black_tie,      formality_range: [5, 5]}
 
 # Which dress codes can share an outfit without a penalty.
+# READ AS: occasion's dress code -> garment dress codes acceptable FOR it.
+#
+# THIS RELATION IS DIRECTIONAL, and `validate_taxonomy.py` only WARNS about
+# asymmetry for that reason. `casual -> activewear` and `activewear -> casual`
+# are not the same claim:
+#
+#   casual     accepts activewear   joggers to the shops is fine
+#   activewear accepts casual       squatting in jeans is not
+#
+# It was symmetric, and the visible result was the gym occasion recommending a
+# denim shirt with jeans and white sneakers, four times over, as its top
+# choices. Nothing was stale and no rule was violated -- `casual` garments were
+# simply declared acceptable for `activewear`, so the scorer ranked the best
+# casual outfit in a wardrobe with no gym clothes in it.
+#
+# `loungewear` was already strict for exactly this reason.
+#
+# No enum changed: this is the compatibility MAP, not the `dress_codes` list,
+# so no Postgres type moves and no Alembic migration is required.
 dress_code_compatibility:
   loungewear:     [loungewear]
-  activewear:     [activewear, casual]
+  activewear:     [activewear]
   casual:         [casual, smart_casual, activewear]
   smart_casual:   [smart_casual, casual, business]
   business:       [business, smart_casual]

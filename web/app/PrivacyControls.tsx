@@ -70,6 +70,13 @@ export default function PrivacyControls({ email }: { email: string }) {
       clearSession();
       // A full reload, not a route push: every screen gates on an in-memory
       // token, and the account this one belongs to no longer exists.
+      //
+      // Defeating the SPA router is the POINT, so the rule's advice to use
+      // `router.push()` is wrong here specifically: a push keeps this tab's
+      // React tree alive, and with it the access token and every piece of
+      // wardrobe data already fetched, after the account behind them has been
+      // deleted. Only a document navigation discards that.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination -- see above
       window.location.href = "/";
     } catch (e) {
       setErr(e instanceof Error ? e.message : String(e));

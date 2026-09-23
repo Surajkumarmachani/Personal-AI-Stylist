@@ -29,7 +29,7 @@ import datetime as dt
 import logging
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 import httpx
 
@@ -39,6 +39,9 @@ AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 REVOKE_URL = "https://oauth2.googleapis.com/revoke"
 EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/primary/events"
+# Any calendar id, not just `primary`. Public holiday calendars are read
+# with an API KEY rather than OAuth: they are not anybody's private diary.
+CALENDAR_EVENTS_URL = "https://www.googleapis.com/calendar/v3/calendars/{calendar_id}/events"
 USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
 
 # The narrowest scope that returns event titles. `openid`/`email` come along
@@ -223,6 +226,69 @@ async def list_today(access_token: str, *, timezone: str, day: dt.date | None = 
         if summary:
             titles.append(str(summary))
     return titles
+
+
+async def list_public_holidays(
+    *,
+    api_key: str,
+    calendar_id: str,
+    day: dt.date,
+) -> list[str]:
+    """Holiday names on `day`, from a PUBLIC Google calendar.
+
+    WHY AN API KEY AND NOT OAUTH
+    -----------------------------
+    A national holiday calendar is not a person's diary. It needs no consent,
+    no refresh token and no per-user grant -- an API key reads it, and the
+    same answer serves every user in that country. This is deliberately a
+    different code path from `list_today`, which handles the user's own
+    calendar and is bound by the consent the UI collected.
+
+    WHY THIS REPLACES A HAND-WRITTEN TABLE
+    ---------------------------------------
+    `config/observances.yaml` can hold fixed dates forever -- Independence Day
+    does not move. It cannot hold Diwali, Holi or Eid without someone entering
+    every year by hand, and a table like that expires silently. Google's
+    holiday calendars already carry them.
+
+    Returns NAMES, not occasions. Mapping "Diwali" to `festival_day` is this
+    product's judgement and belongs in config, not in a client that only knows
+    how to talk to Google.
+
+    Raises `CalendarUnavailable` so the caller falls back to the table rather
+    than failing the request: a holiday lookup is an enhancement, and no
+    suggestion should 500 because Google is slow.
+    """
+    start = dt.datetime.combine(day, dt.time.min, tzinfo=dt.UTC)
+    params = {
+        "key": api_key,
+        "timeMin": start.isoformat(),
+        "timeMax": (start + dt.timedelta(days=1)).isoformat(),
+        "singleEvents": "true",
+        "maxResults": "20",
+    }
+    url = CALENDAR_EVENTS_URL.format(calendar_id=quote(calendar_id, safe=""))
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            resp = await client.get(url, params=params)
+    except httpx.HTTPError as exc:
+        raise CalendarUnavailable(f"holiday calendar unreachable: {exc}") from exc
+
+    if resp.status_code != 200:
+        # 403 here usually means the key is missing the Calendar API, and 404
+        # a mistyped calendar id. Both are configuration, and both must read
+        # as "unavailable" rather than "no holiday today" -- otherwise a
+        # broken key looks exactly like an ordinary Tuesday.
+        raise CalendarUnavailable(
+            f"holiday calendar returned {resp.status_code}: {resp.text[:200]}"
+        )
+
+    names: list[str] = []
+    for item in resp.json().get("items", []):
+        summary = (item.get("summary") or "").strip()
+        if summary:
+            names.append(summary)
+    return names
 
 
 def _declined(item: dict[str, Any]) -> bool:

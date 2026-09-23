@@ -69,7 +69,13 @@ class SegmentResult:
     model: str
 
 
-def segment(model: LoadedModel, image_bytes: bytes) -> SegmentResult:
+def _label_map(model: LoadedModel, image_bytes: bytes) -> np.ndarray:
+    """ATR class id per pixel, at the ORIGINAL frame size.
+
+    Extracted so `segment` and `head_mask` cannot drift: they must agree about
+    which pixels are the person, or a head stencil would not line up with the
+    garments cut from the same photo.
+    """
     from stylist_ml.preprocess import load_rgb
 
     img = load_rgb(image_bytes)
@@ -89,7 +95,36 @@ def segment(model: LoadedModel, image_bytes: bytes) -> SegmentResult:
     # class 4 and class 6 is class 5, which is a different garment entirely.
     # Interpolating logits and then taking argmax is the only correct order.
     upsampled = _bilinear_upsample(logits[0], original_h, original_w)
-    labels = np.argmax(upsampled, axis=0).astype(np.uint8)
+    return np.argmax(upsampled, axis=0).astype(np.uint8)
+
+
+# The person's head: hair and face together.
+#
+# A try-on provider regenerates the WHOLE frame, so the person in the output is
+# a stranger wearing the right clothes. Only the garment region had to change;
+# the head never did. Parsing the ORIGINAL photo for these two classes gives an
+# exact stencil for putting the user's own head back.
+HEAD_CLASSES: frozenset[int] = frozenset({2, 11})  # Hair, Face
+
+
+def head_mask(model: LoadedModel, image_bytes: bytes) -> bytes:
+    """Single-channel PNG: 255 where the person's head is, 0 elsewhere.
+
+    Deliberately NOT folded into /segment's response. That endpoint answers
+    "what garments are in this photo", and returning body parts there would
+    make every caller responsible for knowing which classes to ignore — which
+    is the mistake NON_GARMENT_CLASSES exists to prevent.
+    """
+    labels = _label_map(model, image_bytes)
+    return mask_to_png(np.isin(labels, list(HEAD_CLASSES)))
+
+
+def segment(model: LoadedModel, image_bytes: bytes) -> SegmentResult:
+    from stylist_ml.preprocess import load_rgb
+
+    img = load_rgb(image_bytes)
+    original_w, original_h = img.size
+    labels = _label_map(model, image_bytes)
 
     total_px = original_h * original_w
     present, counts = np.unique(labels, return_counts=True)

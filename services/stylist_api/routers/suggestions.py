@@ -23,6 +23,7 @@ so it stops being a caveat on its own when real tags arrive.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import uuid
@@ -42,10 +43,18 @@ from stylist_api.deps import (
     SettingsDep,
     TenantDB,
 )
+from stylist_clients.google_calendar import CalendarUnavailable, list_public_holidays
 from stylist_db.session import tenant_session
 from stylist_domain.bandit import Arm, daily_seed, explore_slots, reorder
 from stylist_domain.context import resolve_context
+from stylist_domain.observances import (
+    coverage_until,
+    is_stale,
+    observance_for,
+    occasion_for_holiday_name,
+)
 from stylist_domain.scoring import load_scoring_config
+from stylist_domain.slots import OutfitItem, evaluate
 from stylist_domain.taxonomy import load_taxonomy
 from stylist_suggest import (
     TEMPLATE_RATIONALE,
@@ -200,6 +209,77 @@ async def _resolve_weather(
     )
 
 
+
+async def _occasion_from_global_calendar(
+    settings: Any, cache: Any, today: date
+) -> tuple[str, str] | None:
+    """Today's public holiday, as (occasion, reason). None if there is none.
+
+    GOOGLE FIRST, THE LOCAL TABLE SECOND.
+    -------------------------------------
+    `config/observances.yaml` can hold fixed dates forever but not Diwali,
+    Holi or Eid -- those move every year and a hand-kept list of them expires
+    silently. Google's public holiday calendar already carries them and needs
+    only an API key, because a national holiday is nobody's private diary.
+
+    CACHED FOR A DAY. Holidays do not change, and without this every
+    suggestion request on a festival would call Google. The cache key is the
+    date and the calendar id, so changing country does not serve yesterday's
+    answer for the wrong place.
+
+    FAILS TO THE TABLE, NOT TO AN ERROR. A missing key, a 403 from a key
+    without the Calendar API, or Google being slow all land here; the fixed
+    dates still resolve offline, and no suggestion 500s because a holiday
+    lookup did.
+    """
+    api_key = getattr(settings, "google_calendar_api_key", "")
+    calendar_id = getattr(settings, "google_holiday_calendar_id", "")
+    if api_key and calendar_id:
+        cache_key = f"holiday:{calendar_id}:{today.isoformat()}"
+        names: list[str] | None = None
+        try:
+            cached = await cache.get(cache_key)
+            if cached is not None:
+                names = json.loads(cached)
+        except Exception:  # pragma: no cover - cache is an optimisation
+            names = None
+
+        if names is None:
+            try:
+                names = await list_public_holidays(
+                    api_key=api_key, calendar_id=calendar_id, day=today
+                )
+                with contextlib.suppress(Exception):
+                    await cache.set(cache_key, json.dumps(names), ex=24 * 3600)
+            except CalendarUnavailable as exc:
+                logger.warning("global calendar unavailable, using local table: %s", exc)
+                names = None
+
+        if names:
+            # The first NAMED holiday wins. Google returns observances in no
+            # meaningful priority order, and a day with two is rare enough
+            # that picking the first recognised one beats inventing a ranking.
+            for name in names:
+                occasion, recognised = occasion_for_holiday_name(name)
+                if recognised:
+                    return occasion, f"{name} today, so this is dressed for that."
+            first = names[0]
+            occasion, _ = occasion_for_holiday_name(first)
+            # SAID AS A GUESS, because it is one. An unmapped public holiday
+            # may be a festival or may be a long weekend, and stating the
+            # second with the confidence of the first is how a product loses
+            # trust on the one day the user is paying attention.
+            return occasion, (
+                f"{first} today. It is a public holiday rather than one this "
+                f"app has a dress rule for, so this is a best guess."
+            )
+
+    local = observance_for(today)
+    if local is not None:
+        return local.occasion, f"{local.name} today, so this is dressed for that."
+    return None
+
+
 async def _occasion_from_calendar(
     db: Any, settings: Any, user: Any
 ) -> tuple[str | None, str | None, int | None]:
@@ -285,7 +365,34 @@ async def get_suggestions(
         if from_calendar:
             occasion, occasion_source, occasion_reason = from_calendar, "calendar", why
         else:
-            occasion, occasion_source = DEFAULT_OCCASION, "default"
+            # THE UNIVERSAL CALENDAR, between the personal one and the default.
+            #
+            # A user with no Google calendar connected was offered an everyday
+            # casual look on Diwali. The date is not personal data and needs no
+            # integration -- the system already knew it and was not using it.
+            #
+            # Strictly BELOW the personal calendar: someone with a wedding in
+            # their diary on Independence Day is going to the wedding. What is
+            # on YOUR day beats what is on everyone's.
+            today = date.today()
+            from_global = await _occasion_from_global_calendar(settings, cache, today)
+            if from_global is not None:
+                occasion, occasion_reason = from_global
+                occasion_source = "observance"
+            else:
+                occasion, occasion_source = DEFAULT_OCCASION, "default"
+                if is_stale(today):
+                    # NOT SILENT. Recurring dates still resolve past the
+                    # table's coverage, but moving festivals are simply
+                    # unknown -- so "no observance" here means "nobody has
+                    # entered this year", not "an ordinary day". Saying so is
+                    # the difference between a calendar that stopped working
+                    # and one that looks like it is working.
+                    occasion_reason = (
+                        "The festival calendar has no entries past "
+                        f"{coverage_until().isoformat()}, so moving festivals "
+                        "such as Diwali cannot be detected for today."
+                    )
 
     if occasion not in {o["id"] for o in taxonomy.raw["occasions"]}:
         raise HTTPException(
@@ -665,6 +772,37 @@ async def _hydrate(
             # A garment that is gone, or one a `never` rule just removed.
             # Either way the outfit cannot be rendered honestly, so it is
             # skipped rather than shown with a gap.
+            continue
+
+        # RE-CHECK THE STRUCTURE RULES AGAINST TODAY'S TAGS.
+        #
+        # A stored outfit is a claim about garments AS THEY WERE TAGGED when
+        # it was materialised, and that claim can stop being true underneath
+        # it: correcting a slot, or changing the rules themselves, leaves rows
+        # the generator would never produce now. Two real examples, both
+        # served as FIRST CHOICE from one precompute run:
+        #
+        #   ['feet','lower','lower']   two pairs of jeans, no top
+        #   ['feet','lower']           jeans and shoes, no top at all
+        #
+        # Pruning on correction (routers/corrections.py) stops NEW ones
+        # appearing. This stops OLD ones being served, and costs one in-memory
+        # check over at most `limit` outfits. The live path comes through here
+        # too, so the rule is enforced once for both rather than twice and
+        # differently -- a rule enforced on one path only is worse than on
+        # neither, because it looks like it works.
+        verdict = evaluate(
+            [
+                OutfitItem(garment_id=i["id"], slot=i["slot"], subcategory=i["subcategory"])
+                for i in items
+            ]
+        )
+        if not verdict.valid:
+            logger.warning(
+                "dropping stored outfit %s: %s",
+                r.get("garment_set_hash"),
+                ", ".join(verdict.violations),
+            )
             continue
         # THE OUTFIT'S DRESS CODE = the most common among its garments, which
         # is the bandit's arm. Ties break on the value itself, not on row

@@ -165,6 +165,23 @@ class MLClient:
             largest_blob_share=float(resp.headers.get("X-Largest-Blob-Share", "1")),
         )
 
+    async def head_mask(self, *, image_bytes: bytes) -> bytes:
+        """1-bit PNG marking the person's head in this photo.
+
+        Used to restore the user's real face over a try-on render, which
+        otherwise returns a stranger wearing the right clothes.
+        """
+        try:
+            async with httpx.AsyncClient(timeout=self._timeout(SEGMENT_TIMEOUT)) as client:
+                resp = await client.post(
+                    f"{self._base_url}/head-mask", content=image_bytes
+                )
+        except Exception as exc:
+            _raise_if_unavailable(exc)
+            raise
+        _raise_for_status(resp)
+        return resp.content
+
     async def segment(self, *, image_bytes: bytes) -> SegmentResponse:
         """Per-class garment masks.
 

@@ -36,6 +36,7 @@ one, and that applies with more force to a picture of someone's own body.
 from __future__ import annotations
 
 import io
+import json
 import logging
 import uuid
 from typing import Any
@@ -99,6 +100,123 @@ def _looks_unchanged(before: bytes, after: bytes) -> bool:
         return False
     total = sum(abs(x - y) for x, y in zip(pixels_a, pixels_b, strict=True))
     return bool((total / len(pixels_a)) < PASSTHROUGH_MAX_DIFF)
+
+
+
+async def _record_failure(uid: uuid.UUID, garment_set_hash: str, reason: str) -> None:
+    """Write the failure where the API can SEE it.
+
+    The API documents a `render failed` state -- "the provider erred or
+    returned nothing usable" -- and this function is what makes that state
+    reachable. Until it existed, a failed render returned its reason into
+    arq's Redis result, which the API never reads, so a render that died in
+    1.7 seconds against a dead endpoint was indistinguishable from one still
+    working: the card said "queued, tap again to check" forever, and every tap
+    spent quota on a job that had already failed.
+
+    `audit_log` rather than a new table: it already carries `user_id`,
+    `subject_id` and a jsonb `detail`, it is already the try-on quota counter,
+    and one row per failed render alongside the row for the request that
+    caused it keeps the sequence readable by anyone debugging it.
+    """
+    async with tenant_session(uid) as session:
+        await session.execute(
+            text(
+                "INSERT INTO audit_log (id, user_id, action, subject_type, subject_id, detail) "
+                "VALUES (:id, :uid, 'tryon.failed', 'outfit', NULL, CAST(:detail AS jsonb))"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "uid": uid,
+                "detail": json.dumps({"garment_set_hash": garment_set_hash, "reason": reason}),
+            },
+        )
+
+
+
+async def _record_render(
+    uid: uuid.UUID, garment_set_hash: str, rendered: list[str], skipped: list[str]
+) -> None:
+    """Record which slots a successful render covered, and which it did not."""
+    async with tenant_session(uid) as session:
+        await session.execute(
+            text(
+                "INSERT INTO audit_log (id, user_id, action, subject_type, detail) "
+                "VALUES (:id, :uid, 'tryon.rendered', 'outfit', CAST(:detail AS jsonb))"
+            ),
+            {
+                "id": uuid.uuid4(),
+                "uid": uid,
+                "detail": json.dumps(
+                    {
+                        "garment_set_hash": garment_set_hash,
+                        "rendered_slots": rendered,
+                        "skipped_slots": sorted(set(skipped)),
+                    }
+                ),
+            },
+        )
+
+
+
+async def _restore_head(original: bytes, rendered: bytes) -> bytes:
+    """Put the user's OWN head back over a render. Best effort.
+
+    WHY THIS IS NECESSARY
+    ---------------------
+    A try-on provider does not paste a garment onto a photo. It regenerates
+    the entire frame, so the face comes back as a plausible stranger: measured
+    on one real render, the subject's beard and sunglasses were gone, the
+    features were somebody else's, and a cap appeared that was never there.
+    For a product whose whole promise is "how would *I* look in this", that is
+    the difference between useful and worthless.
+
+    Only the garment region ever had to change. The head did not. So the head
+    is taken from the ORIGINAL photo, using the ATR parse of that same photo
+    as a stencil, and composited back.
+
+    FEATHERED, not a hard cut. A 1-bit stencil edge against regenerated skin
+    reads as a paste-up; a few pixels of blur across the boundary makes the
+    seam disappear without moving it.
+
+    BEST EFFORT, deliberately. If the parse fails, the sizes disagree, or the
+    ML service is down, the render is returned UNCHANGED rather than failing:
+    a render with the wrong face is still worth more than no render, and this
+    is an enhancement to a picture that already exists.
+    """
+    try:
+        from PIL import Image, ImageFilter
+
+        from stylist_api.settings import get_settings
+        from stylist_clients.ml_client import MLClient
+
+        settings = get_settings()
+        ml = MLClient(base_url=getattr(settings, "ml_base_url", ""))
+        stencil_png = await ml.head_mask(image_bytes=original)
+
+        base = Image.open(io.BytesIO(rendered)).convert("RGB")
+        head_src = Image.open(io.BytesIO(original)).convert("RGB")
+        stencil = Image.open(io.BytesIO(stencil_png)).convert("L")
+
+        # The provider may return a different size than it was given. Line
+        # everything up on the RENDER, which is what the user will see.
+        if head_src.size != base.size:
+            head_src = head_src.resize(base.size, Image.Resampling.LANCZOS)
+        if stencil.size != base.size:
+            stencil = stencil.resize(base.size, Image.Resampling.NEAREST)
+
+        if stencil.getbbox() is None:
+            # No head found in the photo. Nothing to restore, and pasting an
+            # empty stencil would be a no-op with extra steps.
+            return rendered
+
+        base.paste(head_src, (0, 0), stencil.filter(ImageFilter.GaussianBlur(2.5)))
+        out = io.BytesIO()
+        base.save(out, format="PNG")
+        return out.getvalue()
+    except Exception as exc:
+        logger.warning("tryon: head restore skipped: %s", exc)
+        return rendered
 
 
 async def render_tryon(
@@ -165,6 +283,7 @@ async def render_tryon(
     renderable = [g for g in items if g["slot"] in SLOT_TO_CATEGORY and g["cutout_key"]]
     skipped = [g["slot"] for g in items if g["slot"] not in SLOT_TO_CATEGORY]
     if not renderable:
+        await _record_failure(uid, garment_set_hash, "no renderable garment")
         return {"rendered": False, "reason": "no renderable garment", "skipped": skipped}
 
     client = VTONClient(
@@ -199,14 +318,28 @@ async def render_tryon(
         }
 
     renderable.sort(key=lambda g: PASS_ORDER.get(g["slot"], 99))
-    dropped = [g["slot"] for g in renderable[MAX_PASSES:]]
-    renderable = renderable[:MAX_PASSES]
+    # CONFIGURABLE, because it is the single biggest quality lever here and
+    # the right value is a judgement, not a constant.
+    #
+    # Each pass feeds the PREVIOUS pass's output back in as the person image,
+    # so the frame is regenerated once per garment. Two passes dress the
+    # outfit more completely and degrade identity roughly twice as much:
+    # measured on a real photo, two passes returned a different face, removed
+    # the subject's beard and sunglasses, turned white trainers black and
+    # added a cap. One pass dresses less and looks more like the person.
+    max_passes = max(1, int(getattr(settings, "tryon_max_passes", MAX_PASSES)))
+    dropped = [g["slot"] for g in renderable[max_passes:]]
+    renderable = renderable[:max_passes]
     skipped = skipped + unsupported
 
     try:
-        current = store.get_bytes(body_key)
+        # Kept separately from `current`: `current` is overwritten by each
+        # pass, and the head has to come from the photo the user uploaded.
+        original = store.get_bytes(body_key)
+        current = original
     except Exception as exc:
         logger.warning("tryon %s: body photo unreadable: %s", garment_set_hash, exc)
+        await _record_failure(uid, garment_set_hash, "body photo unreadable")
         return {"rendered": False, "reason": "body photo unreadable"}
 
     passes = 0
@@ -244,6 +377,7 @@ async def render_tryon(
             if passes == 0:
                 # Nothing rendered at all: leave no object, so the API keeps
                 # answering with the board.
+                await _record_failure(uid, garment_set_hash, str(exc))
                 return {"rendered": False, "reason": str(exc), "skipped": skipped}
             # A partial chain IS worth keeping — a body wearing the trousers is
             # a better answer than no render, and the response says which
@@ -251,12 +385,32 @@ async def render_tryon(
             break
         except Exception as exc:  # pragma: no cover - defensive
             logger.exception("tryon %s: unexpected failure: %s", garment_set_hash, exc)
+            await _record_failure(uid, garment_set_hash, "render failed")
             return {"rendered": False, "reason": "render failed"}
+
+    # The provider invented a face; give the user theirs back. `original` is
+    # the untouched body photo, not the running `current`, which by now has
+    # been through one diffusion pass per garment.
+    if getattr(settings, "tryon_restore_face", True):
+        current = await _restore_head(original, current)
 
     key = tryon_key(uid, garment_set_hash)
     store.put_bytes(key, current, content_type="image/png")
 
     rendered_slots = [g["slot"] for g in renderable[:passes]]
+
+    # WHAT THE RENDER DOES NOT COVER IS PART OF THE RESULT.
+    #
+    # No provider renders footwear -- SLOT_TO_CATEGORY maps upper, lower and
+    # dress only -- so the shoes in the output are the ones in the user's own
+    # body photo, not the ones in the outfit. That was invisible: the card
+    # said "rendered" and a user comparing it with their wardrobe reasonably
+    # concluded the render was wrong.
+    #
+    # Recorded next to the failure rows, for the same reason: the worker is
+    # the only place that knows, and the API cannot read arq's result.
+    await _record_render(uid, garment_set_hash, rendered_slots, skipped + dropped)
+
     logger.info(
         "tryon %s: %d/%d passes via %s, skipped=%s",
         garment_set_hash,

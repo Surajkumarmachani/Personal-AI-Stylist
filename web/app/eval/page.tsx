@@ -17,7 +17,7 @@
  */
 
 import Link from "next/link";
-import { useCallback, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 import { type EvalItem, type EvalPage, evalView, getToken } from "@/lib/api";
 
 const PAGE = 12;
@@ -47,18 +47,29 @@ export default function EvalPageView() {
   const [error, setError] = useState<string | null>(null);
   const [showOriginal, setShowOriginal] = useState<Record<string, boolean>>({});
 
-  const load = useCallback(async () => {
-    try {
-      setPage(await evalView({ limit: PAGE, offset, onlyReal }));
-      setError(null);
-    } catch (e) {
-      setError(String(e));
-    }
-  }, [offset, onlyReal]);
-
+  // Inlined instead of calling a memoised `load()`: React's set-state-in-effect
+  // rule cannot see through a callback, so it flags every effect that invokes
+  // one. Inlining also buys the thing that was genuinely missing —
+  // CANCELLATION. Nothing tracked which request was current, so switching
+  // page or filter quickly left whichever response landed last on screen, which is
+  // not necessarily the one that was asked for. `off` makes an abandoned
+  // request's reply a no-op instead of a race.
   useEffect(() => {
-    void load();
-  }, [load]);
+    let off = false;
+    void (async () => {
+      try {
+        const p = await evalView({ limit: PAGE, offset, onlyReal });
+        if (off) return;
+        setPage(p);
+        setError(null);
+      } catch (e) {
+        if (!off) setError(String(e));
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [offset, onlyReal]);
 
   if (!getToken()) {
     // Not an error, and worth saying so. The access token is held in memory

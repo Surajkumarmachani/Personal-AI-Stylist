@@ -11,7 +11,15 @@ import OutfitCard from "./OutfitCard";
 import Onboarding from "./Onboarding";
 import Image from "next/image";
 import { OCCASIONS } from "./OCCASIONS";
-import { askStylist, listGarments, todaysLook, type ChatOutfit } from "@/lib/api";
+import {
+  askStylist,
+  listGarments,
+  todaysLook,
+  unlogWear,
+  wornToday,
+  type ChatOutfit,
+  type WornToday,
+} from "@/lib/api";
 import { restoreSession } from "./session";
 import "./ui.css";
 
@@ -33,6 +41,34 @@ export default function Home() {
   // which is the thing the suggestions endpoint used to do quietly and now
   // reports.
   const [why, setWhy] = useState<string | null>(null);
+  // `null` = not asked yet, and that is NOT the same as "wore nothing".
+  // Branching on the second before the first has answered would flash the
+  // suggestions at someone who has already dressed.
+  const [worn, setWorn] = useState<WornToday | null>(null);
+  // Did the user ASK, or is this the unprompted daily suggestion?
+  //
+  // The "already dressed" gate below must apply only to the unprompted one.
+  // Someone who wore a shirt this morning and then types "dinner date" into
+  // the hero has asked a direct question, and swallowing the answer because
+  // of what they wore earlier is the app refusing to respond.
+  const [asked, setAsked] = useState(false);
+  const [removing, setRemoving] = useState<string | null>(null);
+
+  /** Undo one wear, then re-read. Re-reading rather than splicing the item
+   *  out locally: if that was the last garment, the whole section must give
+   *  way to the suggestions, and only the server knows whether it was. */
+  async function undoWear(garmentId: string) {
+    if (!worn || removing) return;
+    setRemoving(garmentId);
+    try {
+      await unlogWear(garmentId, worn.date);
+      setWorn(await wornToday());
+    } catch {
+      /* leave the card in place: a failed delete must not look like a success */
+    } finally {
+      setRemoving(null);
+    }
+  }
   const router = useRouter();
 
   useEffect(() => {
@@ -42,6 +78,27 @@ export default function Home() {
   }, []);
   useEffect(() => {
     if (email) listGarments().then((g) => setCount(g.length)).catch(() => setCount(null));
+  }, [email]);
+
+  // WHAT THEY ALREADY WORE, asked before anything is offered. Someone who has
+  // dressed does not need to be sold an outfit.
+  useEffect(() => {
+    if (!email) return;
+    let off = false;
+    void (async () => {
+      try {
+        const w = await wornToday();
+        if (!off) setWorn(w);
+      } catch {
+        // Treated as "wore nothing" rather than blocking the page: the
+        // suggestions are the safe fallback, and an error here must not leave
+        // the home screen empty.
+        if (!off) setWorn({ date: "", items: [], wore_something: false });
+      }
+    })();
+    return () => {
+      off = true;
+    };
   }, [email]);
 
   // TODAY'S LOOK, UNASKED. No occasion is sent, so the server resolves one
@@ -81,6 +138,7 @@ export default function Home() {
         const res = await askStylist(message, 4);
         setOutfits(res.outfits);
         setReply(res.reply);
+        setAsked(true);
         // The user has now named an occasion, so the calendar provenance no
         // longer describes what is on screen.
         setWhy(null);
@@ -146,44 +204,6 @@ export default function Home() {
         </div>
       </section>
 
-      {outfits.length > 0 ? (
-        <section style={{ marginBottom: 34 }}>
-          <div className="ui-head">
-            <h2 className="ui-h2">{why ? "Today's look" : "Curated for you"}</h2>
-            <Link href="/explore" style={{ color: "var(--accent)", fontSize: 13.5 }}>
-              See all →
-            </Link>
-          </div>
-          {reply ? <p className="ui-sub" style={{ marginBottom: 14 }}>{reply}</p> : null}
-          {/* WHAT THIS WAS DRESSED FOR. Shown only when the user did not ask —
-              if they typed the occasion themselves, repeating it back is
-              noise. The calendar case names the rule phrase that matched, not
-              the event title: the calendar panel promises titles never reach
-              this app, and quoting a diary entry here would break that in the
-              one place the user would notice. */}
-          {why ? (
-            <div
-              className="ui-sub"
-              style={{
-                marginBottom: 14,
-                padding: "10px 12px",
-                border: "1px solid var(--line)",
-                borderRadius: 10,
-              }}
-            >
-              {why}
-            </div>
-          ) : null}
-          <div className="ui-grid">
-            {outfits.map((o, i) => (
-              <OutfitCard key={i} outfit={o} index={i} />
-            ))}
-          </div>
-        </section>
-      ) : reply ? (
-        <div className="ui-empty" style={{ marginBottom: 34 }}>{reply}</div>
-      ) : null}
-
       <section>
         <div className="ui-head">
           <h2 className="ui-h2">Popular occasions</h2>
@@ -223,6 +243,100 @@ export default function Home() {
       <p className="ui-sub" style={{ marginTop: 26 }}>
         {count === null ? "" : `${count} garments catalogued — every look is built from clothes you own.`}
       </p>
+      {/* WHAT THEY WORE, when they wore something. The answer to "are we
+          done here?" — and the reason the suggestions above are absent. */}
+      {worn !== null && worn.wore_something ? (
+        <section style={{ marginTop: 34 }}>
+          <div className="ui-head">
+            <h2 className="ui-h2">What you wore today</h2>
+            <Link href="/wardrobe" style={{ color: "var(--accent)", fontSize: 13.5 }}>
+              Wardrobe →
+            </Link>
+          </div>
+          <div className="ui-grid tight">
+            {worn.items.map((g, i) => (
+              <article
+                key={g.id}
+                className="ui-card"
+                style={{ animationDelay: `${i * 40}ms` }}
+              >
+                <div className="ui-frame one" style={{ aspectRatio: "1 / 1" }}>
+                  {g.cutout_url ? (
+                    // eslint-disable-next-line @next/next/no-img-element -- presigned MinIO URL, see wardrobe/page.tsx
+                    <img src={g.cutout_url} alt={g.subcategory ?? "garment"} loading="lazy" />
+                  ) : (
+                    <span className="ui-ph">{g.subcategory ?? g.slot ?? "item"}</span>
+                  )}
+                </div>
+                <div className="ui-cbody">
+                  <span className="ui-name" style={{ fontSize: 13.5 }}>
+                    {(g.subcategory ?? g.slot ?? "item").replace(/_/g, " ")}
+                  </span>
+                  {g.note ? <p className="ui-sub">{g.note}</p> : null}
+                  {/* ONE CLICK TO UNDO. A wear logged by mistake used to be
+                      permanent from the UI — the endpoint existed and nothing
+                      called it. It is not a cosmetic entry either: wear
+                      history drives cost-per-wear and repeat-avoidance, so a
+                      wrong one skews suggestions until it is removed. */}
+                  <button
+                    className="ui-btn"
+                    style={{ marginTop: 6, fontSize: 11.5, padding: "3px 8px" }}
+                    disabled={removing === g.id}
+                    onClick={() => void undoWear(g.id)}
+                    title="I did not wear this"
+                  >
+                    {removing === g.id ? "removing…" : "Didn't wear this"}
+                  </button>
+                </div>
+              </article>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {/* SUGGESTIONS ONLY WHEN THEY HAVE NOT DRESSED YET.
+          Offering outfits to someone who already told us what they wore is
+          the product talking over the user. `worn` is null until the answer
+          is known, which is deliberately NOT treated as "wore nothing" —
+          otherwise this flashes on every load before disappearing.
+          Three, not four: this is now a prompt rather than the main event. */}
+      {(asked || (worn !== null && !worn.wore_something)) && outfits.length > 0 ? (
+        <section style={{ marginBottom: 34 }}>
+          <div className="ui-head">
+            <h2 className="ui-h2">{why ? "Today's look" : "Curated for you"}</h2>
+            <Link href="/explore" style={{ color: "var(--accent)", fontSize: 13.5 }}>
+              See all →
+            </Link>
+          </div>
+          {reply ? <p className="ui-sub" style={{ marginBottom: 14 }}>{reply}</p> : null}
+          {/* WHAT THIS WAS DRESSED FOR. Shown only when the user did not ask —
+              if they typed the occasion themselves, repeating it back is
+              noise. The calendar case names the rule phrase that matched, not
+              the event title: the calendar panel promises titles never reach
+              this app, and quoting a diary entry here would break that in the
+              one place the user would notice. */}
+          {why ? (
+            <div
+              className="ui-sub"
+              style={{
+                marginBottom: 14,
+                padding: "10px 12px",
+                border: "1px solid var(--line)",
+                borderRadius: 10,
+              }}
+            >
+              {why}
+            </div>
+          ) : null}
+          <div className="ui-grid">
+            {outfits.slice(0, 4).map((o, i) => (
+              <OutfitCard key={i} outfit={o} index={i} />
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+
     </Shell>
   );
 }

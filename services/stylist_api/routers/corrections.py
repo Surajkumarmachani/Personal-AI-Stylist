@@ -92,6 +92,9 @@ class CorrectionResponse(BaseModel):
     old_value: str | None
     new_value: str | None
     user_verified_fields: list[str]
+    # Reported, not silent. A correction that quietly deletes saved outfits is
+    # a surprise; one that says how many it dropped is an explanation.
+    outfits_pruned: int = 0
 
 
 def _validate_value(field_name: str, value: Any) -> Any:
@@ -237,9 +240,38 @@ async def _apply_correction(
         },
     )
 
-    # Same transaction as the correction (§C1). Phase 6 consumes this to
-    # invalidate precomputed outfits — a garment the user just re-tagged should
-    # not keep appearing in suggestions built on the wrong tags.
+    # PRUNE THE OUTFITS BUILT ON THE OLD TAGS, in this same transaction.
+    #
+    # This used to be left to the outbox event below, whose comment said
+    # "Phase 6 consumes this to invalidate precomputed outfits". NOTHING
+    # CONSUMED IT -- the event had zero handlers, so the stale rows simply
+    # survived, and `GET /suggestions` serves from `outfits` before it
+    # regenerates anything.
+    #
+    # The visible result was an outfit made of TWO PAIRS OF JEANS, ranked
+    # first. It had been materialised while one of them was mis-tagged
+    # `upper_base`; correcting the slot to `lower` fixed the garment and left
+    # the outfit naming both. A structure rule the generator can never break
+    # was broken in storage, because storage was never re-checked.
+    #
+    # Deleting is right rather than rescoring: the live path rebuilds from
+    # current tags, so the only thing these rows can do is be wrong. The
+    # garment-removal path at routers/garments.py already does exactly this,
+    # for exactly the same reason.
+    #
+    # Unconditional, not just for `slot`. A colour or formality correction
+    # does not break the structure but does invalidate the SCORE that ordered
+    # these outfits, and an outfit ranked on tags the user has since rejected
+    # is not a suggestion, it is a stale opinion.
+    pruned = await db.execute(
+        text("DELETE FROM outfits WHERE :gid = ANY(garment_ids) RETURNING id"),
+        {"gid": garment_id},
+    )
+    pruned_count = len(pruned.fetchall())
+
+    # Still emitted: it is the audit record of what the user corrected and is
+    # read by the correction-rate report. It is no longer load-bearing for
+    # invalidation -- that happened above, synchronously.
     await emit(
         db,
         aggregate_id=garment_id,
@@ -264,6 +296,7 @@ async def _apply_correction(
         old_value=None if old_value is None else str(old_value),
         new_value=None if value is None else str(value),
         user_verified_fields=list(verified.scalar_one() or []),
+        outfits_pruned=pruned_count,
     )
 
 

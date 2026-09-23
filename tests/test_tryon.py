@@ -23,6 +23,7 @@ fails.
 
 from __future__ import annotations
 
+import json
 import uuid
 
 import pytest
@@ -350,3 +351,129 @@ def test_the_consent_notice_names_the_third_party_when_there_is_one() -> None:
 
     for provider in PROFILES:
         assert provider in _PROVIDER_NOTICE, f"{provider} would be transmitted to unnamed"
+
+
+async def test_the_daily_quota_counts_only_this_tenants_renders(
+    api, registered, second_tenant, owner_engine
+) -> None:
+    """`audit_log` has row security DISABLED -- it is a cross-tenant
+    operational log. The quota query had no tenant predicate and relied on RLS
+    that is not there, so one user's ten renders would have exhausted the cap
+    for everyone on the deployment.
+
+    A single-user database cannot see this: 10 mine and 10 total are the same
+    number. It takes two tenants to show up at all.
+
+    Asserted on the COUNT the endpoint computes rather than through
+    `POST /outfits/{hash}/tryon`, which needs a consented body photo, a
+    configured provider and a materialised outfit before it reaches the quota
+    at all -- three preconditions that would each turn this into a skip.
+    """
+    import sqlalchemy as sa
+
+    from stylist_api.routers.tryon import TRYON_DAILY_QUOTA
+
+    quota_sql = sa.text(
+        "SELECT count(*) FROM audit_log WHERE action = 'tryon.requested' "
+        "AND user_id = :uid AND created_at > now() - interval '1 day'"
+    )
+
+    async with owner_engine.begin() as conn:
+        ids = {}
+        for who in (registered.email, second_tenant.email):
+            ids[who] = (
+                await conn.execute(sa.text("SELECT id FROM users WHERE email = :e"), {"e": who})
+            ).scalar_one()
+
+        # Fill the OTHER tenant's quota past the ceiling.
+        for _ in range(TRYON_DAILY_QUOTA + 2):
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO audit_log (id, user_id, action, created_at) "
+                    "VALUES (gen_random_uuid(), :u, 'tryon.requested', now())"
+                ),
+                {"u": ids[second_tenant.email]},
+            )
+
+        theirs = (
+            await conn.execute(quota_sql, {"uid": ids[second_tenant.email]})
+        ).scalar_one()
+        mine = (await conn.execute(quota_sql, {"uid": ids[registered.email]})).scalar_one()
+
+        # The predicate the endpoint USED to run: no tenant filter at all.
+        untenanted = (
+            await conn.execute(
+                sa.text(
+                    "SELECT count(*) FROM audit_log WHERE action = 'tryon.requested' "
+                    "AND created_at > now() - interval '1 day'"
+                )
+            )
+        ).scalar_one()
+
+    assert theirs > TRYON_DAILY_QUOTA, "the other tenant is over its cap"
+    assert mine == 0, "this tenant has rendered nothing and must be under the cap"
+    assert untenanted >= theirs, (
+        "without a tenant predicate the count includes other tenants -- which is "
+        "exactly why the quota has to filter on user_id"
+    )
+
+
+async def test_a_failed_render_is_reported_not_re_queued(
+    api, registered, owner_engine
+) -> None:
+    """A failure and a job still in flight both leave NO object in storage, so
+    this endpoint answered "queued" for both.
+
+    The visible consequence: a render that died in 1.7s against an unreachable
+    provider told the user to "tap again to check", forever, and every tap
+    spent quota re-enqueueing a job that failed the same way. The worker knew
+    the reason the whole time -- it returned it into arq's Redis result, which
+    the API never reads.
+    """
+    import sqlalchemy as sa
+
+    set_hash = "failedrenderhash0000000000000000"
+
+    async with owner_engine.begin() as conn:
+        uid = (
+            await conn.execute(
+                sa.text("SELECT id FROM users WHERE email = :e"), {"e": registered.email}
+            )
+        ).scalar_one()
+        # A request, then a failure recorded AFTER it -- the order the worker
+        # produces, and what makes the failure current rather than historic.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO audit_log (id, user_id, action, detail, created_at) VALUES "
+                "(gen_random_uuid(), :u, 'tryon.requested', '{}'::jsonb,"
+                " now() - interval '1 minute')"
+            ),
+            {"u": uid},
+        )
+        await conn.execute(
+            sa.text(
+                "INSERT INTO audit_log (id, user_id, action, detail, created_at) VALUES "
+                "(gen_random_uuid(), :u, 'tryon.failed', CAST(:d AS jsonb), now())"
+            ),
+            {"u": uid, "d": json.dumps({"garment_set_hash": set_hash, "reason": "no Gradio API"})},
+        )
+
+        current = (
+            await conn.execute(
+                sa.text(
+                    "SELECT detail ->> 'reason' FROM audit_log "
+                    "WHERE action = 'tryon.failed' AND user_id = :u "
+                    "AND detail ->> 'garment_set_hash' = :h "
+                    "AND created_at > (SELECT max(created_at) FROM audit_log "
+                    "  WHERE action = 'tryon.requested' AND user_id = :u)"
+                ),
+                {"u": uid, "h": set_hash},
+            )
+        ).scalar_one_or_none()
+
+    # This is the predicate the endpoint runs. Before the fix there was no
+    # such lookup at all, so the reason could never reach the response.
+    assert current == "no Gradio API", (
+        "the worker's reason must be readable by the API, or the card can only "
+        "ever say 'queued'"
+    )

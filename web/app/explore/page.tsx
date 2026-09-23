@@ -10,7 +10,8 @@
  * results and imply a catalogue that is not there.
  */
 
-import { Suspense, useCallback, useEffect, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
+import FillTheGap from "../FillTheGap";
 import { useSearchParams } from "next/navigation";
 import Shell from "../Shell";
 import SignIn from "../SignIn";
@@ -40,20 +41,31 @@ function ExploreInner() {
       .finally(() => setChecking(false));
   }, []);
 
-  const load = useCallback(async () => {
-    setBusy(true);
-    try {
-      setRes(await askStylist(occasion, 9));
-    } catch {
-      setRes(null);
-    } finally {
-      setBusy(false);
-    }
-  }, [occasion]);
-
+  // Inlined instead of calling a memoised `load()`: React's set-state-in-effect
+  // rule cannot see through a callback, so it flags every effect that invokes
+  // one. Inlining also buys the thing that was genuinely missing —
+  // CANCELLATION. Nothing tracked which request was current, so switching
+  // occasion quickly left whichever response landed last on screen, which is
+  // not necessarily the one that was asked for. `off` makes an abandoned
+  // request's reply a no-op instead of a race.
   useEffect(() => {
-    if (email) void load();
-  }, [email, load]);
+    if (!email) return;
+    let off = false;
+    void (async () => {
+      setBusy(true);
+      try {
+        const r = await askStylist(occasion, 9);
+        if (!off) setRes(r);
+      } catch {
+        if (!off) setRes(null);
+      } finally {
+        if (!off) setBusy(false);
+      }
+    })();
+    return () => {
+      off = true;
+    };
+  }, [email, occasion]);
 
   if (checking) return <div className="ui" style={{ display: "block" }} />;
   if (!email) return <SignIn onDone={setEmail} />;
@@ -85,22 +97,21 @@ function ExploreInner() {
         ))}
       </div>
 
-      <div className="ui-pills" style={{ marginBottom: 20 }}>
-        <button className="ui-pill on">All looks</button>
-        <button className="ui-pill">From your wardrobe</button>
-        <button className="ui-pill" disabled title="No product catalogue is connected">
-          New picks
-        </button>
-        <button className="ui-pill" disabled title="No product catalogue is connected">
-          Premium
-        </button>
-      </div>
+      {/* FOUR DEAD PILLS USED TO SIT HERE: "All looks", "From your wardrobe",
+          "New picks" and "Premium".
 
-      <div className="ui-unavailable" style={{ marginBottom: 20 }}>
-        <b>New picks and Premium are off.</b> Both need a product catalogue and a merchant
-        integration; this system only knows the clothes you have photographed. Every look below
-        is built from your own wardrobe.
-      </div>
+          The last two were placeholders for a shop front, and what was
+          actually built is the opposite of one: suggestions appear ONLY where
+          this wardrobe cannot dress the occasion, below the looks, named by
+          what is missing.
+
+          The first two were worse, because they LOOKED live -- "All looks"
+          even rendered as selected -- while neither carried an onClick. They
+          also described a distinction this app does not have: every look here
+          is built from clothes you own, so "all looks" and "from your
+          wardrobe" are two names for the same set. The occasion pills above
+          are the real filter. A control that cannot answer the question it
+          poses is worse than no control. */}
 
       {busy ? <p className="ui-sub">Building looks…</p> : null}
 
@@ -122,6 +133,14 @@ function ExploreInner() {
             .
           </p>
         </div>
+      ) : null}
+
+      {/* BELOW the looks, and only when the wardrobe actually came up short.
+          Keyed on the RESOLVED taxonomy occasion from the reply, not the
+          phrase in the input — the gap has to be for the same occasion the
+          outfits above were built for, or the two contradict each other. */}
+      {res?.understood?.occasion ? (
+        <FillTheGap occasion={res.understood.occasion} />
       ) : null}
     </Shell>
   );

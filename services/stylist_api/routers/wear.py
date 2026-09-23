@@ -44,7 +44,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
-from stylist_api.deps import CurrentUser, TenantDB
+from stylist_api.deps import CurrentUser, ObjectStoreDep, TenantDB
 from stylist_db.outbox import emit
 from stylist_db.session import tenant_session
 
@@ -218,6 +218,63 @@ async def wear_history(
         "cost_per_wear_minor": (int(price) // count) if price and count else None,
         "currency": garment["purchase_currency"],
         "wears": wears,
+    }
+
+
+@router.get("/wardrobe/worn-on")
+async def worn_on(
+    user: CurrentUser,
+    db: TenantDB,
+    store: ObjectStoreDep,
+    on: Annotated[date | None, Query()] = None,
+) -> dict[str, Any]:
+    """What this user actually wore on a given day. Defaults to today.
+
+    The home screen asks this BEFORE it offers anything. Someone who has
+    already dressed does not need to be sold an outfit; showing suggestions
+    over the top of a decision they have made reads as the product not
+    listening. So this answers "are we done here?" and the suggestions only
+    appear when the answer is no.
+
+    `worn_on` is a DATE, not a timestamp, and the default is the server's
+    today. A user in another timezone logging an outfit late in the evening
+    can therefore see it attributed to the following day -- honest to record
+    and wrong to the user. Fixing it properly needs the user's timezone, which
+    this system does not collect; noting it here rather than pretending the
+    date is unambiguous.
+    """
+    rows = await db.execute(
+        text(
+            """
+            SELECT g.id, g.slot::text AS slot, g.subcategory::text AS subcategory,
+                   g.primary_colour::text AS primary_colour, g.cutout_key,
+                   w.worn_on, w.note
+            FROM wear_log w
+            JOIN garments g ON g.id = w.garment_id
+            WHERE w.worn_on = COALESCE(:on, CURRENT_DATE) AND g.is_active
+            ORDER BY g.slot::text, g.subcategory::text
+            """
+        ),
+        {"on": on},
+    )
+    items = [
+        {
+            "id": str(r["id"]),
+            "slot": r["slot"],
+            "subcategory": r["subcategory"],
+            "primary_colour": r["primary_colour"],
+            "cutout_url": store.presign_download(r["cutout_key"]) if r["cutout_key"] else None,
+            "note": r["note"],
+        }
+        for r in rows.mappings()
+    ]
+    return {
+        "date": (on or date.today()).isoformat(),
+        "items": items,
+        # Stated rather than left to `len(items)`, because the home screen
+        # branches on it and "did they dress today" is the question, not "how
+        # many garments came back".
+        "wore_something": bool(items),
     }
 
 

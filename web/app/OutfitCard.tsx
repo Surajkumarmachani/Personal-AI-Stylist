@@ -8,8 +8,15 @@
  * catalogue behind this system, only a wardrobe.
  */
 
-import { useState } from "react";
-import { outfitBoard, requestTryOn, saveOutfit, type ChatOutfit } from "@/lib/api";
+import { useEffect, useRef, useState } from "react";
+import {
+  markOutfitWorn,
+  outfitBoard,
+  rateOutfit,
+  requestTryOn,
+  saveOutfit,
+  type ChatOutfit,
+} from "@/lib/api";
 
 /** A name for the look, DERIVED from its garments rather than invented.
  *
@@ -70,6 +77,10 @@ export default function OutfitCard({
   // dead Try On button that looks identical to a working one.
   const hash = outfit.garment_set_hash;
   const [saved, setSaved] = useState(false);
+  // The verdict given on this card, if any. Local only: the point is to stop
+  // the user rating the same outfit twice in a row and to show it registered.
+  const [rated, setRated] = useState<"like" | "dislike" | null>(null);
+  const [worn, setWorn] = useState(false);
   const [state, setState] = useState<string | null>(null);
   // The rendered try-on, once there is one. SHOWING it is the whole point:
   // an earlier version reported "rendered — reload to see it" and the card
@@ -77,6 +88,20 @@ export default function OutfitCard({
   // invisible. A status line is not a feature.
   const [tryonUrl, setTryonUrl] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  // Seconds since this card's render was enqueued. Drives the live counter,
+  // so a three-minute wait LOOKS like progress instead of a frozen label.
+  const [elapsed, setElapsed] = useState<number | null>(null);
+  // Survives re-renders without causing them; cleared on unmount so a card
+  // scrolled out of a list stops polling.
+  const timers = useRef<{ poll?: ReturnType<typeof setInterval>; tick?: ReturnType<typeof setInterval> }>({});
+
+  useEffect(
+    () => () => {
+      if (timers.current.poll) clearInterval(timers.current.poll);
+      if (timers.current.tick) clearInterval(timers.current.tick);
+    },
+    [],
+  );
   const { name, tags } = lookName(outfit);
 
   // The server states the rank. Falling back to `index + 1` keeps older
@@ -88,6 +113,79 @@ export default function OutfitCard({
   // the scorer's endorsement, so the card says why it is here instead.
   const predicted = outfit.predicted_rank ?? rank;
   const promoted = predicted > rank;
+
+  /** Watch a render to completion, showing elapsed time while it works. */
+  function startPolling() {
+    if (!hash) return;
+    if (timers.current.poll) clearInterval(timers.current.poll);
+    if (timers.current.tick) clearInterval(timers.current.tick);
+
+    const startedAt = Date.now();
+    setElapsed(0);
+    setState("rendering");
+    // Two timers on purpose: the counter ticks every second so the card feels
+    // alive, while the network poll runs every four so a three-minute render
+    // costs ~45 requests rather than ~180.
+    timers.current.tick = setInterval(
+      () => setElapsed(Math.round((Date.now() - startedAt) / 1000)),
+      1000,
+    );
+    timers.current.poll = setInterval(async () => {
+      // A render is 30-120s typically; give up well past the worst case
+      // rather than polling a dead job forever.
+      if (Date.now() - startedAt > 12 * 60 * 1000) {
+        stopPolling();
+        setState("still rendering after 12 minutes — tap Try On to check again");
+        return;
+      }
+      try {
+        const r = await requestTryOn(hash);
+        if (r.rendered && r.tryon_url) {
+          stopPolling();
+          setTryonUrl(r.tryon_url);
+          announce(r.skipped_slots ?? []);
+        } else if (!r.queued) {
+          // A failure, a quota refusal, or consent withdrawn mid-render: all
+          // carry a reason, and none of them get better by waiting.
+          stopPolling();
+          setState(r.reason ?? "not available");
+        }
+      } catch {
+        // A dropped request mid-poll is not the render failing. Keep waiting;
+        // the timeout above is the backstop.
+      }
+    }, 4000);
+  }
+
+  function stopPolling() {
+    if (timers.current.poll) clearInterval(timers.current.poll);
+    if (timers.current.tick) clearInterval(timers.current.tick);
+    timers.current = {};
+    setElapsed(null);
+    setBusy(false);
+  }
+
+  /** What a finished render is, and is not.
+   *
+   *  This line has been wrong in BOTH directions and the history is worth
+   *  keeping. It first claimed untried garments were "your own from the
+   *  photo" — false, the provider invents them. It was then corrected to say
+   *  the face was an approximation too, which was true at the time. Face
+   *  restoration landed afterwards and this string was not updated, so it
+   *  went on calling the user's own composited face a guess.
+   *
+   *  What is actually true now: the head comes from the uploaded photo
+   *  pixel-for-pixel; the garments named in the outfit are fitted by the
+   *  provider; everything else in the frame — background, shoes, hands — is
+   *  regenerated and invented. */
+  function announce(skipped: string[]) {
+    const missed = skipped.map((x) => x.replace(/_/g, " "));
+    setState(
+      missed.length
+        ? `rendered — your face is your own photo. ${missed.join(" and ")} not tried on, so those and the background are invented by the model.`
+        : "rendered — your face is your own photo. The background is regenerated by the model.",
+    );
+  }
 
   async function tryOn(e: React.MouseEvent) {
     e.stopPropagation();
@@ -104,9 +202,16 @@ export default function OutfitCard({
       // `queued` means the worker has it and a render takes a few minutes.
       if (res.rendered && res.tryon_url) {
         setTryonUrl(res.tryon_url);
-        setState("rendered");
+        announce(res.skipped_slots ?? []);
       } else if (res.queued) {
-        setState("queued — a render takes a few minutes. Tap again to check.");
+        // POLL, rather than telling the user to keep tapping.
+        //
+        // Tapping was not just tedious, it was EXPENSIVE: before this change
+        // every tap re-enqueued a duplicate job and spent one of ten daily
+        // renders. The server now recognises a render already in flight and
+        // neither re-enqueues nor charges for the question, which is what
+        // makes polling on a timer safe to do at all.
+        startPolling();
       } else {
         setState(res.reason ?? "not available");
       }
@@ -147,6 +252,59 @@ export default function OutfitCard({
     }
   }
 
+  /** A VERDICT on this suggestion.
+   *
+   *  The recommender had no way to receive one. `saved` was the only kind the
+   *  UI could send, and `apply_feedback` treats saving as intent rather than
+   *  evidence, so it moves the style vector at half weight and the Thompson
+   *  posteriors not at all. `bandit_arm` was consequently empty across the
+   *  entire database — the loop was complete and unreachable.
+   */
+  async function rate(e: React.MouseEvent, kind: "like" | "dislike") {
+    e.stopPropagation();
+    if (busy || rated) return;
+    setBusy(true);
+    try {
+      const r = await rateOutfit(outfit.garments.map((g) => g.id), kind);
+      setRated(kind);
+      // SHOW THAT IT LANDED, AND NAME WHAT MOVED. "Thanks for your feedback"
+      // is what products say when nothing happened. The server returns which
+      // Thompson arm changed, so this is the server's claim, not the
+      // client's guess — and when no arm moved it does not pretend one did.
+      setState(
+        r.bandit_arm
+          ? `${kind === "like" ? "liked" : "disliked"} — learned for ${r.bandit_arm.replace(/_/g, " ")} looks`
+          : `${kind === "like" ? "liked" : "disliked"} — taste updated`,
+      );
+    } catch (err) {
+      setState(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  /** Wearing it is the real verdict. See `markOutfitWorn` for why this both
+   *  teaches the recommender and is the only thing that makes the
+   *  wear-through metric computable. */
+  async function wore(e: React.MouseEvent) {
+    e.stopPropagation();
+    if (busy || worn) return;
+    setBusy(true);
+    try {
+      const r = await markOutfitWorn(outfit.garments.map((g) => g.id));
+      setWorn(true);
+      setState(
+        r.bandit_arm
+          ? `logged as worn — learned for ${r.bandit_arm.replace(/_/g, " ")} looks`
+          : "logged as worn",
+      );
+    } catch (err) {
+      setState(String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function save(e: React.MouseEvent) {
     e.stopPropagation();
     if (busy) return;
@@ -170,13 +328,23 @@ export default function OutfitCard({
       onClick={() => onOpen?.(outfit)}
     >
       <div className={`ui-frame${tryonUrl || outfit.garments.length === 1 ? " one" : ""}`}>
+        {/* `<img>`, deliberately, not `next/image`. Every src below is a
+            PRESIGNED MinIO URL: it carries an expiring signature and is a
+            different string on every request. The image optimizer keys its
+            cache on that URL, so it would never once hit — it would re-fetch
+            and re-encode on each render — and whatever it did cache would
+            outlive the signature it was fetched with. The optimizer is the
+            wrong tool for short-lived signed URLs, so the rule is suppressed
+            per-tag below rather than the URLs being reshaped to suit it. */}
         {tryonUrl ? (
           // The render replaces the cutouts — it IS the answer to "what would
           // this look like on me", and showing both would bury it.
+          // eslint-disable-next-line @next/next/no-img-element -- presigned URL; see above
           <img src={tryonUrl} alt="You wearing this outfit" />
         ) : (
           outfit.garments.map((g) =>
           g.cutout_url ? (
+            // eslint-disable-next-line @next/next/no-img-element -- presigned URL; see above
             <img key={g.id} src={g.cutout_url} alt={g.subcategory ?? "garment"} loading="lazy" />
           ) : (
             <span key={g.id} className="ui-ph">{g.subcategory ?? g.slot ?? "item"}</span>
@@ -237,7 +405,49 @@ export default function OutfitCard({
             Flat-lay
           </button>
         ) : null}
-        {state ? <p className="ui-sub">{state}</p> : null}
+        {/* THE VERDICT BUTTONS. Without these the recommender cannot learn:
+            the heart writes `saved`, which is intent rather than evidence and
+            moves no Thompson posterior. */}
+        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+          <button
+            className={`ui-btn${rated === "like" ? " primary" : ""}`}
+            style={{ fontSize: 11.5, padding: "4px 9px" }}
+            onClick={(e) => void rate(e, "like")}
+            disabled={busy || rated !== null}
+            title="Suggest more like this"
+          >
+            {rated === "like" ? "👍 liked" : "👍 More like this"}
+          </button>
+          <button
+            className={`ui-btn${rated === "dislike" ? " primary" : ""}`}
+            style={{ fontSize: 11.5, padding: "4px 9px" }}
+            onClick={(e) => void rate(e, "dislike")}
+            disabled={busy || rated !== null}
+            title="Suggest fewer like this"
+          >
+            {rated === "dislike" ? "👎 noted" : "👎 Not for me"}
+          </button>
+          <button
+            className={`ui-btn${worn ? " primary" : ""}`}
+            style={{ fontSize: 11.5, padding: "4px 9px" }}
+            onClick={(e) => void wore(e)}
+            disabled={busy || worn}
+            title="Counts as the strongest positive signal, and is what makes the wear-through metric measurable"
+          >
+            {worn ? "✓ worn" : "I wore this"}
+          </button>
+        </div>
+        {elapsed !== null ? (
+          /* A COUNTER, not a static label. The render genuinely takes
+             minutes; the old text said "tap again to check" and looked
+             identical whether the job was working, finished or long dead. */
+          <p className="ui-sub" aria-live="polite">
+            rendering… {Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, "0")}
+            {" — this usually takes 1–3 minutes"}
+          </p>
+        ) : state ? (
+          <p className="ui-sub">{state}</p>
+        ) : null}
       </div>
     </article>
   );
