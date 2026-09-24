@@ -507,6 +507,9 @@ async def get_suggestions(
         "calendar_events_seen": events_seen,
                 # WHY it is empty, not just that it is. "No suggestions" with
                 # no reason is the least actionable screen in the product.
+                # Why there is nothing, separate from notes about outfits
+                # that are merely incomplete. See `CandidatePool`.
+                "blocking_notes": pool.blocking_notes,
                 "notes": pool.notes
                 or ["no outfit satisfied the slot rules from the wearable pool"],
                 "candidates_considered": live.candidates_considered,
@@ -568,6 +571,9 @@ async def get_suggestions(
         "occasion_source": occasion_source,
         "occasion_reason": occasion_reason,
         "calendar_events_seen": events_seen,
+                # Why there is nothing, separate from notes about outfits
+                # that are merely incomplete. See `CandidatePool`.
+                "blocking_notes": pool.blocking_notes,
                 "notes": pool.notes
                 or ["no outfit satisfied your preferences and today's slot rules"],
             }

@@ -84,6 +84,11 @@ class CandidatePool:
     # "No suggestions" with no explanation is the least actionable failure a
     # wardrobe app can produce.
     notes: list[str] = field(default_factory=list)
+    # The subset of `notes` that explains why NO outfit can be built — a
+    # missing required slot, no complete base. Kept apart because the other
+    # notes ("these outfits are shown without shoes") describe outfits that
+    # exist, and quoting one as the reason there are none contradicts itself.
+    blocking_notes: list[str] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -318,11 +323,18 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
     # Fail fast and SAY WHY, for slots an outfit genuinely cannot do without.
     for slot in required_slots():
         if not pool.by_slot.get(slot):
-            pool.notes.append(
+            pool.blocking_notes.append(
                 f"no wearable {_SLOT_WORDS.get(slot, slot.replace('_', ' '))} — every "
                 f"outfit needs one (check the laundry basket, and whether anything "
                 f"you own suits {str(ctx.dress_code_target).replace('_', ' ')})"
             )
+    # BLOCKING BEFORE INCOMPLETE. The base-structure note used to come last, so
+    # for an empty wardrobe the first note was "no shoes — these outfits are
+    # shown without any", and the chat quoted it as the reason there were NO
+    # outfits. Whatever reads `notes[0]` now gets the reason that matters.
+    if not any(all(pool.by_slot.get(s) for s in structure) for structure in base_structures()):
+        pool.blocking_notes.append(_base_structure_note(pool, ctx))
+    pool.notes.extend(pool.blocking_notes)
 
     # A PREFERRED SLOT IS A NOTE, NOT A FAILURE. The outfits below are real
     # and wearable; they are just missing a piece the wardrobe cannot supply.
@@ -342,8 +354,6 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
                     f"outfits are shown without one"
                 )
             )
-    if not any(all(pool.by_slot.get(s) for s in structure) for structure in base_structures()):
-        pool.notes.append(_base_structure_note(pool, ctx))
     return pool
 
 

@@ -371,7 +371,16 @@ async def chat(
         # "no wearable feet", "everything in the wash" — and passing them
         # through is the difference between a useful answer and a shrug.
         notes = result.get("notes") or []
-        gap = notes[0] if notes else "There isn't enough in your wardrobe yet."
+        # A BLOCKING note, never an "incomplete" one. "These outfits are shown
+        # without shoes" was being quoted as the reason there were no outfits
+        # at all — a reply that contradicted itself in one sentence.
+        blocking = result.get("blocking_notes") or []
+        gap = blocking[0] if blocking else "There isn't enough in your wardrobe for this yet."
+        # The notes are written as clauses ("no wearable shoes — ..."); here
+        # one starts a sentence.
+        gap = gap[:1].upper() + gap[1:]
+        if not gap.endswith((".", "!", "?")):
+            gap += "."
 
         # THE GAP IS NOT AN ANSWER ON ITS OWN. It says which piece is missing;
         # it does not say what the occasion is dressed in, which is what was

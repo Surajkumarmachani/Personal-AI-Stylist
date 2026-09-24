@@ -485,3 +485,24 @@ async def test_an_out_of_range_formality_is_refused(api, registered) -> None:
         headers=registered.auth,
     )
     assert r.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_an_empty_wardrobe_reply_gives_the_real_reason_not_a_missing_shoe(
+    api, registered
+) -> None:
+    """With nothing wearable the first note used to be "no shoes — these
+    outfits are shown without any", so the reply said there were no outfits
+    and then described the outfits. It must give the blocking reason, as a
+    sentence."""
+    resp = await api.post(
+        "/chat", json={"message": "what should I wear to the office"}, headers=registered.auth
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["outfits"] == []
+    reply = body["reply"]
+    assert "shown without" not in reply, reply
+    gap = reply.split(". ", 1)[1]
+    assert gap[:1].isupper(), reply
+    assert "wardrobe" in gap, reply
