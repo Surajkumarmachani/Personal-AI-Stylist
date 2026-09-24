@@ -34,6 +34,7 @@ from stylist_api.routers import (
     location,
     occasions,
     ops,
+    partner,
     privacy,
     push,
     search,
@@ -176,6 +177,7 @@ def create_app() -> FastAPI:
     app.include_router(search.router)
     app.include_router(shop.router)
     app.include_router(dresses_as.router)
+    app.include_router(partner.router)
     app.include_router(duplicates.router)
     app.include_router(ops.router)
     app.include_router(evalview.router)

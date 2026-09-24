@@ -475,7 +475,8 @@ async def _add_to_wardrobe(
     }
 
 
-@router.api_route("/shop/conversions", methods=["GET", "POST"])
+@router.get("/shop/conversions", operation_id="shop_conversion_postback_get")
+@router.post("/shop/conversions", operation_id="shop_conversion_postback_post")
 async def conversion_postback(
     settings: SettingsDep,
     store: ObjectStoreDep,

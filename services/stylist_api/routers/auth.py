@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import uuid
 from datetime import UTC, datetime
+from typing import Any
 
 import jwt
 from fastapi import APIRouter, HTTPException, status
@@ -38,56 +39,13 @@ async def register(
     settings: SettingsDep,
     gateway: LiteLLMDep,
 ) -> TokenResponse:
-    user_id = uuid.uuid4()
-    # users/user_profile creation runs without tenant context: the tenant does
-    # not exist yet, so there is nothing for RLS to scope to. user_profile has
-    # a policy, so the INSERT is done here in the same system transaction
-    # deliberately — see the comment below.
-    async with system_session() as session:
-        user = User(
-            id=user_id,
-            email=body.email.lower(),
-            password_hash=hash_password(body.password),
-        )
-        session.add(user)
-        try:
-            await session.flush()
-        except IntegrityError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail="email already registered"
-            ) from exc
-        # user_profile is tenant-scoped and RLS FORCE is on, so a plain INSERT
-        # from a no-context session would be rejected by WITH CHECK. Set the
-        # tenant for the remainder of this transaction.
-        from stylist_db.session import set_tenant
-
-        await set_tenant(session, user_id)
-
-        # One LiteLLM virtual key per tenant, created at signup with a hard
-        # budget (§B3). Enforced by the gateway ON THE CREDENTIAL, so feature
-        # code cannot exceed it even with a bug, and spend is attributable.
-        #
-        # A gateway outage must NOT block signup: registration is the least
-        # appropriate moment to fail, and the tag stage already degrades to
-        # DEGRADED_TAGGED for a tenant with no key. The key is backfillable.
-        litellm_key: str | None = None
-        try:
-            issued = await gateway.create_virtual_key(
-                user_id=user_id, max_budget=settings.free_tier_monthly_budget_usd
-            )
-            litellm_key = issued.key
-        except Exception as exc:
-            logger.warning("could not create a virtual key for %s: %s", user_id, exc)
-
-        session.add(
-            UserProfile(
-                id=uuid.uuid4(),
-                user_id=user_id,
-                litellm_key=litellm_key,
-                litellm_budget_usd=settings.free_tier_monthly_budget_usd,
-                dresses_as=body.dresses_as,
-            )
-        )
+    user_id = await create_account(
+        email=body.email.lower(),
+        password_hash=hash_password(body.password),
+        dresses_as=body.dresses_as,
+        settings=settings,
+        gateway=gateway,
+    )
 
     pair, _ = issue_token_pair(
         user_id=user_id,
@@ -195,3 +153,75 @@ async def logout(
     remaining = int((claims.expires_at - datetime.now(UTC)).total_seconds())
     if remaining > 0:
         await redis.revoke_token(claims.jti, ttl_seconds=remaining)
+
+
+async def create_account(
+    *,
+    email: str,
+    password_hash: str,
+    dresses_as: str | None,
+    settings: Any,
+    gateway: Any,
+    api_client_id: uuid.UUID | None = None,
+    external_id: str | None = None,
+) -> uuid.UUID:
+    """Create a user, their profile and their LiteLLM key. 409 if the email exists.
+
+    Shared by `/auth/register` and `/partner/users`, so an account a partner
+    creates is set up exactly like one a person signs up for — same budget,
+    same profile, same everything the rest of the API assumes exists.
+    """
+    user_id = uuid.uuid4()
+    # users/user_profile creation runs without tenant context: the tenant does
+    # not exist yet, so there is nothing for RLS to scope to. user_profile has
+    # a policy, so the INSERT is done here in the same system transaction
+    # deliberately — see the comment below.
+    async with system_session() as session:
+        user = User(
+            id=user_id,
+            email=email,
+            password_hash=password_hash,
+            api_client_id=api_client_id,
+            external_id=external_id,
+        )
+        session.add(user)
+        try:
+            await session.flush()
+        except IntegrityError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail="email already registered"
+            ) from exc
+        # user_profile is tenant-scoped and RLS FORCE is on, so a plain INSERT
+        # from a no-context session would be rejected by WITH CHECK. Set the
+        # tenant for the remainder of this transaction.
+        from stylist_db.session import set_tenant
+
+        await set_tenant(session, user_id)
+
+        # One LiteLLM virtual key per tenant, created at signup with a hard
+        # budget (§B3). Enforced by the gateway ON THE CREDENTIAL, so feature
+        # code cannot exceed it even with a bug, and spend is attributable.
+        #
+        # A gateway outage must NOT block signup: registration is the least
+        # appropriate moment to fail, and the tag stage already degrades to
+        # DEGRADED_TAGGED for a tenant with no key. The key is backfillable.
+        litellm_key: str | None = None
+        try:
+            issued = await gateway.create_virtual_key(
+                user_id=user_id, max_budget=settings.free_tier_monthly_budget_usd
+            )
+            litellm_key = issued.key
+        except Exception as exc:
+            logger.warning("could not create a virtual key for %s: %s", user_id, exc)
+
+        session.add(
+            UserProfile(
+                id=uuid.uuid4(),
+                user_id=user_id,
+                litellm_key=litellm_key,
+                litellm_budget_usd=settings.free_tier_monthly_budget_usd,
+                dresses_as=dresses_as,
+            )
+        )
+
+    return user_id

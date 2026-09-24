@@ -155,6 +155,12 @@ def validate(raw: Any) -> str | None:
     # so rejecting the whole pronoun costs nothing legitimate.
     if _SECOND_PERSON_RE.search(advice):
         return None
+    # It follows another sentence in the reply, so it must read as one:
+    # measured, the model returned "a festive haldi usually calls for ...
+    # juttis" — lowercase and unterminated, glued onto the gap note.
+    advice = advice[:1].upper() + advice[1:]
+    if not advice.endswith((".", "!", "?")):
+        advice += "."
     return advice
 
 

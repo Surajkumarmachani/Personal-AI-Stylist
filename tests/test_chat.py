@@ -506,3 +506,12 @@ async def test_an_empty_wardrobe_reply_gives_the_real_reason_not_a_missing_shoe(
     gap = reply.split(". ", 1)[1]
     assert gap[:1].isupper(), reply
     assert "wardrobe" in gap, reply
+
+
+def test_advice_is_returned_as_a_sentence() -> None:
+    """It is appended after the gap note, so lowercase-and-unterminated reads
+    as a glitch. Measured from the live model."""
+    from stylist_domain.shortfall import parse_advice
+
+    got = parse_advice('{"advice": "a festive haldi usually calls for a yellow kurta"}')
+    assert got == "A festive haldi usually calls for a yellow kurta."

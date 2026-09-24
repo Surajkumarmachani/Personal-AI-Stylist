@@ -114,6 +114,19 @@ class CacheRedis:
     async def set(self, key: str, value: str, *, ttl_seconds: int) -> None:
         await self._r.set(key, value, ex=ttl_seconds)
 
+    async def incr_window(self, key: str, *, ttl_seconds: int) -> int:
+        """Count one event in a fixed window; the window expires on its own.
+
+        For per-client rate limits. A cache flush resets every window, which
+        errs towards letting requests through — the right way to fail for a
+        limit whose job is fairness, not security.
+        """
+        pipe = self._r.pipeline()
+        pipe.incr(key)
+        pipe.expire(key, ttl_seconds, nx=True)
+        count, _ = await pipe.execute()
+        return int(count)
+
     # ---- request-outcome counters (api_5xx alert) -------------------------
     #
     # On the wrapper rather than exposing the raw client: the point of this

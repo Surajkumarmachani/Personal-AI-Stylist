@@ -105,6 +105,10 @@ class User(Base):
     # an API that can escalate its own callers defeats the boundary.
     is_admin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Set for an account a partner server created (migration 0027): which
+    # partner, and the partner's own id for the person. Both or neither.
+    api_client_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True))
+    external_id: Mapped[str | None] = mapped_column(String(128))
     created_at: Mapped[datetime] = _created_at()
     updated_at: Mapped[datetime] = _updated_at()
 
