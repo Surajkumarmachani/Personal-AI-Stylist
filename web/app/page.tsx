@@ -8,7 +8,9 @@ import Link from "next/link";
 import Shell from "./Shell";
 import SignIn from "./SignIn";
 import OutfitCard from "./OutfitCard";
+import FillTheGap from "./FillTheGap";
 import Onboarding from "./Onboarding";
+import DressesAs from "./DressesAs";
 import Image from "next/image";
 import { OCCASIONS } from "./OCCASIONS";
 import {
@@ -52,6 +54,10 @@ export default function Home() {
   // the hero has asked a direct question, and swallowing the answer because
   // of what they wore earlier is the app refusing to respond.
   const [asked, setAsked] = useState(false);
+  // The RESOLVED occasion of the last question, so the shop panel is keyed on
+  // what the outfits were built for, not on the words typed. Explore does the
+  // same, for the same reason: the two must not disagree about the occasion.
+  const [askedOccasion, setAskedOccasion] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
 
   /** Undo one wear, then re-read. Re-reading rather than splicing the item
@@ -139,12 +145,14 @@ export default function Home() {
         setOutfits(res.outfits);
         setReply(res.reply);
         setAsked(true);
+        setAskedOccasion(res.needs_clarification ? null : (res.understood?.occasion ?? null));
         // The user has now named an occasion, so the calendar provenance no
         // longer describes what is on screen.
         setWhy(null);
       } catch (e) {
         setReply(String(e));
         setOutfits([]);
+        setAskedOccasion(null);
       } finally {
         setBusy(false);
       }
@@ -161,6 +169,8 @@ export default function Home() {
           marketing headline over an empty grid is the least useful screen the
           product can show. */}
       <Onboarding />
+      {/* Once, for accounts made before sign-up asked. Renders nothing after. */}
+      <DressesAs variant="prompt" />
 
       <section className="ui-hero">
         <h1>
@@ -336,7 +346,17 @@ export default function Home() {
         </section>
       ) : null}
 
+      {/* ASKED, AND THE WARDROBE CAME UP EMPTY. The reply says which piece is
+          missing; it used to render nowhere, because the section above only
+          exists when there are outfits — so the question got no answer at all. */}
+      {asked && outfits.length === 0 && reply ? (
+        <section style={{ marginBottom: 34 }}>
+          <p className="ui-sub">{reply}</p>
+        </section>
+      ) : null}
 
+      {/* Renders nothing unless the occasion's pool actually came back short. */}
+      {asked && askedOccasion ? <FillTheGap occasion={askedOccasion} /> : null}
     </Shell>
   );
 }

@@ -217,3 +217,241 @@ async def test_a_garment_can_only_be_owned_once_per_product(owner_engine) -> Non
     # PARTIAL: ordinary photographed garments are all NULL here and must not
     # be forced to be distinct from one another.
     assert "WHERE" in idx and "NOT NULL" in idx
+
+
+# ------------------------------------------------------ merchant-reported buys
+
+
+def test_the_reference_replaces_a_placeholder_sub_id_rather_than_adding_one() -> None:
+    """Two sub-ids on one link, and networks disagree about which one wins —
+    so the purchase could be credited to the placeholder and never reach us."""
+    from urllib.parse import parse_qs, urlsplit
+
+    from stylist_shop.conversions import tracked_url
+
+    url = tracked_url("https://shop.example/p?q=kurta&subid=PLACEHOLDER", "abc", "subid")
+    query = parse_qs(urlsplit(url).query)
+    assert query == {"q": ["kurta"], "subid": ["abc"]}
+
+
+def test_an_unknown_status_is_refused_not_read_as_approved() -> None:
+    """Guessing 'approved' puts a garment in someone's wardrobe."""
+    from stylist_shop.conversions import normalise_status
+
+    assert normalise_status("Confirmed") == "approved"
+    assert normalise_status("pending") == "pending"
+    assert normalise_status("returned") == "rejected"
+    assert normalise_status("shipped-ish") is None
+    assert normalise_status(None) is None
+
+
+@pytest.mark.asyncio
+async def test_a_reported_purchase_joins_the_wardrobe_once_and_leaves_on_return(
+    api, registered, owner_engine, monkeypatch
+) -> None:
+    """The whole loop: shown -> link carries the impression id -> the merchant
+    reports the order against it -> the garment exists, once, however many
+    times the network resends -> a return retires it."""
+    import uuid
+    from urllib.parse import parse_qs, urlsplit
+
+    import sqlalchemy as sa
+
+    from stylist_api.settings import get_settings
+
+    monkeypatch.setenv("SHOP_POSTBACK_SECRET", "s3cret")
+    get_settings.cache_clear()
+
+    product_id = uuid.uuid4()
+    async with owner_engine.begin() as conn:
+        # Price 0 so it sorts ahead of anything else stocked for `feet`.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO product (id, merchant, external_id, title, slot, url, price_minor) "
+                "VALUES (:id, 'test', :ext, 'Test juttis', 'feet', "
+                "'https://shop.example/juttis', 0)"
+            ),
+            {"id": product_id, "ext": str(product_id)},
+        )
+    try:
+        body = (
+            await api.get("/shop/gaps?occasion=casual_outing", headers=registered.auth)
+        ).json()
+        assert body["auto_add"] is True
+        shown = [p for g in body["gaps"] for p in g["products"] if p["id"] == str(product_id)]
+        assert shown, body
+        ref = parse_qs(urlsplit(shown[0]["url"]).query)["subid"][0]
+
+        base = f"/shop/conversions?ref={ref}&conversion_id=ORD-{product_id}&network=test"
+        assert (await api.get(f"{base}&secret=wrong&status=pending")).status_code == 403
+        assert (await api.get(f"{base}&secret=s3cret&status=shippedish")).status_code == 400
+
+        first = (await api.get(f"{base}&secret=s3cret&status=pending")).json()
+        # A network resending the same order, now approved, and via POST.
+        again = (await api.post(f"{base}&secret=s3cret&status=approved")).json()
+        assert first["garment_id"] and first["garment_id"] == again["garment_id"]
+
+        async with owner_engine.begin() as conn:
+            rows = (
+                await conn.execute(
+                    sa.text(
+                        "SELECT is_active, attributes_raw->>'confirmed_by' FROM garments "
+                        "WHERE sourced_product_id = :pid"
+                    ),
+                    {"pid": product_id},
+                )
+            ).all()
+        assert rows == [(True, "conversion_feed")]
+
+        await api.get(f"{base}&secret=s3cret&status=returned")
+        async with owner_engine.begin() as conn:
+            active = (
+                await conn.execute(
+                    sa.text("SELECT is_active FROM garments WHERE sourced_product_id = :pid"),
+                    {"pid": product_id},
+                )
+            ).scalar_one()
+        assert active is False, "a returned item is no longer theirs to be styled in"
+
+        # A reference that belongs to nobody is acknowledged, not retried forever.
+        stray = await api.get(
+            f"/shop/conversions?ref={uuid.uuid4()}&conversion_id=X&status=pending&secret=s3cret"
+        )
+        assert stray.status_code == 200 and stray.json()["accepted"] is False
+    finally:
+        async with owner_engine.begin() as conn:
+            await conn.execute(
+                sa.text("DELETE FROM shop_conversion WHERE product_id = :pid"), {"pid": product_id}
+            )
+            await conn.execute(
+                sa.text("DELETE FROM garments WHERE sourced_product_id = :pid"),
+                {"pid": product_id},
+            )
+            await conn.execute(sa.text("DELETE FROM product WHERE id = :pid"), {"pid": product_id})
+        get_settings.cache_clear()
+
+
+@pytest.mark.asyncio
+async def test_the_postback_is_closed_when_no_secret_is_configured(api, monkeypatch) -> None:
+    """An unconfigured deployment must not add garments for whoever guesses
+    the path — an empty secret would otherwise match an empty parameter."""
+    from stylist_api.settings import get_settings
+
+    monkeypatch.setenv("SHOP_POSTBACK_SECRET", "")
+    get_settings.cache_clear()
+    try:
+        resp = await api.get("/shop/conversions?secret=&ref=x&conversion_id=1&status=approved")
+        assert resp.status_code == 403
+    finally:
+        get_settings.cache_clear()
+
+
+# ------------------------------------------------------------- whose clothes
+
+
+@pytest.mark.asyncio
+async def test_sign_up_records_whose_clothes_to_suggest(api) -> None:
+    """Asked at sign-up so the first shortfall is already for the right person."""
+    import uuid
+
+    resp = await api.post(
+        "/auth/register",
+        json={
+            "email": f"user-{uuid.uuid4()}@example.com",
+            "password": "a-long-enough-password",
+            "dresses_as": "women",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    auth = {"Authorization": f"Bearer {resp.json()['access_token']}"}
+    assert (await api.get("/me/dresses-as", headers=auth)).json() == {
+        "dresses_as": "women",
+        "asked": True,
+    }
+
+    bad = await api.post(
+        "/auth/register",
+        json={
+            "email": f"user-{uuid.uuid4()}@example.com",
+            "password": "a-long-enough-password",
+            "dresses_as": "robot",
+        },
+    )
+    assert bad.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_an_account_made_before_the_question_reads_as_not_asked(api, registered) -> None:
+    """NULL is 'not asked yet', which is what makes the home screen ask once."""
+    body = (await api.get("/me/dresses-as", headers=registered.auth)).json()
+    assert body == {"dresses_as": None, "asked": False}
+    assert (
+        await api.put("/me/dresses-as", json={"dresses_as": "they"}, headers=registered.auth)
+    ).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_the_gap_filler_offers_only_the_users_line_plus_unisex(
+    api, registered, owner_engine
+) -> None:
+    """An empty wardrobe used to be offered a lehenga skirt and a sherwani
+    side by side. Each answer sees its own line and unisex; 'all' sees both."""
+    import uuid
+
+    import sqlalchemy as sa
+
+    ids = {g: uuid.uuid4() for g in ("women", "men", "unisex")}
+    async with owner_engine.begin() as conn:
+        for gender, pid in ids.items():
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO product (id, merchant, external_id, title, slot, url, "
+                    "price_minor, gender) VALUES (:id, 'test', :ext, :title, 'feet', "
+                    "'https://shop.example/x', 0, :g)"
+                ),
+                {"id": pid, "ext": str(pid), "title": f"{gender} shoes", "g": gender},
+            )
+
+    async def offered() -> set[str]:
+        body = (
+            await api.get("/shop/gaps?occasion=casual_outing", headers=registered.auth)
+        ).json()
+        seen = {p["id"] for g in body["gaps"] for p in g["products"]}
+        return {g for g, pid in ids.items() if str(pid) in seen}
+
+    try:
+        assert await offered() == {"women", "men", "unisex"}, "unasked shows everything"
+        for answer, expected in (
+            ("women", {"women", "unisex"}),
+            ("men", {"men", "unisex"}),
+            ("all", {"women", "men", "unisex"}),
+        ):
+            await api.put("/me/dresses-as", json={"dresses_as": answer}, headers=registered.auth)
+            assert await offered() == expected, answer
+    finally:
+        async with owner_engine.begin() as conn:
+            await conn.execute(
+                sa.text("DELETE FROM product WHERE id = ANY(:ids)"), {"ids": list(ids.values())}
+            )
+
+
+def test_a_product_with_an_unknown_department_is_rejected() -> None:
+    from stylist_shop.providers import InvalidProduct, Product, validate
+
+    ok = Product(merchant="m", external_id="1", title="t", url="u", slot="feet", gender="women")
+    assert validate(ok) is ok
+    with pytest.raises(InvalidProduct, match="gender"):
+        validate(
+            Product(merchant="m", external_id="1", title="t", url="u", slot="feet", gender="kids")
+        )
+
+
+def test_the_advice_is_told_whose_clothes_and_nothing_when_both() -> None:
+    """Without it the advice named a saree and a sherwani in one sentence.
+    'all' and unasked say nothing, so the prompt's "one of each" applies."""
+    from stylist_domain.shortfall import build_user_message
+
+    assert "Describe: womenswear" in build_user_message("the haldi", "festive_ethnic", "", "women")
+    assert "Describe: menswear" in build_user_message("the haldi", "festive_ethnic", "", "men")
+    for unsaid in ("all", None):
+        assert "Describe" not in build_user_message("the haldi", "festive_ethnic", "", unsaid)

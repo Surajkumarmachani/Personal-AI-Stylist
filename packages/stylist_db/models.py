@@ -132,6 +132,9 @@ class UserProfile(Base):
     preference_facts: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, server_default="{}"
     )
+    # Whose clothes to suggest BUYING: 'women', 'men' or 'all'. Never used to
+    # filter the user's own wardrobe. NULL = not asked yet — see 0026.
+    dresses_as: Mapped[str | None] = mapped_column(String(8))
     # The tenant's LiteLLM virtual key. Nullable: a gateway outage at signup
     # must not block registration, and the tag stage degrades for a tenant
     # without one.

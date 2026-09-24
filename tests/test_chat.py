@@ -227,6 +227,87 @@ def test_a_low_confidence_answer_is_not_acted_on() -> None:
     assert not got.confident, "a coin-flip classification must ask, not dress"
 
 
+def test_a_correct_answer_in_malformed_json_is_salvaged() -> None:
+    """THE EXACT REPLY THE FREE MODEL SENT, and it used to be discarded.
+
+    Probed live: asked "cultural program", the OpenRouter free row answered
+    `{"{ "occasion": "festival_day" ` followed by newlines to `max_tokens`.
+    The classification is RIGHT; only the wrapping is broken, and the user was
+    shown "I'm not sure what the occasion is" because of a stray brace.
+
+    Every free model declaring structured outputs is a reasoning model, so
+    this is the normal condition of the cheap tier, not one bad slug.
+    """
+    from stylist_domain.intent_llm import parse_answer
+
+    got = parse_answer('{"{ "occasion": "festival_day" ' + "\n " * 200)
+    assert got is not None and got.occasion == "festival_day"
+
+
+def test_a_salvaged_answer_does_not_invent_a_confidence() -> None:
+    """Confidence decides whether the user is ASKED or SHOWN an outfit.
+
+    The newline flood truncates before the field, so it is genuinely unknown.
+    Defaulting it high would fabricate the model's own uncertainty signal —
+    the one thing that stops a guess being acted on — so a salvaged answer
+    with no readable confidence is offered as a question instead.
+    """
+    from stylist_domain.intent_llm import parse_answer
+
+    got = parse_answer('{"{ "occasion": "festival_day" ' + "\n " * 200)
+    assert got is not None
+    assert got.confidence == 0.0
+    assert not got.confident, "a salvaged answer must be asked about, not acted on"
+
+    # When the broken output DOES carry one, it is read rather than ignored.
+    with_conf = parse_answer('{"{ "occasion": "haldi" , "confidence": 0.91 }}}')
+    assert with_conf is not None and with_conf.confident
+
+
+def test_salvage_still_refuses_an_invented_occasion() -> None:
+    """Tolerating bad JSON must not tolerate a bad ID. Salvage reconstructs the
+    fields and hands them to the same `validate` gate — an occasion outside the
+    taxonomy still reaches `resolve_context` as a 500 if it gets through."""
+    from stylist_domain.intent_llm import parse_answer
+
+    assert parse_answer('{"{ "occasion": "moon_landing" ') is None
+    assert parse_answer("I think this is a festival.") is None
+    assert parse_answer("") is None
+
+
+def test_a_well_formed_answer_is_unaffected_by_salvage() -> None:
+    """Salvage runs only after `json.loads` has failed, so the happy path
+    cannot have changed meaning — including the markdown fence some models
+    wrap their JSON in."""
+    from stylist_domain.intent_llm import parse_answer
+
+    clean = parse_answer(
+        '{"occasion":"festival_day","confidence":0.95,"alternatives":["temple_visit"]}'
+    )
+    assert clean is not None
+    assert clean.occasion == "festival_day"
+    assert clean.confident and clean.alternatives == ("temple_visit",)
+
+    fenced = parse_answer('```json\n{"occasion":"brunch","confidence":0.8,"alternatives":[]}\n```')
+    assert fenced is not None and fenced.occasion == "brunch"
+
+
+def test_advice_never_claims_the_user_owns_anything() -> None:
+    """The product rule is that outfits come from the catalogued wardrobe.
+
+    Advice sits in the same bubble as real suggestions, so a model listing
+    clothes the user may not have would make the honest half untrustworthy
+    too. Enforced on salvaged answers as well as clean ones.
+    """
+    from stylist_domain.shortfall import parse_advice
+
+    assert parse_advice('{"advice":"Wear your blue kurta."}') is None
+    assert parse_advice('{"{ "advice": "You already have a great saree." ') is None
+
+    ok = parse_advice('{"{ "advice": "A festival usually calls for a silk saree." ')
+    assert ok == "A festival usually calls for a silk saree."
+
+
 def test_alternatives_are_filtered_to_real_occasions() -> None:
     """A bad SUGGESTION is cosmetic where a bad classification is not, so
     unknown ids are dropped rather than failing the whole answer."""
@@ -311,20 +392,27 @@ async def test_a_custom_occasion_must_name_a_real_base(api, registered) -> None:
 async def test_a_custom_name_beats_the_built_in_lexicon(api, registered) -> None:
     """The ordering IS the feature.
 
-    The lexicon maps bare `office` to `office_casual`, and "office" is longer
-    than "party" so it wins the longest-phrase rule. Someone who has named an
-    occasion "office party" would therefore get desk clothes for a night out —
-    their own words losing to a generic keyword inside them, in their own
-    wardrobe.
+    The built-in lexicon has a good answer for "office party" — the occasion
+    of that name, `office_party`. This asserts the user's OWN answer still
+    wins: someone who has named an occasion "office party" and pointed it at
+    `party_night` dresses for a night out, not for the work social the
+    taxonomy assumes.
+
+    The control used to be `office_casual`, from bare `office` winning the
+    longest-phrase rule when no `office party` phrase existed. That was an
+    accident of the lexicon rather than the behaviour under test, and it
+    stopped being true once the phrase was added. What is being tested is
+    unchanged: whatever the built-in says, the alias overrides it and
+    deleting the alias restores it.
 
     Measured against the running API: without the alias the message resolves
-    to `office_casual via office`; with it, `party_night via your occasion
-    'office party'`; after deleting it, back to `office_casual`.
+    to `office_party via office party`; with it, `party_night via your
+    occasion 'office party'`; after deleting it, back to `office_party`.
     """
     from stylist_domain.intent import parse
 
     msg = "what do i wear to the office party"
-    assert parse(msg).occasion == "office_casual", "the control the alias has to beat"
+    assert parse(msg).occasion == "office_party", "the control the alias has to beat"
 
     created = await api.post(
         "/me/occasions",
@@ -341,7 +429,7 @@ async def test_a_custom_name_beats_the_built_in_lexicon(api, registered) -> None
     )
     assert gone.status_code == 200
     back = await api.post("/chat", json={"message": msg}, headers=registered.auth)
-    assert back.json()["understood"]["occasion"] == "office_casual", (
+    assert back.json()["understood"]["occasion"] == "office_party", (
         "deleting an alias must restore the built-in answer, not leave a hole"
     )
 

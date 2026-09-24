@@ -258,6 +258,10 @@ services:
       # compares the string, so a trailing slash is a different URI.
       GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
       GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      # Phase 13 affiliate postback, read from .env. Unset keeps shop links
+      # untagged and `/shop/conversions` closed; see catalogue/README.md.
+      SHOP_POSTBACK_SECRET: ${SHOP_POSTBACK_SECRET:-}
+      SHOP_SUBID_PARAM: ${SHOP_SUBID_PARAM:-subid}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8080/calendar/callback}
       # The GLOBAL calendar: a public holiday feed read with an API key,
       # not OAuth. Unset degrades to config/observances.yaml, which holds

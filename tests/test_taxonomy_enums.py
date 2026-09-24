@@ -8,6 +8,8 @@ database rejects.
 
 from __future__ import annotations
 
+import pathlib
+
 import pytest
 from sqlalchemy import text
 
@@ -61,3 +63,36 @@ async def test_no_other_value_anywhere(app_sessionmaker) -> None:
         )
         offenders = list(rows)
     assert not offenders, f"forbidden escape-hatch enum values present: {offenders}"
+
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+
+
+def test_every_occasion_is_reachable_and_askable() -> None:
+    """A taxonomy occasion nobody can pick or type does not exist to the user.
+
+    Twelve of eighteen had tiles. `office_formal`, `client_meeting` and `wfh`
+    cover most of the working week and none were on the screen, while the
+    resolver could dress someone for a `funeral` they had no way to choose.
+
+    Both directions are checked, because they fail differently: a missing tile
+    is invisible, and a tile whose `ask` phrase resolves somewhere else is
+    WORSE -- it silently serves a different occasion than the one tapped.
+    """
+    import re
+
+    from stylist_domain.intent import LEXICON
+    from stylist_domain.taxonomy import load_taxonomy
+
+    ids = {o["id"] for o in load_taxonomy().raw["occasions"]}
+    src = (ROOT / "web" / "app" / "OCCASIONS.ts").read_text()
+    tiles = re.findall(r'id: "([a-z_]+)", ask: "([^"]+)"', src)
+
+    assert {t for t, _ in tiles} == ids, "every occasion needs exactly one tile"
+    for occasion, ask in tiles:
+        assert LEXICON.get(ask.lower()) == occasion, (
+            f"tile {occasion!r} asks {ask!r}, which the lexicon resolves to "
+            f"{LEXICON.get(ask.lower())!r}"
+        )
+    for occasion in ids:
+        assert occasion in set(LEXICON.values()), f"{occasion} cannot be typed"

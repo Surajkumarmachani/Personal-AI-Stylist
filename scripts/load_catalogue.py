@@ -53,13 +53,13 @@ async def main() -> int:
                     INSERT INTO product (
                         id, merchant, external_id, title, brand, slot, subcategory,
                         primary_colour, dress_code, formality, warmth,
-                        price_minor, currency, url, image_url, in_stock, updated_at
+                        price_minor, currency, url, image_url, in_stock, gender, updated_at
                     ) VALUES (
                         :id, :merchant, :external_id, :title, :brand,
                         CAST(:slot AS slot), CAST(:subcategory AS subcategory),
                         CAST(:primary_colour AS colour), CAST(:dress_code AS dress_code),
                         :formality, :warmth, :price_minor, :currency, :url,
-                        :image_url, :in_stock, now()
+                        :image_url, :in_stock, :gender, now()
                     )
                     -- EVERY column the feed supplies, not just the volatile
                     -- ones. This used to update title, price, stock, url and
@@ -85,6 +85,7 @@ async def main() -> int:
                         in_stock = EXCLUDED.in_stock,
                         url = EXCLUDED.url,
                         image_url = EXCLUDED.image_url,
+                        gender = EXCLUDED.gender,
                         updated_at = now()
                     """
                 ),

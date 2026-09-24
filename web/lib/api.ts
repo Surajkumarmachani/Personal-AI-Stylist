@@ -195,12 +195,15 @@ async function json<T>(resp: Response): Promise<T> {
   return (await resp.json()) as T;
 }
 
-export async function register(email: string, password: string) {
+/** Whose clothes to suggest BUYING. Never filters the user's own wardrobe. */
+export type DressesAs = "women" | "men" | "all";
+
+export async function register(email: string, password: string, dressesAs?: DressesAs) {
   const body = await json<{ access_token: string; refresh_token: string }>(
     await fetch(`${API_BASE}/auth/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ email, password, dresses_as: dressesAs }),
     }),
   );
   setSession(body.access_token, body.refresh_token);
@@ -598,6 +601,9 @@ export type ShopGaps = {
    *  returning it as data means a new surface cannot forget it. */
   affiliate: string;
   catalogue_empty: boolean;
+  /** True when a purchase through these links is reported by the merchant
+   *  and added to the wardrobe without the user saying so. */
+  auto_add: boolean;
 };
 
 export async function shopGaps(occasion: string): Promise<ShopGaps> {
@@ -1421,4 +1427,21 @@ export async function listBodyPhotos(): Promise<{ photos: BodyPhoto[]; active: n
  *  must not cost you the product. */
 export async function revokeBodyPhotos(): Promise<unknown> {
   return json<unknown>(await authedFetch(`${API_BASE}/me/body-photos`, { method: "DELETE" }));
+}
+
+// ------------------------------------------------------------ dresses as
+
+export async function getDressesAs(): Promise<{ dresses_as: DressesAs | null; asked: boolean }> {
+  const res = await authedFetch(`${API_BASE}/me/dresses-as`);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return (await res.json()) as { dresses_as: DressesAs | null; asked: boolean };
+}
+
+export async function setDressesAs(value: DressesAs): Promise<void> {
+  const res = await authedFetch(`${API_BASE}/me/dresses-as`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ dresses_as: value }),
+  });
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${(await res.text()).slice(0, 120)}`);
 }

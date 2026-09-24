@@ -196,14 +196,25 @@ async def test_suggestions_explains_an_empty_result(api: AsyncClient, registered
     """ "No suggestions" with no reason is the least actionable screen possible.
 
     This tenant's single garment is still at `received` with no cutout, so the
-    pool is empty — and the response has to say which slot is missing.
+    pool is empty — and the response has to say what is missing IN WORDS.
+
+    The note is the entire answer the chat shows for an undressable occasion,
+    so the bar is what a user can act on, not what a developer can decode. It
+    used to read "no complete base structure available (upper_base+lower or
+    full_body)", which named the slots in the schema's vocabulary rather than
+    the wearer's; the raw-id assertion below is what stops that returning.
     """
     resp = await api.get("/suggestions", headers=registered.auth)
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["outfits"] == []
     assert body["notes"], body
-    assert any("feet" in n or "base structure" in n for n in body["notes"]), body["notes"]
+    assert any(
+        "shoes" in n or "wardrobe" in n or "outfit" in n for n in body["notes"]
+    ), body["notes"]
+    jargon = ("upper_base", "full_body", "base structure", "no wearable feet")
+    for note in body["notes"]:
+        assert not any(j in note for j in jargon), f"slot ids leaked to the user: {note!r}"
 
 
 @pytest.mark.asyncio
@@ -486,6 +497,93 @@ async def test_a_stored_outfit_that_breaks_todays_rules_is_not_served(
         slots = [g["slot"] for g in outfit["garments"]]
         assert len(slots) == len(set(slots)), f"two garments in one slot: {slots}"
         assert "upper_base" in slots or "full_body" in slots, f"no top: {slots}"
+
+
+@pytest.mark.asyncio
+async def test_a_stored_outfit_is_rechecked_against_the_occasions_dress_code(
+    api: AsyncClient, registered, owner_engine
+) -> None:
+    """DENIM AT THE GYM. Reported from the running app, top four looks.
+
+    "Something for the gym" returned denim shirts, jeans and white sneakers.
+    The rows were real: materialised under `occasion = 'workout'` from
+    garments tagged `casual`, while `activewear` accepts only `activewear`.
+    Re-running `load_wardrobe` for that wardrobe and occasion produced an
+    EMPTY pool, so the live path had been right the whole time — the stored
+    rows had simply outlived the tags they were built from, and `_hydrate`
+    re-checked the STRUCTURE of a stored outfit but never whether it still
+    suited the occasion it was filed under.
+
+    The structure here is deliberately VALID (top, bottom, shoes) so that the
+    existing slot-rule guard cannot be what rejects it. Only a dress-code
+    check can, which is what makes this a test of the fix rather than of the
+    guard next to it.
+    """
+    import uuid as _uuid
+
+    import sqlalchemy as sa
+
+    async with owner_engine.begin() as conn:
+        user_id = (
+            await conn.execute(
+                sa.text("SELECT id FROM users WHERE email = :e"), {"e": registered.email}
+            )
+        ).scalar_one()
+
+        planted = {
+            "upper_base": (_uuid.uuid4(), "shirt_casual"),
+            "lower": (_uuid.uuid4(), "jeans"),
+            "feet": (_uuid.uuid4(), "sneakers"),
+        }
+        for slot, (gid, sub) in planted.items():
+            await conn.execute(
+                sa.text(
+                    "INSERT INTO garments (id, user_id, original_key, slot, subcategory,"
+                    " primary_colour, dress_code, formality, warmth, attributes_raw,"
+                    " field_confidence, user_verified_fields, state, needs_review,"
+                    " is_active, moderation, needs_wash, created_at, updated_at)"
+                    f" VALUES (:id, :u, :key, CAST('{slot}' AS slot),"
+                    f" CAST('{sub}' AS subcategory), CAST('denim_indigo' AS colour),"
+                    " CAST('casual' AS dress_code), 2, 3, '{}'::jsonb, '{}'::jsonb,"
+                    " '{}', 'matted', false, true, '{}'::jsonb, false, now(), now())"
+                ),
+                {"id": gid, "u": user_id, "key": f"originals/{user_id}/{gid}"},
+            )
+
+        # Score 0.99 puts it first if it is served at all.
+        await conn.execute(
+            sa.text(
+                "INSERT INTO outfits (id, user_id, garment_ids, garment_set_hash,"
+                " occasion, warmth_target, formality_target, wet, score,"
+                " score_breakdown, scoring_version, created_at) VALUES"
+                " (gen_random_uuid(), :u, ARRAY[CAST(:a AS uuid), CAST(:b AS uuid),"
+                " CAST(:c AS uuid)], 'denim-at-the-gym-hash', 'workout', :w, 1,"
+                " false, 0.99, '{}'::jsonb, 1, now())"
+            ),
+            {
+                "u": user_id,
+                "a": planted["upper_base"][0],
+                "b": planted["lower"][0],
+                "c": planted["feet"][0],
+                # 26 C -> warmth band 3, which the serving query filters on.
+                "w": 3,
+            },
+        )
+
+    resp = await api.get(
+        "/suggestions?occasion=workout&feels_like_c=26", headers=registered.auth
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    served = {g["id"] for o in body["outfits"] for g in o["garments"]}
+    for slot, (gid, sub) in planted.items():
+        assert str(gid) not in served, f"{sub} ({slot}, casual) served for a workout"
+
+    # AND THE USER IS TOLD WHY. Dropping the row must not turn into a blank
+    # screen with no reason — that is the failure the notes exist to prevent.
+    if not body["outfits"]:
+        assert body["notes"], "an empty result has to say what is missing"
 
 
 def test_the_universal_calendar_dresses_a_user_with_no_diary() -> None:

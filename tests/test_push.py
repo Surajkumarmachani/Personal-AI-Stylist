@@ -264,3 +264,37 @@ async def test_the_notification_carries_a_deep_link_and_no_ranking_detail(
     assert sent["data"]["kind"] == "daily_digest"
     assert "score" not in sent["body"].lower()
     assert "kurta" in sent["body"]
+
+
+async def test_the_digest_never_names_an_outfit_that_cannot_be_worn_today(
+    tenant, monkeypatch
+) -> None:
+    """The top stored outfit holds a kurta in the wash. The push must skip to
+    one that can be worn — or send nothing — rather than suggest it."""
+    await _register(tenant, TOKEN_A)
+    await _seed_outfit(tenant)  # the kurta, score 0.9, hash "a"*64
+    async with tenant_session(tenant.id) as db:
+        await db.execute(text("UPDATE garments SET needs_wash = true WHERE subcategory = 'kurta'"))
+        clean = uuid.uuid4()
+        await db.execute(
+            text(
+                "INSERT INTO garments (id, user_id, original_key, slot, subcategory, state) "
+                "VALUES (:g, :u, 'k', 'upper_base', 't_shirt', 'complete')"
+            ),
+            {"g": clean, "u": tenant.id},
+        )
+        await db.execute(
+            text(
+                "INSERT INTO outfits (id, user_id, garment_ids, garment_set_hash, occasion, "
+                "warmth_target, formality_target, score, scoring_version) "
+                "VALUES (:i, :u, CAST(:ids AS uuid[]), :h, 'casual_outing', 3, 3, 0.5, 1)"
+            ),
+            {"i": uuid.uuid4(), "u": tenant.id, "ids": [str(clean)], "h": "b" * 64},
+        )
+    fake = FakeFCM()
+    monkeypatch.setattr(notify, "get_client", lambda: fake)
+
+    await notify.send_digest_for_tenant(tenant.id, now=at_hour(7))
+    sent = fake.sends[0]
+    assert sent["data"]["garment_set_hash"] == "b" * 64
+    assert "kurta" not in sent["body"]

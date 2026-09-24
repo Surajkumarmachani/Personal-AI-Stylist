@@ -43,6 +43,7 @@ from stylist_api.settings import get_settings
 from stylist_clients.fcm import FCMClient, PushUnavailable, ServiceAccount
 from stylist_db.session import system_session, tenant_session
 from stylist_obs import stage_span
+from stylist_suggest.pipeline import RECENTLY_WORN_DAYS
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +148,28 @@ async def send_digest_for_tenant(
         outfit = await db.execute(
             text(
                 """
-                SELECT garment_set_hash, garment_ids
-                FROM outfits
-                ORDER BY score DESC, garment_set_hash
+                SELECT o.garment_set_hash, o.garment_ids
+                FROM outfits o
+                -- Only an outfit that can be WORN today. The same rule the
+                -- suggestions endpoint applies to stored outfits: a
+                -- notification naming the shirt in the wash, or yesterday's
+                -- jeans, is the push version of the bug fixed there.
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM unnest(o.garment_ids) AS gid
+                    JOIN garments g ON g.id = gid
+                    WHERE g.needs_wash OR NOT g.is_active
+                       OR EXISTS (
+                            SELECT 1 FROM wear_log w
+                            WHERE w.garment_id = g.id
+                              AND w.worn_on >= CURRENT_DATE
+                                  - make_interval(days => :recent_days)
+                       )
+                )
+                ORDER BY o.score DESC, o.garment_set_hash
                 LIMIT 1
                 """
-            )
+            ),
+            {"recent_days": RECENTLY_WORN_DAYS},
         )
         top = outfit.mappings().one_or_none()
         if top is None:

@@ -73,6 +73,32 @@ QUERIES: dict[str, str] = {
     "mehendi": "mehendi haldi indian outfit yellow",
     "sangeet": "sangeet indian wedding outfit dance",
     "temple_visit": "kurta indian traditional menswear",
+    # --- added with the occasion expansion ---------------------------------
+    #
+    # Six of these are occasions the TAXONOMY already had and the tile grid
+    # never showed: a user could be dressed for a funeral by the system and
+    # could not choose one on the screen.
+    "wfh": "working from home comfortable outfit",
+    "office_formal": "formal business suit office",
+    "client_meeting": "business meeting professional outfit",
+    "wedding_reception": "indian wedding reception outfit",
+    "funeral": "formal black outfit sombre",
+    "black_tie_event": "black tie gown tuxedo formal event",
+    # Corporate.
+    "conference": "business conference professional",
+    "networking_event": "networking business event people",
+    "office_party": "office christmas party outfit",
+    "team_offsite": "team outing casual work",
+    # Ethnic. Short queries on purpose -- see the catalogue fetcher: long
+    # phrases naming Indian garments precisely return ZERO results on
+    # Unsplash, which indexes in generic English.
+    "haldi": "haldi ceremony yellow",
+    "engagement": "indian engagement ceremony couple",
+    "griha_pravesh": "indian pooja ceremony home",
+    "baby_shower": "baby shower celebration",
+    # General.
+    "brunch": "brunch outfit cafe",
+    "graduation": "graduation gown ceremony",
 }
 
 
@@ -110,8 +136,25 @@ def _write_image_map() -> None:
         " * for a local path carrying a query string. */",
         "export const OCCASION_IMAGES: Record<string, string> = {",
     ]
+    # GROUPED BY OCCASION FIRST, then one entry each.
+    #
+    # This iterated a snapshot of `glob("*.jpg")` and emitted a line per FILE.
+    # A refresh writes `casual_outing.jpg` next to the existing
+    # `casual_outing.70143707.jpg`, so the snapshot held both and the
+    # generated map got TWO `casual_outing:` keys -- which TypeScript rejects
+    # outright: "An object literal cannot have multiple properties with the
+    # same name", twelve times, and the web build stopped.
+    #
+    # Keying the dict by occasion makes a duplicate impossible to express.
+    # An un-hashed file is the freshly downloaded one, so it wins.
+    by_occasion: dict[str, pathlib.Path] = {}
     for f in sorted(OUT.glob("*.jpg")):
         occasion = f.stem.split(".")[0]
+        fresh = "." not in f.stem
+        if occasion not in by_occasion or fresh:
+            by_occasion[occasion] = f
+
+    for occasion, f in sorted(by_occasion.items()):
         digest = hashlib.sha256(f.read_bytes()).hexdigest()[:8]
         final = OUT / f"{occasion}.{digest}.jpg"
         if f != final:

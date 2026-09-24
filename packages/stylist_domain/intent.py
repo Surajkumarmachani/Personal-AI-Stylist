@@ -47,6 +47,94 @@ from dataclasses import dataclass
 # "office formal" must beat "office", so matching sorts by phrase length
 # descending rather than trusting dict order.
 LEXICON: dict[str, str] = {
+    # --- a STYLE of clothing, not an event ----------------------------------
+    #
+    # "Cultural wear" got "I'm not sure what the occasion is". It is one of the
+    # most basic things a person can ask this product for, and both layers
+    # missed it: no lexicon phrase, and a prompt that told the model to judge
+    # "what the person will be DOING" -- which is unanswerable when they have
+    # named a wardrobe category rather than an event.
+    #
+    # These resolve to the occasion that dress code BELONGS to. It is a
+    # judgement, not a fact: someone asking for ethnic wear may be going to a
+    # wedding or a temple, and `festival_day` is the festive-ethnic default
+    # rather than a claim about their day.
+    "ethnic": "festival_day",
+    "ethnic wear": "festival_day",
+    "cultural wear": "festival_day",
+    "cultural dress": "festival_day",
+    "traditional wear": "festival_day",
+    "traditional dress": "festival_day",
+    "traditional outfit": "festival_day",
+    "indian wear": "festival_day",
+    "indian outfit": "festival_day",
+    "desi": "festival_day",
+    "desi wear": "festival_day",
+    "kurta": "festival_day",
+    "saree": "festival_day",
+    "sari": "festival_day",
+    "lehenga": "wedding_ceremony",
+    "sherwani": "wedding_ceremony",
+    "western wear": "casual_outing",
+    "formals": "office_formal",
+    "formal wear": "office_formal",
+    "party wear": "party_night",
+    "gym wear": "workout",
+    "sportswear": "workout",
+    "activewear": "workout",
+    "loungewear": "wfh",
+    # --- corporate ----------------------------------------------------------
+    #
+    # The working week was three ids deep (`wfh`, `office_casual`,
+    # `office_formal`) while weddings had four. Most people dress for work far
+    # more often than for a wedding.
+    "conference": "conference",
+    "seminar": "conference",
+    "summit": "conference",
+    "convention": "conference",
+    "trade show": "conference",
+    "offsite": "team_offsite",
+    "off site": "team_offsite",
+    "team outing": "team_offsite",
+    "team building": "team_offsite",
+    "work trip": "team_offsite",
+    "networking": "networking_event",
+    "networking event": "networking_event",
+    "meetup": "networking_event",
+    "industry event": "networking_event",
+    "office party": "office_party",
+    "work party": "office_party",
+    "team dinner": "office_party",
+    "christmas party": "office_party",
+    "farewell": "office_party",
+    "appraisal": "office_formal",
+    "investor meeting": "client_meeting",
+    "townhall": "office_casual",
+    "town hall": "office_casual",
+    "graduation": "graduation",
+    "convocation": "graduation",
+    "brunch": "brunch",
+    "lunch out": "brunch",
+    # --- ethnic ceremonies --------------------------------------------------
+    #
+    # `mehendi`, `sangeet` and the two wedding days existed; the ceremonies
+    # around them did not, so someone dressing for a haldi got a generic
+    # festival answer.
+    "haldi": "haldi",
+    "pithi": "haldi",
+    "engagement": "engagement",
+    "roka": "engagement",
+    "sagai": "engagement",
+    "ring ceremony": "engagement",
+    "griha pravesh": "griha_pravesh",
+    "housewarming": "griha_pravesh",
+    "house warming": "griha_pravesh",
+    "griha pravesham": "griha_pravesh",
+    "baby shower": "baby_shower",
+    "godh bharai": "baby_shower",
+    "seemantham": "baby_shower",
+    "naming ceremony": "baby_shower",
+    "namkaran": "baby_shower",
     # --- Indian festivals -> festival_day -----------------------------------
     "diwali": "festival_day",
     "divali": "festival_day",
@@ -80,7 +168,6 @@ LEXICON: dict[str, str] = {
     # --- weddings. Separate occasions because the clothes genuinely differ ---
     "mehendi": "mehendi",
     "mehndi": "mehendi",
-    "haldi": "mehendi",
     "sangeet": "sangeet",
     "wedding reception": "wedding_reception",
     "reception": "wedding_reception",
@@ -88,7 +175,6 @@ LEXICON: dict[str, str] = {
     "wedding": "wedding_ceremony",
     "shaadi": "wedding_ceremony",
     "nikah": "wedding_ceremony",
-    "engagement": "wedding_reception",
     # --- work ---------------------------------------------------------------
     "client meeting": "client_meeting",
     "client visit": "client_meeting",
@@ -103,7 +189,6 @@ LEXICON: dict[str, str] = {
     "work from home": "wfh",
     "wfh": "wfh",
     "working from home": "wfh",
-    "conference": "office_formal",
     # --- social -------------------------------------------------------------
     "dinner date": "dinner_date",
     "date night": "dinner_date",
@@ -113,7 +198,6 @@ LEXICON: dict[str, str] = {
     "night out": "party_night",
     "clubbing": "party_night",
     "birthday": "party_night",
-    "brunch": "casual_outing",
     "coffee": "casual_outing",
     "shopping": "casual_outing",
     "casual": "casual_outing",

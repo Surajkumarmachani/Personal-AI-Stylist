@@ -28,7 +28,9 @@ codebase has already made once with the rationale cache.
 
 from __future__ import annotations
 
+import hmac
 import json
+import logging
 import uuid
 from typing import Annotated, Any
 
@@ -44,8 +46,11 @@ from stylist_api.deps import (
     SettingsDep,
     TenantDB,
 )
+from stylist_api.routers.dresses_as import read_dresses_as
+from stylist_db.session import system_session, tenant_session
 from stylist_domain.context import resolve_context
 from stylist_domain.taxonomy import load_taxonomy
+from stylist_shop.conversions import normalise_status, tracked_url
 from stylist_shop.gaps import find_gaps
 from stylist_shop.own import (
     ALLOWED_IMAGE_TYPES,
@@ -55,6 +60,8 @@ from stylist_shop.own import (
     garment_from_product,
 )
 from stylist_suggest import load_wardrobe
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["shop"])
 
@@ -95,6 +102,13 @@ async def shop_gaps(
     pool = await load_wardrobe(db, ctx)
     gaps = find_gaps(pool, ctx)
 
+    auto_add = bool(settings.shop_postback_secret)
+    # WHOSE CLOTHES. An empty wardrobe used to be offered a lehenga skirt and
+    # a sherwani side by side. Unasked (None) and 'all' show everything.
+    dresses_as = await read_dresses_as(db)
+    genders = (
+        [dresses_as, "unisex"] if dresses_as in {"women", "men"} else ["women", "men", "unisex"]
+    )
     results: list[dict[str, Any]] = []
     for gap in gaps:
         rows = await db.execute(
@@ -113,6 +127,9 @@ async def shop_gaps(
                   -- would make the feature look like an untargeted ad.
                   AND (dress_code IS NULL OR dress_code::text = ANY(:codes))
                   AND (warmth IS NULL OR abs(warmth - :warmth) <= 1)
+                  -- NULL is unisex: an unplaced product is shown to everyone
+                  -- rather than hidden from everyone. See migration 0026.
+                  AND (gender IS NULL OR gender = ANY(:genders))
                 ORDER BY
                   -- Cheapest first among equally suitable items. Not a
                   -- margin-maximising order: the user is being asked to spend
@@ -132,6 +149,7 @@ async def shop_gaps(
                 or [gap.dress_code],
                 "warmth": gap.warmth_target or 3,
                 "lim": MAX_SUGGESTIONS,
+                "genders": genders,
             },
         )
         products = [dict(r) for r in rows.mappings()]
@@ -141,18 +159,27 @@ async def shop_gaps(
         # Impressions, in the same request that produced them. Recorded even
         # when the list is empty is NOT useful, so only real shows are logged.
         for p in products:
+            event_id = uuid.uuid4()
             await db.execute(
                 text(
                     "INSERT INTO product_event (id, user_id, product_id, kind, occasion) "
                     "VALUES (:id, CAST(:uid AS uuid), CAST(:pid AS uuid), 'shown', :occ)"
                 ),
                 {
-                    "id": uuid.uuid4(),
+                    "id": event_id,
                     "uid": str(user.id),
                     "pid": p["id"],
                     "occ": occasion,
                 },
             )
+            # THE IMPRESSION IS THE AFFILIATE REFERENCE. Its id goes on the
+            # link, the network echoes it back in the postback, and
+            # `shop_ref_owner` turns it into this user and this product. Put
+            # on the link HERE rather than by `/shop/click`, because the click
+            # is recorded alongside the navigation, not before it — see
+            # `record_click` for why our server stays out of that path.
+            if auto_add:
+                p["url"] = tracked_url(p["url"], str(event_id), settings.shop_subid_param)
 
         # A GAP WITH NOTHING TO OFFER IS NOT ACTIONABLE.
         #
@@ -182,6 +209,10 @@ async def shop_gaps(
         # True when gaps EXIST but nothing in the catalogue fills them —
         # distinct from "your wardrobe is fine", which is `gaps == []`.
         "catalogue_empty": bool(gaps) and not results,
+        # True when a purchase through these links is reported back by the
+        # merchant and added to the wardrobe without the user saying so. The
+        # client still offers "I bought this": reports lag the order by hours.
+        "auto_add": auto_add,
     }
 
 
@@ -260,13 +291,27 @@ async def own_product(
 ) -> dict[str, Any]:
     """"I bought this" — add the product to the wardrobe.
 
-    WHY THIS IS NOT TRIGGERED BY THE PURCHASE
-    -----------------------------------------
-    We cannot see the purchase. The checkout happens on the merchant's site,
-    and affiliate conversion data (where a programme exists at all) arrives in
-    delayed batches keyed to a click id, not as a per-user event. So the user
-    states it. When a conversion feed does exist, it calls the same code with
-    confirmed_by="conversion_feed" and the row records which it was.
+    STILL NEEDED NOW THAT PURCHASES ARE REPORTED
+    --------------------------------------------
+    `/shop/conversions` adds the garment when the merchant reports the order,
+    but only for a deployment with an affiliate postback configured, and only
+    once the network sends it — hours after checkout on most of them. This is
+    the path for everything else: an unconfigured deployment, a network with
+    no postback, a purchase made in a shop. Both call `_add_to_wardrobe`, and
+    the row records which one it was.
+    """
+    return await _add_to_wardrobe(db, store, user.id, product_id, confirmed_by="user")
+
+
+async def _add_to_wardrobe(
+    db: Any,
+    store: Any,
+    user_id: uuid.UUID,
+    product_id: uuid.UUID,
+    *,
+    confirmed_by: str,
+) -> dict[str, Any]:
+    """Create the garment for a bought product. Idempotent per (user, product).
 
     NO PIPELINE RUN
     ---------------
@@ -287,14 +332,14 @@ async def own_product(
     if product is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown product")
 
-    fields = garment_from_product(dict(product), confirmed_by="user")
+    fields = garment_from_product(dict(product), confirmed_by=confirmed_by)
     garment_id = uuid.uuid4()
 
     # `originals/` and `cutouts/`, deliberately reusing the existing prefixes
     # rather than inventing a `catalogue/` one: the erasure saga deletes a
     # user's objects by prefix list, and a new prefix that is not added there
     # is an object that survives account deletion.
-    original_key = f"originals/{user.id}/{garment_id}"
+    original_key = f"originals/{user_id}/{garment_id}"
     cutout_key: str | None = None
 
     image_url = product["image_url"]
@@ -314,7 +359,7 @@ async def own_product(
         # A packshot is already isolated on a plain background, so it doubles
         # as the cutout. Running the matting model over it would spend GPU
         # time to approximate what the merchant's photographer already did.
-        cutout_key = f"cutouts/{user.id}/{garment_id}.png"
+        cutout_key = f"cutouts/{user_id}/{garment_id}.png"
         store.put_bytes(cutout_key, body, content_type=content_type)
     else:
         # NO IMAGE, AND WE DO NOT INVENT ONE.
@@ -338,7 +383,9 @@ async def own_product(
     # the surrounding transaction, so the recovery SELECT could not run inside
     # it -- measured, as `InFailedSQLTransactionError`, on the second tap.
     # Letting Postgres resolve the conflict keeps one round trip and one
-    # transaction, and is race-free against a concurrent duplicate.
+    # transaction, and is race-free against a concurrent duplicate — which is
+    # exactly what a network retrying a postback while the user taps "I
+    # bought this" produces.
     inserted = await db.execute(
         text(
             """
@@ -365,23 +412,23 @@ async def own_product(
                 """
         ),
         {
-                "id": garment_id,
-                "uid": str(user.id),
-                "okey": original_key,
-                "ckey": cutout_key,
-                "slot": fields["slot"],
-                "subcategory": fields["subcategory"],
-                "primary_colour": fields["primary_colour"],
-                "dress_code": fields["dress_code"],
-                "formality": fields["formality"],
-                "warmth": fields["warmth"],
-                "brand": fields["brand"],
-                "price": fields["purchase_price_minor"],
-                "currency": fields["purchase_currency"],
-                "attrs": json.dumps(fields["attributes_raw"]),
-                "conf": json.dumps(fields["field_confidence"]),
-                "extractor": fields["extractor_version"],
-                "review": fields["needs_review"],
+            "id": garment_id,
+            "uid": str(user_id),
+            "okey": original_key,
+            "ckey": cutout_key,
+            "slot": fields["slot"],
+            "subcategory": fields["subcategory"],
+            "primary_colour": fields["primary_colour"],
+            "dress_code": fields["dress_code"],
+            "formality": fields["formality"],
+            "warmth": fields["warmth"],
+            "brand": fields["brand"],
+            "price": fields["purchase_price_minor"],
+            "currency": fields["purchase_currency"],
+            "attrs": json.dumps(fields["attributes_raw"]),
+            "conf": json.dumps(fields["field_confidence"]),
+            "extractor": fields["extractor_version"],
+            "review": fields["needs_review"],
             "pid": str(product_id),
         },
     )
@@ -396,7 +443,7 @@ async def own_product(
                 "SELECT id FROM garments WHERE user_id = CAST(:uid AS uuid) "
                 "AND sourced_product_id = :pid"
             ),
-            {"uid": str(user.id), "pid": str(product_id)},
+            {"uid": str(user_id), "pid": str(product_id)},
         )
         return {
             "garment_id": str(existing.scalar_one()),
@@ -410,7 +457,7 @@ async def own_product(
             "INSERT INTO product_event (id, user_id, product_id, kind) "
             "VALUES (:id, CAST(:uid AS uuid), CAST(:pid AS uuid), 'bought')"
         ),
-        {"id": uuid.uuid4(), "uid": str(user.id), "pid": str(product_id)},
+        {"id": uuid.uuid4(), "uid": str(user_id), "pid": str(product_id)},
     )
 
     return {
@@ -426,3 +473,136 @@ async def own_product(
             "take one and it will show in your wardrobe."
         ),
     }
+
+
+@router.api_route("/shop/conversions", methods=["GET", "POST"])
+async def conversion_postback(
+    settings: SettingsDep,
+    store: ObjectStoreDep,
+    secret: Annotated[str, Query()] = "",
+    ref: Annotated[str, Query()] = "",
+    conversion_id: Annotated[str, Query(max_length=128)] = "",
+    order_status: Annotated[str, Query(alias="status")] = "",
+    network: Annotated[str, Query(max_length=40)] = "affiliate",
+) -> dict[str, Any]:
+    """A merchant reports an order made through one of our links.
+
+    Registered with the affiliate network as a postback template, e.g.
+    `/shop/conversions?secret=…&ref={subid}&conversion_id={order_id}&status={status}`.
+    GET and POST both accepted with the fields in the query string, because
+    networks differ on the verb and all of them can template a URL.
+
+    NO USER TOKEN, SO THE SECRET IS THE ONLY AUTHORITY. Compared in constant
+    time, and an unset secret refuses everything — see `shop_postback_secret`.
+
+    2xx FOR A REPORT WE WILL NEVER ACT ON. A network retries anything else for
+    days. A reference that matches no impression (expired, or someone else's
+    catalogue) will not start matching on the fifth attempt, so it is
+    acknowledged and logged rather than retried into the logs forever.
+    """
+    configured = settings.shop_postback_secret
+    if not configured or not hmac.compare_digest(secret.encode(), configured.encode()):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="bad secret")
+
+    state = normalise_status(order_status)
+    if state is None:
+        # Refused, not guessed. Reading an unknown spelling as "approved" puts
+        # a garment in a wardrobe; a 400 makes the network show the error to
+        # whoever configured the postback, which is who can fix it.
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail=f"unknown status {order_status!r}"
+        )
+    if not conversion_id:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="conversion_id missing")
+    try:
+        ref_id = uuid.UUID(ref)
+    except ValueError:
+        return {"accepted": False, "reason": "unknown ref"}
+
+    # The one privileged read: reference -> (user, product). See 0025.
+    async with system_session() as sys_db:
+        owner = (
+            await sys_db.execute(
+                text("SELECT user_id, product_id FROM shop_ref_owner(:ref)"), {"ref": ref_id}
+            )
+        ).one_or_none()
+    if owner is None:
+        logger.info("shop postback for unknown ref %s from %s", ref_id, network)
+        return {"accepted": False, "reason": "unknown ref"}
+    user_id, product_id = owner
+
+    async with tenant_session(user_id) as db:
+        row = (
+            await db.execute(
+                text(
+                    """
+                    INSERT INTO shop_conversion
+                        (id, user_id, product_id, ref, network, conversion_id, status, raw)
+                    VALUES (:id, :uid, :pid, :ref, :net, :cid, :status, CAST(:raw AS jsonb))
+                    ON CONFLICT (network, conversion_id) DO UPDATE
+                        SET status = EXCLUDED.status, raw = EXCLUDED.raw, updated_at = now()
+                    RETURNING id, garment_id
+                    """
+                ),
+                {
+                    "id": uuid.uuid4(),
+                    "uid": user_id,
+                    "pid": product_id,
+                    "ref": ref_id,
+                    "net": network,
+                    "cid": conversion_id,
+                    "status": state,
+                    # The secret is deliberately NOT stored with the rest.
+                    "raw": json.dumps({"status": order_status}),
+                },
+            )
+        ).one()
+        conversion_row_id, garment_id = row
+
+        if state == "rejected":
+            # A cancellation or a return: they no longer own it. Retired only
+            # if the MERCHANT put it there and the user has since done nothing
+            # to claim it — a garment they tapped "I bought this" on, corrected
+            # the tags of, or wore, is theirs to remove, not ours.
+            if garment_id is not None:
+                await db.execute(
+                    text(
+                        """
+                        UPDATE garments SET is_active = false, updated_at = now()
+                        WHERE id = :gid
+                          AND attributes_raw->>'confirmed_by' = 'conversion_feed'
+                          AND user_verified_fields = '{}'
+                          AND NOT EXISTS (SELECT 1 FROM wear_log w WHERE w.garment_id = :gid)
+                        """
+                    ),
+                    {"gid": garment_id},
+                )
+            return {"accepted": True, "status": state, "garment_id": None}
+
+        if product_id is None:
+            # The product left the catalogue between the click and the report.
+            # The order is recorded; there is nothing left to copy tags from.
+            return {"accepted": True, "status": state, "garment_id": None}
+
+        if garment_id is None:
+            added = await _add_to_wardrobe(
+                db, store, user_id, product_id, confirmed_by="conversion_feed"
+            )
+            garment_id = uuid.UUID(added["garment_id"])
+            await db.execute(
+                text("UPDATE shop_conversion SET garment_id = :gid WHERE id = :id"),
+                {"gid": garment_id, "id": conversion_row_id},
+            )
+
+        # A return reversed, or a reorder after a return: the uniqueness index
+        # hands back the retired garment, so it is brought back rather than
+        # left hidden. Merchant-added rows only, for the reason above.
+        await db.execute(
+            text(
+                "UPDATE garments SET is_active = true, updated_at = now() "
+                "WHERE id = :gid AND NOT is_active "
+                "AND attributes_raw->>'confirmed_by' = 'conversion_feed'"
+            ),
+            {"gid": garment_id},
+        )
+    return {"accepted": True, "status": state, "garment_id": str(garment_id)}

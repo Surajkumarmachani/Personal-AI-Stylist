@@ -125,6 +125,16 @@ class Settings(BaseSettings):
     # down. Unset disables push; nothing else changes.
     firebase_credentials_file: str = Field(default="")
 
+    # ---- shop conversions (Phase 13) ----
+    # The shared secret the affiliate network puts in its postback URL. EMPTY
+    # disables the whole loop: links go out untagged and `/shop/conversions`
+    # refuses every call, so an unconfigured deployment cannot be made to add
+    # garments by anyone who guesses the path.
+    shop_postback_secret: str = Field(default="")
+    # The query parameter the network reads the sub-id from: `subid` for
+    # Cuelinks and Admitad, `aff_sub` for vCommission, `sub1` for others.
+    shop_subid_param: str = Field(default="subid")
+
     # ---- try-on (Phase 10) ----
     # EMPTY, and that is the current correct value. Phase 10 opens with
     # ---- Virtual try-on ----

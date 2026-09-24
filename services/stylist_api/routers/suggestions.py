@@ -63,10 +63,13 @@ from stylist_suggest import (
     rerank,
     suggest,
 )
-from stylist_suggest.pipeline import CandidatePool, load_style_vector
+from stylist_suggest.pipeline import RECENTLY_WORN_DAYS, CandidatePool, load_style_vector
 from stylist_worker.trends import load_trends
 
 logger = logging.getLogger(__name__)
+
+# How many stored rows to read per outfit shown. See the materialised query.
+STORED_OVERFETCH = 3
 
 router = APIRouter(tags=["suggestions"])
 
@@ -461,7 +464,12 @@ async def get_suggestions(
                 LIMIT :lim
                 """
             ),
-            {"occasion": occasion, "warmth": ctx.warmth_target, "lim": limit},
+            # OVER-FETCHED, then trimmed after `_hydrate`. Hydration drops
+            # every stored outfit that holds a garment in the wash or just
+            # worn, and a favourite shirt is in most of the top rows — so
+            # reading exactly `limit` turned "the shirt is in the wash" into
+            # one suggestion instead of five.
+            {"occasion": occasion, "warmth": ctx.warmth_target, "lim": limit * STORED_OVERFETCH},
         )
         rows = [dict(r) for r in result.mappings()]
 
@@ -506,7 +514,19 @@ async def get_suggestions(
 
     # Hydrate the garments in ONE query rather than per outfit. Ten outfits of
     # four garments is 40 ids and would otherwise be 40 round trips.
-    outfits, rows_by_id = await _hydrate(db, store, rows)
+    outfits, rows_by_id = await _hydrate(db, store, rows, ctx.dress_code_target)
+    # Something stored could not be served today (in the wash, just worn, a
+    # `never` rule, a stale dress code) AND what is left is short of what was
+    # asked for. Measured on the live stack: with the tee in the wash and the
+    # jeans worn, four stored outfits became ONE, while the wardrobe could
+    # still make two. Most occasions have only the `limit` rows the last live
+    # run persisted — the nightly job covers four occasions — so over-fetching
+    # alone cannot refill them. The regenerated outfits are persisted, so a
+    # wardrobe with enough wearable combinations is materialised again on the
+    # next request; one that genuinely has fewer than `limit` pays the live
+    # run each time, which for a wardrobe that small is cheap.
+    short_after_filtering = len(outfits) < min(limit, len(rows))
+    outfits = outfits[:limit]
 
     # PREFERENCE FILTERING CAN EMPTY THE MATERIALISED SET, and then the user
     # gets a blank screen for having set a rule. Measured: a `never white`
@@ -517,7 +537,7 @@ async def get_suggestions(
     # interview on a cold day must not get an empty screen" — it was simply
     # checked before filtering rather than after. Regenerating honours the
     # rules at generation time, so the result is non-empty AND obeys them.
-    if not outfits and served_from == "materialised":
+    if served_from == "materialised" and (not outfits or short_after_filtering):
         served_from = "live"
         pool = await load_wardrobe(db, ctx)
         style_vector, style_events = await load_style_vector(db)
@@ -539,7 +559,7 @@ async def get_suggestions(
             for items, score in live.outfits
         ]
         await _persist_live_outfits(user.id, ctx, rows)
-        outfits, rows_by_id = await _hydrate(db, store, rows)
+        outfits, rows_by_id = await _hydrate(db, store, rows, ctx.dress_code_target)
         if not outfits:
             return {
                 "outfits": [],
@@ -706,7 +726,7 @@ async def _load_bandit_arms(db: Any) -> dict[str, Arm]:
 
 
 async def _hydrate(
-    db: Any, store: Any, rows: list[dict[str, Any]]
+    db: Any, store: Any, rows: list[dict[str, Any]], dress_code_target: str | None = None
 ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
     """Rows -> renderable outfits, in one query.
 
@@ -718,6 +738,17 @@ async def _hydrate(
     """
     if not rows:
         return [], {}
+
+    # The dress codes this occasion accepts, asymmetric exactly as the pool
+    # query uses them: `casual` admits smart_casual and activewear, while
+    # `activewear` admits only itself.
+    compatible: set[str] | None = None
+    if dress_code_target:
+        taxonomy = load_taxonomy()
+        compatible = set(
+            taxonomy.dress_code_compatibility.get(dress_code_target, (dress_code_target,))
+        )
+        compatible.add(dress_code_target)
 
     all_ids = sorted({gid for r in rows for gid in r["garment_ids"]})
     detail = await db.execute(
@@ -732,6 +763,22 @@ async def _hydrate(
                    formality, warmth, cutout_key, needs_review, needs_wash
             FROM garments g
             WHERE g.id = ANY(CAST(:ids AS uuid[])) AND g.is_active
+              -- NOT IN TODAY'S WARDROBE: in the wash, or worn within the
+              -- rest window. The SAME two rules as `POOL_SQL`, and they have
+              -- to be here as well, because a stored outfit is a claim about
+              -- the garments as they were when it was built.
+              --
+              -- MEASURED (tests/test_wash_and_wear.py): a shirt put in the
+              -- basket, jeans worn this morning, and shoes worn yesterday
+              -- were all still served from `materialised` — both rules held
+              -- only on the live path, and nothing re-checked a stored row
+              -- until the nightly precompute rebuilt it.
+              AND NOT g.needs_wash
+              AND NOT EXISTS (
+                SELECT 1 FROM wear_log w
+                WHERE w.garment_id = g.id
+                  AND w.worn_on >= CURRENT_DATE - make_interval(days => :recent_days)
+              )
               AND NOT EXISTS (
                 SELECT 1 FROM preference_fact pf
                 WHERE pf.kind = 'never'
@@ -746,7 +793,7 @@ async def _hydrate(
               )
             """
         ),
-        {"ids": [str(i) for i in all_ids]},
+        {"ids": [str(i) for i in all_ids], "recent_days": RECENTLY_WORN_DAYS},
     )
     rows_by_id = {str(r["id"]): dict(r) for r in detail.mappings()}
     garments = {
@@ -769,9 +816,10 @@ async def _hydrate(
             breakdown = json.loads(breakdown)
         items = [garments[str(g)] for g in r["garment_ids"] if str(g) in garments]
         if len(items) != len(r["garment_ids"]):
-            # A garment that is gone, or one a `never` rule just removed.
-            # Either way the outfit cannot be rendered honestly, so it is
-            # skipped rather than shown with a gap.
+            # A garment that is gone, one a `never` rule just removed, or one
+            # that is in the wash or was just worn. Every case means the
+            # outfit cannot be worn today, so it is skipped rather than shown
+            # with a gap.
             continue
 
         # RE-CHECK THE STRUCTURE RULES AGAINST TODAY'S TAGS.
@@ -804,6 +852,39 @@ async def _hydrate(
                 ", ".join(verdict.violations),
             )
             continue
+
+        # RE-CHECK THE DRESS CODE TOO, for the same reason and in the same
+        # place. The structure check above asks "is this still an outfit?";
+        # it never asked "is it still an outfit FOR THIS OCCASION?".
+        #
+        # MEASURED: "something for the gym" returned denim shirts, jeans and
+        # sneakers as the top four looks. The rows were materialised on
+        # 2026-09-21 under `occasion = 'workout'` from garments that are
+        # tagged `casual` today, and `activewear` accepts only `activewear`.
+        # Re-running `load_wardrobe` for that user and occasion now yields an
+        # EMPTY pool — the live path was right and the stored rows outlived
+        # the tags they were built from.
+        #
+        # A garment with NO dress code still passes, matching `POOL_SQL`
+        # exactly: the two paths have to agree about an untagged garment, or
+        # this becomes another rule enforced on one path and not the other.
+        if compatible is not None:
+            wrong = sorted(
+                {
+                    code
+                    for gid in (str(g) for g in r["garment_ids"])
+                    if (code := rows_by_id.get(gid, {}).get("dress_code"))
+                    and code not in compatible
+                }
+            )
+            if wrong:
+                logger.warning(
+                    "dropping stored outfit %s: dress code %s does not suit %s",
+                    r.get("garment_set_hash"),
+                    ", ".join(wrong),
+                    dress_code_target,
+                )
+                continue
         # THE OUTFIT'S DRESS CODE = the most common among its garments, which
         # is the bandit's arm. Ties break on the value itself, not on row
         # order, so an arm cannot change because the query plan did. Stripped

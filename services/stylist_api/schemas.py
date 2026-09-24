@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import date, datetime
+from typing import Literal
 
 from pydantic import BaseModel, EmailStr, Field
 
@@ -14,6 +15,9 @@ from stylist_clients.storage import ALLOWED_CONTENT_TYPES, MAX_UPLOAD_BYTES
 class RegisterRequest(BaseModel):
     email: EmailStr
     password: str = Field(min_length=12, max_length=72)  # 72 = bcrypt's real limit
+    # Whose clothes to suggest buying. Optional on the API so older clients
+    # still register; the web sign-up form requires it. See migration 0026.
+    dresses_as: Literal["women", "men", "all"] | None = None
 
 
 class LoginRequest(BaseModel):

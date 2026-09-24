@@ -19,6 +19,7 @@ import { useEffect, useState } from "react";
 import Shell from "../Shell";
 import AvatarUpload from "../AvatarUpload";
 import HomeCity from "../HomeCity";
+import DressesAs from "../DressesAs";
 import CalendarConnect from "../CalendarConnect";
 import PushNotifications from "../PushNotifications";
 import PrivacyControls from "../PrivacyControls";
@@ -127,6 +128,10 @@ export default function ProfilePage() {
 
       <div style={{ marginBottom: 18 }}>
         <HomeCity />
+      </div>
+
+      <div style={{ marginBottom: 18 }}>
+        <DressesAs variant="setting" />
       </div>
 
       <CalendarConnect />

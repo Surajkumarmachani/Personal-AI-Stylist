@@ -85,6 +85,7 @@ async def register(
                 user_id=user_id,
                 litellm_key=litellm_key,
                 litellm_budget_usd=settings.free_tier_monthly_budget_usd,
+                dresses_as=body.dresses_as,
             )
         )
 

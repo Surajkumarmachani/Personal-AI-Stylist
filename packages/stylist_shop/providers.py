@@ -53,6 +53,14 @@ class Product:
     currency: str | None = None
     image_url: str | None = None
     in_stock: bool = True
+    # The merchant's department. None = unisex; see migration 0026.
+    gender: str | None = None
+
+
+# The departments a product can be filed under. Not in the taxonomy because it
+# describes who a SHOP sells to, not a garment's attributes — the user's own
+# clothes carry no such field and must not start to.
+GENDERS = frozenset({"women", "men", "unisex"})
 
 
 class CatalogueProvider(Protocol):
@@ -88,6 +96,8 @@ def validate(product: Product) -> Product:
             raise InvalidProduct(f"{field} {value!r} is not in the taxonomy")
     if not product.url:
         raise InvalidProduct("a product with no link cannot be acted on")
+    if product.gender is not None and product.gender not in GENDERS:
+        raise InvalidProduct(f"gender {product.gender!r} must be one of {sorted(GENDERS)}")
     return product
 
 
@@ -143,4 +153,5 @@ def _from_row(raw: dict[str, Any], merchant: str) -> Product:
         currency=get("currency"),
         image_url=get("image_url"),
         in_stock=str(raw.get("in_stock") or "true").strip().lower() not in {"false", "0", "no"},
+        gender=(get("gender") or "").lower() or None,
     )

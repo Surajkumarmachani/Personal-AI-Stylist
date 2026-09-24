@@ -12,6 +12,11 @@
  * occasion") before it names a product. The user arrived here by trying to
  * get dressed, not by being sold to.
  *
+ * BUYING THROUGH A LINK ADDS THE GARMENT BY ITSELF when the server says so
+ * (`auto_add`): the link carries a reference the merchant reports back with
+ * the order. "I bought this" stays, because that report lands hours later and
+ * a deployment with no affiliate postback never sends one.
+ *
  * DISCLOSURE COMES FROM THE SERVER AND IS RENDERED VERBATIM.
  * Paid-link disclosure is a legal obligation (ASA, FTC), not a footer style
  * choice, so the text is a field on the response rather than a string in this
@@ -117,24 +122,36 @@ export default function FillTheGap({ occasion }: { occasion: string }) {
                         ✓ {p.title} — {owned[p.id]}
                       </p>
                     ) : (
-                      <button
-                        className="ui-btn"
-                        disabled={adding === p.id}
-                        onClick={() => {
-                          setAdding(p.id);
-                          ownProduct(p.id)
-                            .then((r) => setOwned((o) => ({ ...o, [p.id]: r.note })))
-                            .catch((e) =>
-                              setOwned((o) => ({
-                                ...o,
-                                [p.id]: e instanceof Error ? e.message : String(e),
-                              })),
-                            )
-                            .finally(() => setAdding(null));
-                        }}
-                      >
-                        {adding === p.id ? "Adding…" : `I bought this — add “${p.title}”`}
-                      </button>
+                      <>
+                        {data.auto_add ? (
+                          <p className="ui-sub" style={{ fontSize: 12, marginBottom: 4 }}>
+                            Bought {p.title} through this link? It will appear in your
+                            wardrobe on its own once the shop confirms the order.
+                          </p>
+                        ) : null}
+                        <button
+                          className="ui-btn"
+                          disabled={adding === p.id}
+                          onClick={() => {
+                            setAdding(p.id);
+                            ownProduct(p.id)
+                              .then((r) => setOwned((o) => ({ ...o, [p.id]: r.note })))
+                              .catch((e) =>
+                                setOwned((o) => ({
+                                  ...o,
+                                  [p.id]: e instanceof Error ? e.message : String(e),
+                                })),
+                              )
+                              .finally(() => setAdding(null));
+                          }}
+                        >
+                          {adding === p.id
+                            ? "Adding…"
+                            : data.auto_add
+                              ? "Don't want to wait? Add it now"
+                              : `I bought this — add “${p.title}”`}
+                        </button>
+                      </>
                     )}
                   </div>
                 ))}

@@ -11,15 +11,31 @@ table — so it is here.
 
 | occasion | photographer | photo |
 |---|---|---|
+| baby_shower | [Gian Gomez](https://unsplash.com/@antistalgia) | [link](https://unsplash.com/photos/a-birthday-cake-with-a-blue-and-white-sign-D8c1TZGFDu0) |
+| black_tie_event | [HACA Wedding](https://unsplash.com/@hacawedding) | [link](https://unsplash.com/photos/elegant-woman-in-blue-dress-with-man-in-suit-B9FCVrdrX0k) |
+| brunch | [Jojo Yuen (sharemyfoodd)](https://unsplash.com/@jojoyuen) | [link](https://unsplash.com/photos/a-wooden-table-topped-with-plates-of-food-SWx1-hkzdS0) |
 | casual_outing | [Ash Dowie](https://unsplash.com/@ashdowie) | [link](https://unsplash.com/photos/man-wearing-brown-jacket-and-black-pants-standing-near-basketball-ring-kUQhNbKEjVk) |
+| client_meeting | [Ruthson Zimmerman](https://unsplash.com/@ruthson_zimmerman) | [link](https://unsplash.com/photos/man-in-blue-suit-jacket-wearing-gold-round-analog-watch-4oDG18btbWI) |
+| conference | [Amari Shutters](https://unsplash.com/@asnanya) | [link](https://unsplash.com/photos/diverse-group-of-people-in-a-business-meeting-I-YvZzFmxVk) |
 | dinner_date | [Vladimir Yelizarov](https://unsplash.com/@yelizarov) | [link](https://unsplash.com/photos/a-woman-in-a-black-outfit-and-hat-UmNPQoBOu7g) |
+| engagement | [shades by 43](https://unsplash.com/@shades_by_43) | [link](https://unsplash.com/photos/a-man-and-woman-standing-under-a-canopy-of-flowers-ykcXm_u84sg) |
 | festival_day | [Sabesh Photography LTD](https://unsplash.com/@sabesh) | [link](https://unsplash.com/photos/woman-in-sari-with-gold-jewelry-Xqa_NWl4xEY) |
+| funeral | [Ulla Shinami](https://unsplash.com/@ullashinami) | [link](https://unsplash.com/photos/woman-in-black-tank-top-standing-on-the-beach-GJhS_gU-8i8) |
+| graduation | [Albert Vincent Wu](https://unsplash.com/@albertvincentwu) | [link](https://unsplash.com/photos/a-woman-in-a-graduation-cap-and-gown-m7yOJx0ALME) |
+| griha_pravesh | [Prashant Gupta](https://unsplash.com/@mysticpg) | [link](https://unsplash.com/photos/happy-birthday-candles-on-cake-lV_1--cFJWo) |
+| haldi | [Amit Rana](https://unsplash.com/@arana13) | [link](https://unsplash.com/photos/a-wooden-table-topped-with-bowls-of-food-eSflvcBdC8c) |
 | interview | [Mohamad Khosravi](https://unsplash.com/@mohamadkhosravi) | [link](https://unsplash.com/photos/man-in-black-suit-jacket-and-black-pants-standing-on-gray-concrete-floor-during-daytime-vS0Kya7E5V4) |
 | mehendi | [kabita Darlami](https://unsplash.com/@itskabita) | [link](https://unsplash.com/photos/a-couple-of-women-standing-next-to-each-other-dI-mCK0dhb0) |
+| networking_event | [Spencer Chow](https://unsplash.com/@sunny0725) | [link](https://unsplash.com/photos/people-browse-art-in-a-busy-modern-gallery-RPAkpV5w-6I) |
 | office_casual | [Laura Chouette](https://unsplash.com/@laurachouette) | [link](https://unsplash.com/photos/woman-wearing-white-coat-carrying-crossbody-bag-d7wSG9uPev4) |
+| office_formal | [Vishal Kampani](https://unsplash.com/@vishalkampani) | [link](https://unsplash.com/photos/a-man-in-a-suit-standing-in-an-office-hallway-6ZG0MTcmFtQ) |
+| office_party | [Diana Akhmedova](https://unsplash.com/@dakhmedd) | [link](https://unsplash.com/photos/woman-in-vintage-suit-talks-on-phone-at-desk-yBabQgYNyf8) |
 | party_night | [Jeff Tumale](https://unsplash.com/@jeff_tumale) | [link](https://unsplash.com/photos/a-woman-in-a-snake-skin-dress-standing-next-to-another-woman-CgYp7lQrLRs) |
 | sangeet | [Mohit Maru](https://unsplash.com/@mohit_0307) | [link](https://unsplash.com/photos/wedding-couple-in-traditional-attire-NCrvRQdvTx8) |
+| team_offsite | [Naassom Azevedo](https://unsplash.com/@naassomz1) | [link](https://unsplash.com/photos/group-of-people-sitting-on-bench-near-trees-duting-daytime-Q_Sei-TqSlc) |
 | temple_visit | [Firangi Yarn Menswear Brand](https://unsplash.com/@firangiyarn) | [link](https://unsplash.com/photos/a-man-standing-next-to-a-tree-wearing-a-green-shirt-hEuVOYuq1l4) |
 | travel_day | [Maria Armario Lorenzo](https://unsplash.com/@mariaarlorenzo) | [link](https://unsplash.com/photos/woman-in-patterned-outfit-posing-in-a-leafy-courtyard-Oh2YiDoiczo) |
 | wedding_ceremony | [Harsh Gupta](https://unsplash.com/@imharsh081) | [link](https://unsplash.com/photos/a-woman-in-a-red-and-gold-bridal-outfit-2DZmm6QKFQE) |
+| wedding_reception | [iKshana Productions](https://unsplash.com/@ikshanaproductions) | [link](https://unsplash.com/photos/a-bride-and-groom-walking-down-a-path-2oQy4GAGxbk) |
+| wfh | [Jan Baborák](https://unsplash.com/@janbaborak) | [link](https://unsplash.com/photos/woman-in-blue-sweater-sitting-in-front-of-laptop-computer-O4nTgxWr5Sc) |
 | workout | [Bryant Churckyno](https://unsplash.com/@churckyno7) | [link](https://unsplash.com/photos/running-girl-during-daytime-_1eBN9MzA_c) |

@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from "react";
 import Shell from "../Shell";
 import SignIn from "../SignIn";
 import OutfitCard from "../OutfitCard";
+import FillTheGap from "../FillTheGap";
 import { askStylist, type ChatOutfit, type ChatReply } from "@/lib/api";
 import { restoreSession } from "../session";
 import "../ui.css";
@@ -60,6 +61,9 @@ export default function StylistPage() {
     },
   ]);
   const [outfits, setOutfits] = useState<ChatOutfit[]>([]);
+  // The resolved occasion of the last answer. See `FillTheGap` for why the
+  // shop panel is keyed on this and not on the message text.
+  const [gapOccasion, setGapOccasion] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
@@ -103,6 +107,7 @@ export default function StylistPage() {
     try {
       const res: ChatReply = await askStylist(message, 6);
       setOutfits(res.outfits);
+      setGapOccasion(res.needs_clarification ? null : (res.understood?.occasion ?? null));
       const bits = [res.ranking_source, res.served_from].filter(Boolean) as string[];
       setBubbles((b) => [
         ...b,
@@ -119,6 +124,7 @@ export default function StylistPage() {
     } catch (e) {
       setBubbles((b) => [...b, { who: "err", text: String(e) }]);
       setOutfits([]);
+      setGapOccasion(null);
     } finally {
       setBusy(false);
     }
@@ -203,6 +209,10 @@ export default function StylistPage() {
           </div>
         </section>
       ) : null}
+
+      {/* Below the looks, and renders nothing unless the wardrobe came up
+          short for this occasion — the chat is not a shop front either. */}
+      {gapOccasion ? <FillTheGap key={gapOccasion} occasion={gapOccasion} /> : null}
     </Shell>
   );
 }

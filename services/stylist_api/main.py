@@ -24,6 +24,7 @@ from stylist_api.routers import (
     calendar,
     chat,
     corrections,
+    dresses_as,
     duplicates,
     evalview,
     feedback,
@@ -174,6 +175,7 @@ def create_app() -> FastAPI:
     app.include_router(wear.router)
     app.include_router(search.router)
     app.include_router(shop.router)
+    app.include_router(dresses_as.router)
     app.include_router(duplicates.router)
     app.include_router(ops.router)
     app.include_router(evalview.router)

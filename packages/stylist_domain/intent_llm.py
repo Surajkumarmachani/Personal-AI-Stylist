@@ -47,6 +47,8 @@ greeting for a wedding.
 
 from __future__ import annotations
 
+import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -139,9 +141,20 @@ SYSTEM_PROMPT = (
     "Meeting a partner's family is a dinner date or a casual outing, never a "
     "client meeting.\n"
     "\n"
-    f"If the message is not about getting dressed for something, answer "
-    f"'{UNKNOWN}'. Greetings, questions about the app, and small talk are "
-    f"'{UNKNOWN}'. Do not stretch to fit."
+    "A message may name a KIND OF CLOTHING rather than an event -- 'cultural "
+    "wear', 'something ethnic', 'traditional', 'formals', 'black tie'. That is "
+    "a real request, not an unknown one: answer with the occasion that kind of "
+    "clothing belongs to. Ethnic, cultural, traditional and Indian wear are a "
+    "festival day unless the message says otherwise; formals are office "
+    "formal; black tie is a black tie event. Prefer the specific occasion when "
+    "the message gives you one -- a lehenga or sherwani is a wedding.\n"
+    "\n"
+    "An unfamiliar event is still an event. A poetry reading, a book launch, a "
+    "graduation party, a court appearance: pick the occasion whose dress code "
+    "is closest rather than giving up. Only answer "
+    f"'{UNKNOWN}' when the message is not about getting dressed AT ALL -- "
+    "greetings, questions about the app, small talk. Do not stretch those to "
+    "fit."
 )
 
 
@@ -196,3 +209,71 @@ def validate(raw: Any) -> LLMIntent | None:
     )[:2]
 
     return LLMIntent(occasion=resolved, confidence=confidence, alternatives=alternatives)
+
+
+# ---------------------------------------------------------------- salvage ---
+#
+# MEASURED, not hypothetical. The free OpenRouter row answered "cultural
+# program" with:
+#
+#     {"{ "occasion": "festival_day" \n \n \n \n \n ... (to max_tokens)
+#
+# The CLASSIFICATION IS CORRECT. `festival_day` is the right answer, and the
+# user was shown "I'm not sure what the occasion is" because of a stray brace
+# and a newline flood — a right answer thrown away for being badly wrapped.
+#
+# Every free model declaring structured outputs is a reasoning model, so this
+# is the normal condition of the cheap tier rather than one bad slug. The
+# provider is asked for strict JSON and `validate` still gates the result
+# against the taxonomy; this only widens what counts as readable.
+
+_FENCE_RE = re.compile(r"^\s*```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
+_OCCASION_RE = re.compile(r'"occasion"\s*:\s*"([A-Za-z_]+)"')
+_CONFIDENCE_RE = re.compile(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)')
+_ALT_BLOCK_RE = re.compile(r'"alternatives"\s*:\s*\[(.*?)\]', re.DOTALL)
+_STRING_RE = re.compile(r'"([A-Za-z_]+)"')
+
+
+def parse_answer(content: str | None) -> LLMIntent | None:
+    """Read the model's reply, whether or not it is well-formed JSON.
+
+    Order matters: a clean parse is tried first and nothing about the happy
+    path changes. Salvage is reached only when `json.loads` has already
+    failed, so it cannot alter the meaning of a well-formed answer.
+
+    A SALVAGED ANSWER IS NOT TRUSTED MORE THAN A CLEAN ONE. It still goes
+    through `validate`, so an invented occasion is still refused. And when the
+    broken output cut off before `confidence` — which is what the newline
+    flood does — the confidence is NOT invented: it stays 0.0, the answer is
+    not `confident`, and the caller offers it as "Did you mean the festival?"
+    instead of acting on it.
+
+    That distinction is the point. Guessing the model's own uncertainty would
+    fabricate the one signal that decides whether the user is asked or shown,
+    and a question naming the real occasion is already far better than the
+    fixed-example form letter this replaces.
+    """
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    text = _FENCE_RE.sub("", content.strip())
+    try:
+        return validate(json.loads(text))
+    except (ValueError, TypeError):
+        pass
+
+    occasion = _OCCASION_RE.search(text)
+    if occasion is None:
+        return None
+
+    salvaged: dict[str, Any] = {"occasion": occasion.group(1)}
+
+    confidence = _CONFIDENCE_RE.search(text)
+    if confidence is not None:
+        salvaged["confidence"] = confidence.group(1)
+
+    alts = _ALT_BLOCK_RE.search(text)
+    if alts is not None:
+        salvaged["alternatives"] = _STRING_RE.findall(alts.group(1))
+
+    return validate(salvaged)

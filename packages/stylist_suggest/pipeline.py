@@ -319,8 +319,9 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
     for slot in required_slots():
         if not pool.by_slot.get(slot):
             pool.notes.append(
-                f"no wearable {slot} — every outfit needs one "
-                f"(check the laundry basket and the {ctx.dress_code_target} dress code)"
+                f"no wearable {_SLOT_WORDS.get(slot, slot.replace('_', ' '))} — every "
+                f"outfit needs one (check the laundry basket, and whether anything "
+                f"you own suits {str(ctx.dress_code_target).replace('_', ' ')})"
             )
 
     # A PREFERRED SLOT IS A NOTE, NOT A FAILURE. The outfits below are real
@@ -329,16 +330,71 @@ async def load_wardrobe(session: Any, ctx: OutfitContext) -> CandidatePool:
     # shoes?" is the obvious next question and the answer is actionable.
     for slot in preferred_slots():
         if not pool.by_slot.get(slot):
+            # "no wearable feet" is what the slot id produced, and it is not a
+            # sentence about clothes. The slot is named for the body part; the
+            # user owns garments.
             pool.notes.append(
-                f"no wearable {slot} — these outfits are shown without one. "
-                f"Add footwear and I will include it."
+                "no shoes that work for this — these outfits are shown without "
+                "any. Add a pair and I'll include it."
                 if slot == "feet"
-                else f"no wearable {slot}; outfits are shown without one"
+                else (
+                    f"no wearable {_SLOT_WORDS.get(slot, slot.replace('_', ' '))}; "
+                    f"outfits are shown without one"
+                )
             )
     if not any(all(pool.by_slot.get(s) for s in structure) for structure in base_structures()):
-        readable = " or ".join("+".join(s) for s in base_structures())
-        pool.notes.append(f"no complete base structure available ({readable})")
+        pool.notes.append(_base_structure_note(pool, ctx))
     return pool
+
+
+# How to say a slot to someone who has never read the taxonomy. The ids are
+# machine words: a reply that ends "(upper_base+lower or full_body)" tells a
+# user nothing they can act on, and it reached them — that string was the
+# whole of the answer to "Cultural wear".
+_SLOT_WORDS = {
+    "upper_base": "a top",
+    "lower": "something to wear on the bottom",
+    "full_body": "a one-piece like a kurta set, dress or saree",
+    "feet": "shoes",
+    "upper_outer": "a jacket or layer",
+}
+
+
+def _base_structure_note(pool: CandidatePool, ctx: Any) -> str:
+    """Say what is actually missing, in words, and what would fix it.
+
+    THE SLOT IS KNOWN, SO NAME IT. The old note listed every base structure
+    the taxonomy defines and left the user to work out which half they were
+    short of. The pool knows precisely: this reports the structure that is
+    CLOSEST to complete, because that is the smallest thing the user could
+    add to get an outfit.
+
+    The distinction that matters is between owning nothing for the dress code
+    and owning part of it — "you have no ethnic clothes" and "you have an
+    ethnic top but no bottom" call for different next steps, and the second is
+    the far more common and more frustrating one.
+    """
+    code = str(getattr(ctx, "dress_code_target", "") or "").replace("_", " ")
+    base_slots = {s for structure in base_structures() for s in structure}
+    has_any = any(pool.by_slot.get(s) for s in base_slots)
+
+    if not has_any:
+        return (
+            f"there's nothing {code} in your wardrobe yet — add a few pieces "
+            f"and I'll style them"
+        )
+
+    # Fewest additions first: with an ethnic top already owned, "add a bottom"
+    # beats "add a one-piece", even though both would work.
+    missing = min(
+        (tuple(s for s in structure if not pool.by_slot.get(s)) for structure in base_structures()),
+        key=len,
+    )
+    words = " and ".join(_SLOT_WORDS.get(s, s.replace("_", " ")) for s in missing)
+    return (
+        f"your {code} pieces don't make a full outfit yet — add {words} "
+        f"and I'll put it together"
+    )
 
 
 # The garment attributes a preference fact can name. Kept in sync with

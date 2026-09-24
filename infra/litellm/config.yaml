@@ -312,6 +312,36 @@ model_list:
   # is the behaviour that shipped before this row existed.
   - model_name: intent-classifier
     litellm_params:
+      # RE-PROBED LIVE 2026-09-23. THE ROW BELOW HAS DEGRADED; READ THIS FIRST.
+      #
+      # All eight free OpenRouter models declaring text + structured outputs
+      # are REASONING models — there is no instruct-only free option left, so
+      # the trap the tagger rows document is now the whole tier. Six queries
+      # each, this exact schema:
+      #
+      #   nemotron-3-super-120b   4/6 usable, 0/4 correct, 5.8s   <- this row
+      #   nex-n2.5-mini           2/3 then 429 on every retry
+      #   nex-n2.5-pro            2/3 usable, 11-65s
+      #   gemma-4-26b/31b, qwen3.8-27b   429 on every call
+      #   dots-3-note, lfm-2.5-2.6b      empty content
+      #   intent-classifier-local 6/6 usable, 2/4 correct, 1.4s   <- the local
+      #                           fallback, measurably better on every axis
+      #
+      # Its characteristic failure is NOT an error, which is what makes it
+      # expensive: it returns HTTP 200 carrying
+      #
+      #     {"{ "occasion": "festival_day" \n \n \n ... (to max_tokens)
+      #
+      # The classification is RIGHT and the wrapper is broken. A 200 does not
+      # trigger the `fallbacks` entry below — that only catches 402/429/5xx —
+      # so the local model never sees these. `intent_llm.parse_answer` is what
+      # recovers them; see its salvage section.
+      #
+      # NOT REPLACED, because nothing free is better: the two rows that beat
+      # it on one probe failed the next. The real options are a paid model or
+      # running the local row first, and both are decisions above this file.
+      #
+      # ---- the 2026-09-21 probe that chose this row, now stale ----
       # PROBED LIVE 2026-09-21 against this exact json_schema and a real
       # long-tail query ("my cousin's daughter has her naming ceremony").
       # Chosen from the free models declaring text input AND structured
@@ -337,6 +367,54 @@ model_list:
       # this asks an instruct model for three fields, so 512 is generous.
       max_tokens: 512
       temperature: 0.0
+    model_info:
+      mode: chat
+
+  # OPEN SOURCE, LOCAL, AND FREE. Added so the product can be exercised end
+  # to end with no provider credit at all.
+  #
+  # Both hosted classifiers stopped answering on the same day: Gemini returned
+  # RESOURCE_EXHAUSTED ("prepayment credits are depleted") and the free
+  # OpenRouter slug returned 402, and malformed JSON when it did answer. The
+  # LLM fallback degrades honestly in that case -- the chat asks the user
+  # instead -- but "I'm not sure what the occasion is" for *cultural wear* is
+  # not a product anyone can judge.
+  #
+  # Reuses the model already pulled for tagging rather than adding a download.
+  # It is a vision model doing a text job, which is wasteful and entirely
+  # adequate for a 30-token classification.
+  #
+  # NOT THE PRODUCTION ANSWER. It runs on the developer's machine, so latency
+  # is whatever that machine can do and nothing is served from it when the
+  # laptop is shut. `intent-classifier` stays pointed at a hosted model; this
+  # is the fallback that makes a dead credit card a slow answer instead of no
+  # answer.
+  - model_name: intent-classifier-local
+    litellm_params:
+      # qwen2.5:3b, TEXT-ONLY and small on purpose. MEASURED, all three:
+      #   qwen2.5vl:7b   timed out at 180s on every message (vision weights,
+      #                  wrong tool for a 30-token classification)
+      #   qwen2.5:7b     23-32s per call and intermittent failures -- too slow
+      #                  to sit in front of a chat box
+      #   qwen2.5:3b     1.4-7s, schema-valid every time  <- this
+      #
+      # Its weakness is accuracy, not speed: it answered *poetry reading* with
+      # griha_pravesh at confidence 1.0. A 3B model cannot do a 28-way
+      # classification well, and it does not know that it cannot. Good enough
+      # to exercise the product; not good enough to ship. The first attempt reused
+      # qwen2.5vl:7b -- already pulled for tagging, so no download -- and it
+      # TIMED OUT at 180s on every message: a 7B vision model is the wrong
+      # tool for a thirty-token classification. A 3B text model answers in
+      # seconds on the same machine.
+      model: ollama_chat/qwen2.5:3b
+      api_base: http://host.docker.internal:11434
+      max_tokens: 512
+      temperature: 0.0
+      # Generous: a 7B model on CPU is slow, and a timeout here costs the
+      # user the clarification they were already getting.
+      timeout: 120
+      input_cost_per_token: 0
+      output_cost_per_token: 0
     model_info:
       mode: chat
 
@@ -376,7 +454,10 @@ litellm_settings:
   # hard timeout and NO retry for the opposite reason.
   num_retries: 2
   request_timeout: 120
-  fallbacks: [{ "vlm-tagger": ["vlm-tagger-backup"] }]
+  fallbacks:
+    - { "vlm-tagger": ["vlm-tagger-backup"] }
+    # A depleted card must not read as "I do not understand you".
+    - { "intent-classifier": ["intent-classifier-local"] }
   # Response cache: re-tagging an identical grid is free. Keyed on the request
   # body, so it also absorbs the duplicate deliveries the outbox relay can
   # produce at-least-once.

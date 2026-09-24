@@ -226,6 +226,10 @@ class FakeObjectStore:
         """Simulate the client's direct-to-storage PUT succeeding."""
         self.objects[key] = {"ContentLength": 2048, "ContentType": "image/jpeg"}
 
+    def put_bytes(self, key: str, data: bytes, *, content_type: str) -> None:
+        """A server-side write (a catalogue packshot, a placeholder)."""
+        self.objects[key] = {"ContentLength": len(data), "ContentType": content_type}
+
     def head(self, key: str) -> dict[str, Any] | None:
         return self.objects.get(key)
 

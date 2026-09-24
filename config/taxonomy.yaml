@@ -566,6 +566,53 @@ occasions:
   - id: black_tie_event
     dress_code: black_tie
     formality_target: 5
+  # ---- added after review (migration 0024) -------------------------------
+  #
+  # The first eighteen covered weddings and the gym but almost nothing of the
+  # working week, and only three points on the ethnic calendar.
+  #
+  # APPENDED, never inserted. `occasion` is a Postgres enum generated from
+  # this list and the enum test compares labels IN ORDER, so a new id in the
+  # middle means rebuilding the type instead of appending to it.
+  #
+  # Each also needs a phrase in `stylist_domain.intent.LEXICON` or nobody can
+  # ask for it, and a tile in `web/app/OCCASIONS.ts` or nobody can see it;
+  # `test_every_occasion_is_reachable_and_askable` enforces both.
+  #
+  # Corporate.
+  - id: conference
+    dress_code: business
+    formality_target: 4
+  - id: networking_event
+    dress_code: smart_casual
+    formality_target: 4
+  - id: office_party
+    dress_code: smart_casual
+    formality_target: 3
+  - id: team_offsite
+    dress_code: casual
+    formality_target: 2
+  # Ethnic ceremonies. mehendi, sangeet and the two wedding days existed; the
+  # ceremonies around them did not.
+  - id: haldi
+    dress_code: festive_ethnic
+    formality_target: 3
+  - id: engagement
+    dress_code: formal_ethnic
+    formality_target: 4
+  - id: griha_pravesh
+    dress_code: festive_ethnic
+    formality_target: 3
+  - id: baby_shower
+    dress_code: festive_ethnic
+    formality_target: 3
+  # General.
+  - id: brunch
+    dress_code: smart_casual
+    formality_target: 3
+  - id: graduation
+    dress_code: business
+    formality_target: 4
 
 # ═════════════════════════════════════════════════════════════════════════════
 # 10. PER-FIELD EXTRACTION AND CONFIDENCE POLICY
