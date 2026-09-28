@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     cors_allow_origins: str = Field(default="http://localhost:3100")
 
     ml_base_url: str = Field(default="http://localhost:8081")
+    # Audience for a Google ID token on every ml call; set only when ml is a
+    # private Cloud Run service (infra/vm/). Empty = no auth header.
+    ml_auth_audience: str = Field(default="")
 
     # ---- LiteLLM gateway ----
     # The ONLY egress path to model providers. Every model call goes through

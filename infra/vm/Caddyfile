@@ -1,0 +1,9 @@
+# HTTPS for the api. Caddy obtains and renews the Let's Encrypt certificate
+# for {$API_HOST} by itself; ports 80 and 443 must be open (firewall rule
+# stylist-web, created by bootstrap.sh).
+#
+# No `encode` directive: compressing a text/event-stream response can buffer
+# it, and the job-progress stream (SSE) must reach the browser as it happens.
+{$API_HOST} {
+	reverse_proxy api:8000
+}

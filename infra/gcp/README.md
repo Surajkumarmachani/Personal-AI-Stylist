@@ -1,142 +1,120 @@
-# Deploying: backend on Google Cloud, frontend on Vercel
+# Deploying: backend on Google Cloud (~$35/month), frontend on Vercel
 
 ```
  browser / installed desktop app (PWA)
         │
         ▼
- Vercel (web/)  ──NEXT_PUBLIC_API_BASE──►  Cloud Run: stylist-api  (public)
-                                               │  Direct VPC egress
-            ┌──────────────────────────────────┼─────────────────────────┐
-            ▼                  ▼               ▼                         ▼
-   Cloud Run: stylist-ml  Cloud Run:     Memorystore ×2          Cloud SQL (PG16)
-   (internal, GCS FUSE    stylist-litellm (queue: noeviction,    stylist + litellm DBs
-    mount of weights)     (internal)       cache: allkeys-lru)
-            ▲                  ▲               ▲                         ▲
-            └──────── Cloud Run worker pool: stylist-worker (arq) ───────┘
- Cloud Storage: uploads bucket (S3 API + HMAC key), models bucket
+ Vercel (web/, free Hobby plan) ──NEXT_PUBLIC_API_BASE──►  https://api.<ip>.sslip.io
+                                                               │
+ ┌─────────────── Compute Engine VM: stylist-vm (e2-medium, 4 GB) ─────────────┐
+ │  Caddy (HTTPS) → api ─┬─ Postgres (pgvector)   worker (arq) ─┐              │
+ │                       ├─ redis-queue (noeviction)             │              │
+ │                       ├─ redis-cache (LRU)                    │              │
+ │                       └─ litellm ──► OpenRouter / Gemini      │              │
+ └───────────────────────────────────────────────────────────────┼──────────────┘
+                                                                 │ ID token
+                                           Cloud Run: stylist-ml (private, scales to 0)
+ Cloud Storage: uploads (S3 API + HMAC) · models · backups (30 days) · deploy bundle
 ```
 
-| compose service | Google Cloud |
-|---|---|
-| `api` | Cloud Run service, public |
-| `worker` | Cloud Run **worker pool** (arq listens on no port) |
-| `ml` | Cloud Run service, internal, 4 vCPU / 8 GiB, weights on a read-only GCS mount |
-| `litellm` | Cloud Run service, internal, image = upstream + baked `config.yaml` |
-| `migrate` | Cloud Run job, then `scripts/set_app_role_password.py` |
-| `postgres` | Cloud SQL for PostgreSQL 16, reached over the Cloud SQL socket |
-| `redis-queue` / `redis-cache` | two Memorystore instances (eviction policy is per instance) |
-| `minio` | Cloud Storage, through its S3-compatible API |
-| `.env` / `secrets/` | Secret Manager |
+| What | Where | ≈ per month |
+|---|---|---|
+| Postgres, both Redis, litellm, api, worker, Caddy | 1 × e2-medium VM, `asia-south1-a` | $28 |
+| VM disk (30 GB) + daily snapshots (7 days) | Compute Engine | $3 |
+| Static IP | Compute Engine | $3.60 |
+| ml | Cloud Run, min 0 / max 2 instances, private | $0–3 |
+| Uploads, models, backups, images | Cloud Storage / Artifact Registry | ~$1–2 |
+| **Total** | | **~$35** |
 
-## Deploying without a terminal
+Everything local compose runs is here except MinIO (replaced by Cloud Storage)
+and ml (moved to Cloud Run, where it is billed only while working).
 
-Everything below can be done in three websites: Google Cloud Console, GitHub
-and Vercel. GitHub Actions runs the scripts in this folder for you:
+## First deploy
 
-| Workflow (Actions tab) | Does |
-|---|---|
-| **GCP Setup** | `bootstrap.sh` + model weights → Cloud Storage. First time, and after changing `WEB_ORIGINS`. |
-| **Deploy** | build → migrate → deploy, then a smoke check. Refuses commits whose CI failed. |
-| **GCP Admin** | grant / revoke / list `/ops` admins. |
-
-The one manual step in the Console is letting GitHub sign in to Google Cloud
-(Workload Identity Federation: no key file is ever created). Use exactly the
-IDs `github`, `github-oidc` and `stylist-deployer`. GCP Setup looks for those
-names and reuses them rather than creating duplicates.
-
-## First deploy (with a terminal)
-
-Prerequisites: `gcloud` logged in (`gcloud auth login`), a project with
-billing enabled, and model weights downloaded locally
-(`python scripts/download_models.py`).
+Prerequisites: `gcloud auth login`, a project with billing, and model weights
+downloaded locally (`.venv/bin/python scripts/download_models.py`).
 
 ```bash
 cp infra/gcp/config.env.example infra/gcp/config.env   # fill it in
-infra/gcp/bootstrap.sh          # ~15 min, one time; safe to re-run
-# add the optional third-party secrets it prints (Gemini, VTON, Firebase…)
-infra/gcp/deploy.sh models      # verify checksums, sync weights to GCS
-infra/gcp/deploy.sh all         # build → migrate → deploy
+infra/gcp/bootstrap.sh     # ~5 min: buckets, secrets, IP, firewall, the VM
+# add third-party keys to Secret Manager (bootstrap prints the command)
+infra/gcp/deploy.sh models # verify checksums, upload weights for ml
+infra/gcp/deploy.sh all    # build images → deploy ml → update the VM
 ```
 
-`deploy.sh` finishes by printing the API URL. Then:
+`deploy.sh all` finishes by printing the API address (`https://api.<ip>.sslip.io`). Then:
 
-1. **Vercel.** Import the repo and set **Root Directory = `web`**. Add these
-   environment variables (Production and Preview):
-   - `NEXT_PUBLIC_API_BASE` = the API URL
-   - `NEXT_PUBLIC_FIREBASE_API_KEY`, `NEXT_PUBLIC_FIREBASE_PROJECT_ID`,
-     `NEXT_PUBLIC_FIREBASE_SENDER_ID`, `NEXT_PUBLIC_FIREBASE_APP_ID`,
-     `NEXT_PUBLIC_FIREBASE_VAPID_KEY`, copied from the root `.env`
-
-   These are inlined at build time, so redeploy on Vercel after changing any of them.
-2. **Google OAuth client.** Add `<API URL>/calendar/callback` as an authorized
-   redirect URI.
-3. **Firebase console → Authentication → Authorized domains.** Add the Vercel domain.
-4. Put the Vercel URL in `WEB_ORIGINS` and `WEB_BASE_URL` in `config.env`. If it
-   changed, re-run `bootstrap.sh` (for the bucket CORS) and
-   `deploy.sh services` (for the API CORS).
-5. Make yourself an admin so `/ops` works:
-   `infra/gcp/deploy.sh admin --email you@example.com`
+1. **Vercel**: import the repo with **Root Directory = `web`**. Set
+   `NEXT_PUBLIC_API_BASE` to the API address and add the five
+   `NEXT_PUBLIC_FIREBASE_*` values from the root `.env`. Redeploy whenever
+   these change, because they're baked in at build time.
+2. **Google OAuth client**: add `<API address>/calendar/callback` as a redirect URI.
+3. **Firebase → Authentication → Authorized domains**: add the Vercel domain.
+4. Put the real Vercel domain in `WEB_ORIGINS`/`WEB_BASE_URL`, then re-run
+   `bootstrap.sh` (bucket CORS) and `deploy.sh vm` (API CORS).
+5. `infra/gcp/deploy.sh admin --email you@example.com` to get `/ops` access.
 
 ## Everyday
 
 ```bash
-infra/gcp/deploy.sh all                      # ship the current commit
-TAG=<git sha> infra/gcp/deploy.sh services   # roll back to an earlier build
-infra/gcp/deploy.sh admin --list             # who can see /ops
+infra/gcp/deploy.sh all                  # ship the current commit
+TAG=<git sha> infra/gcp/deploy.sh vm     # roll back to an earlier build
+infra/gcp/deploy.sh status               # container status on the VM
+infra/gcp/deploy.sh logs worker          # recent logs for one service
+gcloud compute ssh stylist-vm --zone=asia-south1-a   # a shell on the VM
 ```
 
-**From GitHub instead of a laptop.** Set `GITHUB_REPO=owner/name` in
-`config.env` and re-run `bootstrap.sh`. It creates a keyless deploy identity
-(Workload Identity Federation) and prints three variables to add to a GitHub
-*environment* named e.g. `production`. Then go to **Actions → Deploy → Run
-workflow**. The workflow refuses to deploy a commit whose CI run didn't pass,
-and finishes with a smoke check against `/health/ready`.
+Logs also go to **Cloud Logging** (Console → Logging) as JSON with real severities.
 
-**Staging.** Use a separate GCP project, with its own `infra/gcp/staging.env`,
-then `GCP_CONFIG=infra/gcp/staging.env infra/gcp/bootstrap.sh` (and the same
-prefix for `deploy.sh`). A separate project means staging can't reach
-production's secrets or data.
+## What runs where on the VM
 
-Images are tagged with the git SHA. A build made from a dirty tree is tagged
-`<sha>-dirty-<timestamp>` so it can't be mistaken for the commit.
+`/opt/stylist/` holds `docker-compose.yml`, `Caddyfile`, `app.env` (non-secret)
+and `.env`, which is rendered from Secret Manager on every deploy (root-only).
+`update.sh` runs on each deploy: it pulls images, runs migrations, then
+restarts the containers. The containers restart by themselves after a reboot.
+The VM's startup script (`infra/vm/vm-setup.sh`) installs Docker on first
+boot and adds 2 GB of swap.
+
+**Backups**: a nightly `pg_dump` at 03:00 IST goes to the backups bucket
+(kept 30 days), plus daily disk snapshots (kept 7 days).
 
 ## Verify after the first deploy
 
-- `curl <API URL>/health/ready`: every dependency reports ok. Use this and
-  **not** `/readyz`: Cloud Run reserves some paths ending in `z` on public
-  URLs, so the z-paths are for compose and in-container probes only.
-- **Upload a garment from the Vercel site.** This is the one step to actually
-  test by hand. Uploads use a presigned **POST** with a size policy
-  (`packages/stylist_clients/storage.py`), signed with SigV4 against Cloud
-  Storage's S3 API. If uploads 403, check `S3_REGION` (set to `auto`) and the
-  bucket CORS before anything else.
-- Worker: `gcloud run worker-pools logs read stylist-worker --region=$REGION`
-  shows `worker started, environment=production`.
+- `curl https://<API address>/health/ready`: every dependency reports ok. The first
+  call can take about 60 s because it wakes ml. Use this path, **not** `/readyz`:
+  Cloud Run reserves some paths ending in `z`.
+- **Upload a garment from the Vercel site.** This is the one flow to test by hand:
+  a presigned POST, signed with SigV4, against Cloud Storage's S3 API. If uploads
+  return 403, check the bucket CORS first.
 
-## What production refuses to do
+## Trade-offs of the $35 plan
 
-- **Start with a credential from git.** With `ENVIRONMENT` set to anything other than `local`, the
-  api and worker won't boot on the MinIO keys, the local LiteLLM master key,
-  the local app-role password, or the dev JWT secret
-  (`services/stylist_api/settings.py`). The new revision fails to start and
-  never takes traffic, instead of going live with broken uploads.
-- **Build the frontend without an API.** A Vercel *production* build fails if
-  `NEXT_PUBLIC_API_BASE` is unset, instead of shipping a site that points at
-  localhost.
-- **Log unstructured text.** `LOG_FORMAT=json` gives Cloud Logging a real
-  severity on every line, so you can alert on `severity>=ERROR`.
+- **Everything but ml is on one VM.** If the VM goes down, the app is down
+  until it's back; it restarts itself after a reboot, and the data is in the
+  backups above. There's no automatic failover.
+- **ml cold starts.** The first photo after a quiet period waits ~30–60 s while
+  ml starts and loads its models. Ingest runs in the background, so the user
+  sees "processing" rather than an error.
+- **The api container's healthcheck is liveness (`/healthz`).** Readiness
+  would call ml every few seconds and keep it awake, which costs ~$80/month.
+- **Vercel Hobby is non-commercial.** Move to Pro ($20/month) once you charge users.
+- **Outgrowing it**: resize the VM (`VM_MACHINE=e2-standard-2`, ~$55) before
+  reaching for managed Postgres or Redis.
+
+## Deploying from GitHub (optional)
+
+Set `GITHUB_REPO=owner/name` in `config.env` and re-run `bootstrap.sh`. It
+creates a keyless deploy identity (Workload Identity Federation) and prints
+three variables for a GitHub environment named `production`. Then use
+**Actions → Deploy / GCP Setup / GCP Admin → Run workflow**. Deploy refuses
+commits whose CI run didn't pass.
 
 ## Gotchas
 
-- **`gcloud run worker-pools` fails with `No module named 'grpc'`.** Homebrew
-  installs of gcloud ship without it. `deploy.sh` detects this and prints the fix.
-- **CORS on Vercel preview URLs.** Every preview deploy gets a new hostname,
-  and the API allows only exact origins. Point previews at a separate
-  staging backend, or add the specific preview origin.
-- **Cost floor.** `min-instances=1` on api, ml (4 vCPU) and litellm, plus
-  Cloud SQL and two Memorystore instances, means the stack costs money even when
-  idle. That's deliberate: ml takes about 20 s to load its models, and scaling
-  to zero would put that delay on some user's first request. Lower
-  `--min-instances` in `deploy.sh` for a staging project.
-- **DB connections.** `DB_POOL_SIZE=5` × up to 8 api instances, plus the worker,
-  stays under Cloud SQL's default of 100 connections. Raise both together.
+- **`No module named 'grpc'` from gcloud.** Homebrew's gcloud is missing it:
+  `python3 -m venv ~/.gcloud-py && ~/.gcloud-py/bin/pip install grpcio`, then
+  `export CLOUDSDK_PYTHON=~/.gcloud-py/bin/python CLOUDSDK_PYTHON_SITEPACKAGES=1`.
+- **The first `gcloud compute ssh`** creates an SSH key and signs in through
+  OS Login. That's normal, and it only happens once.
+- **Vercel preview URLs** aren't in the CORS list; only exact origins are allowed.
+- **Try-on**: a `gradio.live` `VTON_BASE_URL` expires after about 72 hours.

@@ -19,6 +19,8 @@ from typing import Any
 
 import httpx
 
+from stylist_clients.gcp_identity import auth_headers
+
 # Measured in-container: embed ~0.5s, segment ~2.6s, matte ~3-5s. Ceilings are
 # ~4x those so a slow-but-working call succeeds while a hung one fails fast.
 # PROVISIONAL — re-dated 2026-09-17. P9 arrived with no real traffic, so this is unchanged.
@@ -133,8 +135,13 @@ class EmbedResponse:
 
 
 class MLClient:
-    def __init__(self, base_url: str) -> None:
+    def __init__(self, base_url: str, auth_audience: str | None = None) -> None:
         self._base_url = base_url.rstrip("/")
+        # Set only when ml is a private Cloud Run service (see gcp_identity).
+        self._auth_audience = auth_audience or None
+
+    async def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        return {**(extra or {}), **await auth_headers(self._auth_audience)}
 
     def _timeout(self, read: float) -> httpx.Timeout:
         # Short connect, long read: a slow connect means the service is down,
@@ -150,7 +157,9 @@ class MLClient:
         try:
             async with httpx.AsyncClient(timeout=self._timeout(MATTE_TIMEOUT)) as client:
                 resp = await client.post(
-                    f"{self._base_url}/matte", content=image_bytes, headers=headers
+                    f"{self._base_url}/matte",
+                    content=image_bytes,
+                    headers=await self._headers(headers),
                 )
         except Exception as exc:
             _raise_if_unavailable(exc)
@@ -173,7 +182,11 @@ class MLClient:
         """
         try:
             async with httpx.AsyncClient(timeout=self._timeout(SEGMENT_TIMEOUT)) as client:
-                resp = await client.post(f"{self._base_url}/head-mask", content=image_bytes)
+                resp = await client.post(
+                    f"{self._base_url}/head-mask",
+                    content=image_bytes,
+                    headers=await self._headers(),
+                )
         except Exception as exc:
             _raise_if_unavailable(exc)
             raise
@@ -192,7 +205,7 @@ class MLClient:
                 resp = await client.post(
                     f"{self._base_url}/segment",
                     content=image_bytes,
-                    headers={"Content-Type": "application/octet-stream"},
+                    headers=await self._headers({"Content-Type": "application/octet-stream"}),
                 )
         except Exception as exc:
             _raise_if_unavailable(exc)
@@ -239,7 +252,7 @@ class MLClient:
                 resp = await client.post(
                     f"{self._base_url}/embed",
                     content=image_bytes,
-                    headers={"Content-Type": "application/octet-stream"},
+                    headers=await self._headers({"Content-Type": "application/octet-stream"}),
                 )
         except Exception as exc:
             _raise_if_unavailable(exc)
@@ -263,7 +276,7 @@ class MLClient:
                 resp = await client.post(
                     f"{self._base_url}/moderate",
                     content=image_bytes,
-                    headers={"Content-Type": "application/octet-stream"},
+                    headers=await self._headers({"Content-Type": "application/octet-stream"}),
                 )
         except Exception as exc:
             _raise_if_unavailable(exc)
@@ -273,11 +286,11 @@ class MLClient:
 
     async def readyz(self) -> dict[str, object]:
         async with httpx.AsyncClient(timeout=self._timeout(5.0)) as client:
-            resp = await client.get(f"{self._base_url}/health/ready")
+            resp = await client.get(f"{self._base_url}/health/ready", headers=await self._headers())
         return dict(resp.json())
 
     async def models(self) -> dict[str, object]:
         async with httpx.AsyncClient(timeout=self._timeout(10.0)) as client:
-            resp = await client.get(f"{self._base_url}/models")
+            resp = await client.get(f"{self._base_url}/models", headers=await self._headers())
         resp.raise_for_status()
         return dict(resp.json())

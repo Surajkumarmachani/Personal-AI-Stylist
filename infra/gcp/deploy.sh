@@ -1,27 +1,27 @@
 #!/usr/bin/env bash
-# Build and roll out the backend to Cloud Run. Assumes bootstrap.sh has run.
+# Build and roll out the budget plan. Assumes bootstrap.sh has run.
 #
 # Usage:
-#   infra/gcp/deploy.sh all        build, migrate, then deploy every service
+#   infra/gcp/deploy.sh all        build, then deploy ml and the VM
 #   infra/gcp/deploy.sh build      build and push the three images only
-#   infra/gcp/deploy.sh migrate    run migrations against the current TAG
-#   infra/gcp/deploy.sh services   deploy ml, litellm, api, worker at TAG
+#   infra/gcp/deploy.sh ml         deploy the ml service (Cloud Run) at TAG
+#   infra/gcp/deploy.sh vm         deploy everything else (the VM) at TAG
 #   infra/gcp/deploy.sh models     verify local weights and sync them to GCS
-#   infra/gcp/deploy.sh admin --email you@x.com [--revoke]   grant /ops access
+#   infra/gcp/deploy.sh admin --email you@x.com [--revoke] | --list
+#   infra/gcp/deploy.sh status     container status on the VM
+#   infra/gcp/deploy.sh logs [service]   recent logs (api, worker, litellm…)
 #
-# GCP_CONFIG selects the environment (default infra/gcp/config.env):
-#   GCP_CONFIG=infra/gcp/staging.env infra/gcp/deploy.sh all
+# TAG defaults to the current git SHA; `TAG=<sha> deploy.sh vm` redeploys an
+# older build, which is the whole rollback procedure. Migrations run inside
+# `vm` before the new containers start, so the old version must tolerate the
+# new schema for the moment in between (expand, then contract).
 #
-# TAG defaults to the current git SHA; set TAG=... to redeploy an older build
-# (which is the whole rollback procedure: `TAG=<sha> deploy.sh services`).
-#
-# ORDER MATTERS in `all`: migrations run BEFORE the new code starts, so the
-# old revision must tolerate the new schema for the minutes in between. That
-# is the same expand-then-contract rule the compose stack already follows.
+# GCP_CONFIG selects the environment (default infra/gcp/config.env).
 
 source "$(dirname "$0")/lib.sh"
 cd "$REPO_ROOT"
 
+TAG_GIVEN="${TAG:-}"
 if [ -z "${TAG:-}" ]; then
   TAG="$(git rev-parse --short HEAD)"
   if [ -n "$(git status --porcelain)" ]; then
@@ -32,90 +32,7 @@ if [ -z "${TAG:-}" ]; then
   fi
 fi
 
-API_URL="${API_PUBLIC_URL:-$(run_url "$SVC_API")}"
 ML_URL="$(run_url "$SVC_ML")"
-LITELLM_URL="$(run_url "$SVC_LITELLM")"
-
-# ---- env and secret wiring ---------------------------------------------------
-
-# YAML, not --set-env-vars: CORS_ALLOW_ORIGINS is comma-separated, and commas
-# are gcloud's own delimiter there.
-yaml_kv() { printf "%s: '%s'\n" "$1" "${2//\'/\'\'}"; }
-
-redis_host() { gcloud redis instances describe "$1" --region="$REGION" --format='value(host)'; }
-
-# Shared by api, worker and the migrate job: they read one Settings class.
-write_app_env() {
-  local qhost chost
-  qhost="$(redis_host "$REDIS_QUEUE")"
-  chost="$(redis_host "$REDIS_CACHE")"
-  {
-    yaml_kv ENVIRONMENT production
-    yaml_kv LOG_LEVEL INFO
-    # One JSON object per line, so Cloud Logging sees severity (stylist_obs/logs.py).
-    yaml_kv LOG_FORMAT json
-    yaml_kv REDIS_QUEUE_URL "redis://$qhost:6379/0"
-    yaml_kv REDIS_CACHE_URL "redis://$chost:6379/0"
-    yaml_kv ML_BASE_URL "$ML_URL"
-    yaml_kv LITELLM_BASE_URL "$LITELLM_URL"
-    yaml_kv VLM_MODEL "${VLM_MODEL:-vlm-tagger-mock}"
-    # Cloud Storage through its S3-compatible XML API, signed with the
-    # stylist-storage HMAC key. Same endpoint inside and out: there is no
-    # internal hostname to leak into a presigned URL, unlike MinIO.
-    yaml_kv S3_ENDPOINT_URL https://storage.googleapis.com
-    yaml_kv S3_PUBLIC_ENDPOINT_URL https://storage.googleapis.com
-    yaml_kv S3_BUCKET "$UPLOAD_BUCKET"
-    yaml_kv S3_REGION auto
-    yaml_kv CORS_ALLOW_ORIGINS "$WEB_ORIGINS"
-    yaml_kv WEB_BASE_URL "${WEB_BASE_URL:-${WEB_ORIGINS%%,*}}"
-    yaml_kv GOOGLE_CLIENT_ID "${GOOGLE_CLIENT_ID:-}"
-    yaml_kv GOOGLE_REDIRECT_URI "$API_URL/calendar/callback"
-    yaml_kv GOOGLE_HOLIDAY_CALENDAR_ID "${GOOGLE_HOLIDAY_CALENDAR_ID:-en.indian#holiday@group.v.calendar.google.com}"
-    yaml_kv SHOP_SUBID_PARAM "${SHOP_SUBID_PARAM:-subid}"
-    yaml_kv VTON_PROVIDER "${VTON_PROVIDER:-}"
-    yaml_kv VTON_BASE_URL "${VTON_BASE_URL:-}"
-    yaml_kv VTON_TIMEOUT_S 900
-    yaml_kv TRYON_DAILY_QUOTA "${TRYON_DAILY_QUOTA:-10}"
-    yaml_kv TRYON_MAX_PASSES "${TRYON_MAX_PASSES:-2}"
-    # Matched to ml's ML_MAX_CONCURRENCY, as in compose (§C2).
-    yaml_kv WORKER_MAX_JOBS 2
-    # Cloud SQL's default max_connections on db-custom-1-3840 is 100. The
-    # local default of 20 per process x up to 8 api instances would exhaust
-    # it before the worker or a migration could connect.
-    yaml_kv DB_POOL_SIZE 5
-  } > "$1"
-}
-
-# Secrets that must exist (bootstrap creates them) plus the optional
-# third-party ones, included only when present. Cloud Run refuses to deploy a
-# revision that references a secret that does not exist.
-app_secrets() {
-  local s="DATABASE_URL=database-url:latest,JWT_SECRET=jwt-secret:latest"
-  s+=",LITELLM_MASTER_KEY=litellm-master-key:latest"
-  s+=",S3_ACCESS_KEY=s3-access-key:latest,S3_SECRET_KEY=s3-secret-key:latest"
-  local pair
-  for pair in VTON_API_TOKEN=vton-api-token GOOGLE_CLIENT_SECRET=google-client-secret \
-              GOOGLE_CALENDAR_API_KEY=google-calendar-api-key \
-              SHOP_POSTBACK_SECRET=shop-postback-secret; do
-    secret_exists "${pair#*=}" && s+=",$pair:latest"
-  done
-  echo "$s"
-}
-
-litellm_secrets() {
-  local s="LITELLM_MASTER_KEY=litellm-master-key:latest"
-  s+=",LITELLM_DATABASE_URL=litellm-database-url:latest"
-  local pair
-  for pair in GEMINI_API_KEY=gemini-api-key ANTHROPIC_API_KEY=anthropic-api-key \
-              OPENROUTER_API_KEY=openrouter-api-key GROQ_API_KEY=groq-api-key \
-              OPENAI_API_KEY=openai-api-key LANGFUSE_PUBLIC_KEY=langfuse-public-key \
-              LANGFUSE_SECRET_KEY=langfuse-secret-key; do
-    secret_exists "${pair#*=}" && s+=",$pair:latest"
-  done
-  echo "$s"
-}
-
-# ---- steps -------------------------------------------------------------------
 
 cmd_build() {
   log "Building images at $TAG (Cloud Build)"
@@ -127,158 +44,148 @@ cmd_models() {
   log "Verifying local model weights"
   local py="python3"
   [ -x .venv/bin/python ] && py=".venv/bin/python"
-  # Refuse to publish weights whose checksums do not match the registry pins:
-  # a corrupted file here would serve wrong predictions to every user.
+  # Refuse to publish weights whose checksums do not match the registry pins.
   "$py" scripts/download_models.py --verify
   log "Syncing models/ to gs://$MODELS_BUCKET"
   gcloud storage rsync --recursive --delete-unmatched-destination-objects \
     --exclude='\.gitkeep$' models "gs://$MODELS_BUCKET"
 }
 
-cmd_migrate() {
-  log "Migrating (job $JOB_MIGRATE at $TAG)"
-  gcloud run jobs deploy "$JOB_MIGRATE" --region="$REGION" \
-    --image="$REGISTRY/app:$TAG" --service-account="$RUNTIME_SA" \
-    --set-cloudsql-instances="$SQL_CONN" \
-    --set-secrets="MIGRATION_DATABASE_URL=migration-database-url:latest,APP_DB_PASSWORD=db-app-password:latest" \
-    --command=sh \
-    --args=-c,"alembic -c packages/stylist_db/alembic.ini upgrade head && python scripts/set_app_role_password.py" \
-    --task-timeout=15m --max-retries=0 \
-    --execute-now --wait
-}
-
-# scripts/grant_admin.py as a one-off job. It needs database access by design
-# (see its docstring), and in production the database is reachable only from
-# inside Cloud Run — so the script goes to the database, not the other way.
-cmd_admin() {
-  [ $# -gt 0 ] || { echo "usage: deploy.sh admin --email you@example.com [--revoke] | --list" >&2; exit 2; }
-  local args="scripts/grant_admin.py"
-  local a
-  for a in "$@"; do args+=",$a"; done
-  # The image the api is RUNNING, not $TAG: the current commit may never have
-  # been built, and the grant must match the schema that is actually live.
-  local image
-  image="$(gcloud run services describe "$SVC_API" --region="$REGION" \
-    --format='value(spec.template.spec.containers[0].image)')"
-  [ -n "$image" ] || { echo "stylist-api is not deployed yet; run deploy first" >&2; exit 1; }
-  log "grant_admin.py $* (image $image)"
-  gcloud run jobs deploy stylist-admin --region="$REGION" \
-    --image="$image" --service-account="$RUNTIME_SA" \
-    --set-cloudsql-instances="$SQL_CONN" \
-    --set-secrets="DATABASE_URL=database-url:latest" \
-    --command=python --args="$args" \
-    --task-timeout=5m --max-retries=0 --execute-now --wait
-  # Print what the script said, so the result is visible where it was run
-  # (a terminal, or the GitHub Actions log) without opening Cloud Logging.
-  sleep 10
-  gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=stylist-admin" \
-    --freshness=10m --limit=20 --order=asc --format='value(textPayload)' || true
-}
-
-cmd_services() {
-  local env_file
-  env_file="$(mktemp)"
-  write_app_env "$env_file"
-
-  log "ml"
-  # Weights come from a read-only GCS FUSE mount, the Cloud Run equivalent of
-  # compose's `../../models:/models:ro` — never baked into the image (View 2).
-  # 4 vCPU = the 2 threads x 2 inferences compose measured; 8Gi covers the
-  # 3.9GiB measured peak plus FUSE's cache. The startup probe waits on
-  # /readyz so no request lands during the ~20s model load.
+cmd_ml() {
+  log "ml (Cloud Run, scale-to-zero, private) at $TAG"
+  # min-instances 0: billed only while it works. The price is a cold start
+  # (~30-60 s) on the first photo after a quiet spell; ingest is a background
+  # job, so the user sees "processing" rather than an error.
+  # --no-allow-unauthenticated: only identities with run.invoker (the VM's
+  # service account) get in. An open URL would be 4 vCPUs anyone could spend.
+  # --max-instances 2 caps the worst-case bill.
   gcloud run deploy "$SVC_ML" --region="$REGION" \
     --image="$REGISTRY/ml:$TAG" --service-account="$RUNTIME_SA" \
-    --ingress=internal --allow-unauthenticated --port=8000 \
-    --execution-environment=gen2 --cpu=4 --memory=8Gi \
-    --concurrency=4 --min-instances=1 --max-instances=4 \
+    --ingress=all --no-allow-unauthenticated --port=8000 \
+    --execution-environment=gen2 --cpu=4 --memory=8Gi --cpu-boost \
+    --concurrency=4 --min-instances=0 --max-instances=2 --timeout=300 \
     --clear-volumes --clear-volume-mounts \
     --add-volume=name=models,type=cloud-storage,bucket="$MODELS_BUCKET",readonly=true \
     --add-volume-mount=volume=models,mount-path=/models \
     --set-env-vars=ENVIRONMENT=production,LOG_FORMAT=json,U2NET_HOME=/models/u2net,MODELS_ROOT=/models,ORT_INTRA_OP_THREADS=2,ORT_ENABLE_CPU_ARENA=false,ML_MAX_CONCURRENCY=2 \
     --startup-probe=httpGet.path=/health/ready,httpGet.port=8000,periodSeconds=10,timeoutSeconds=5,failureThreshold=30 \
     --command=uvicorn --args=stylist_ml.main:app,--host,0.0.0.0,--port,8000,--no-access-log
+}
 
-  log "litellm"
-  # No VPC flags: it needs Cloud SQL (socket) and the public internet, and
-  # nothing inside the VPC. Default egress reaches the model providers.
-  gcloud run deploy "$SVC_LITELLM" --region="$REGION" \
-    --image="$REGISTRY/litellm:$TAG" --service-account="$RUNTIME_SA" \
-    --ingress=internal --allow-unauthenticated --port=4000 \
-    --cpu=1 --memory=2Gi --min-instances=1 --max-instances=4 \
-    --add-cloudsql-instances="$SQL_CONN" \
-    --set-env-vars=STORE_MODEL_IN_DB=True \
-    --set-secrets="$(litellm_secrets)" \
-    --startup-probe=httpGet.path=/health/liveliness,httpGet.port=4000,periodSeconds=10,timeoutSeconds=5,failureThreshold=12
+# Non-secret settings for the VM. Secrets are added ON the VM by update.sh,
+# straight from Secret Manager, so they never pass through this machine.
+write_app_env() {
+  local host="$1"
+  kv() { printf "%s='%s'\n" "$1" "${2//\'/}"; }
+  {
+    kv TAG "$TAG"
+    kv REGISTRY "$REGISTRY"
+    kv API_HOST "$host"
+    kv BACKUP_BUCKET "$BACKUP_BUCKET"
+    kv ENVIRONMENT production
+    kv LOG_LEVEL INFO
+    kv LOG_FORMAT json
+    kv REDIS_QUEUE_URL redis://redis-queue:6379/0
+    kv REDIS_CACHE_URL redis://redis-cache:6379/0
+    kv ML_BASE_URL "$ML_URL"
+    kv ML_AUTH_AUDIENCE "$ML_URL"
+    kv LITELLM_BASE_URL http://litellm:4000
+    kv VLM_MODEL "${VLM_MODEL:-vlm-tagger-mock}"
+    # Cloud Storage through its S3-compatible XML API, signed with the
+    # stylist-storage HMAC key.
+    kv S3_ENDPOINT_URL https://storage.googleapis.com
+    kv S3_PUBLIC_ENDPOINT_URL https://storage.googleapis.com
+    kv S3_BUCKET "$UPLOAD_BUCKET"
+    kv S3_REGION auto
+    kv CORS_ALLOW_ORIGINS "$WEB_ORIGINS"
+    kv WEB_BASE_URL "${WEB_BASE_URL:-${WEB_ORIGINS%%,*}}"
+    kv GOOGLE_CLIENT_ID "${GOOGLE_CLIENT_ID:-}"
+    kv GOOGLE_REDIRECT_URI "https://$host/calendar/callback"
+    kv GOOGLE_HOLIDAY_CALENDAR_ID "${GOOGLE_HOLIDAY_CALENDAR_ID:-en.indian#holiday@group.v.calendar.google.com}"
+    kv SHOP_SUBID_PARAM "${SHOP_SUBID_PARAM:-subid}"
+    kv VTON_PROVIDER "${VTON_PROVIDER:-}"
+    kv VTON_BASE_URL "${VTON_BASE_URL:-}"
+    kv VTON_TIMEOUT_S 900
+    kv TRYON_DAILY_QUOTA "${TRYON_DAILY_QUOTA:-10}"
+    kv TRYON_MAX_PASSES "${TRYON_MAX_PASSES:-2}"
+    kv WORKER_MAX_JOBS 2
+    kv DB_POOL_SIZE 5
+  } > "$2"
+}
 
-  log "api"
-  # --no-access-log: Cloud Run writes a structured request log for every call
-  # already; uvicorn's copy would double the log volume and bill.
-  # --timeout 600: SSE streams are capped at 300s in settings, and Cloud Run's
-  # 300s default would cut them at exactly the wrong moment.
-  gcloud run deploy "$SVC_API" --region="$REGION" \
-    --image="$REGISTRY/app:$TAG" --service-account="$RUNTIME_SA" \
-    --ingress=all --allow-unauthenticated --port=8000 \
-    --cpu=1 --memory=1Gi --concurrency=80 --min-instances=1 --max-instances=8 \
-    --timeout=600 \
-    --add-cloudsql-instances="$SQL_CONN" "${VPC_FLAGS[@]}" \
-    --env-vars-file="$env_file" --set-secrets="$(app_secrets)" \
-    --command=uvicorn \
-    --args=stylist_api.main:app,--host,0.0.0.0,--port,8000,--proxy-headers,--forwarded-allow-ips=*,--no-access-log
+image_exists() {
+  gcloud artifacts docker images describe "$REGISTRY/app:$1" >/dev/null 2>&1
+}
 
-  log "worker"
-  # A worker POOL, not a service: arq pulls from Redis and listens on no port,
-  # and a Cloud Run service that never binds one fails its startup probe.
-  local worker_secrets
-  worker_secrets="$(app_secrets)"
-  local worker_env="$env_file.worker"
-  cp "$env_file" "$worker_env"
-  if secret_exists firebase-credentials; then
-    # Mounted as a file, read-only — the same shape as compose's secrets/ mount.
-    worker_secrets+=",/app/secrets/firebase.json=firebase-credentials:latest"
-    yaml_kv FIREBASE_CREDENTIALS_FILE /app/secrets/firebase.json >> "$worker_env"
+cmd_vm() {
+  local host bundle tmp
+  host="$(api_host)"
+  bundle="gs://$DEPLOY_BUCKET/bundle"
+  # `deploy.sh vm` on its own (a config change, say) should not need a
+  # rebuild. When no image exists for the computed TAG, and none was asked
+  # for explicitly, reuse the version the VM is running now.
+  if ! image_exists "$TAG"; then
+    local current
+    current="$(gcloud storage cat "$bundle/app.env" 2>/dev/null | sed -n "s/^TAG='\(.*\)'$/\1/p")"
+    if [ -z "$TAG_GIVEN" ] && [ -n "$current" ] && image_exists "$current"; then
+      echo "no image for $TAG; redeploying the current version $current" >&2
+      TAG="$current"
+    else
+      echo "no image $REGISTRY/app:$TAG — run 'deploy.sh build' first, or set TAG" >&2
+      exit 1
+    fi
   fi
-  if ! gcloud run worker-pools deploy --help >/dev/null 2>&1; then
-    cat >&2 <<'EOF'
-`gcloud run worker-pools` failed to load. On Homebrew installs this is usually
-the missing `grpc` module; give gcloud a Python that has it:
+  tmp="$(mktemp -d)"
+  write_app_env "$host" "$tmp/app.env"
+  cp infra/vm/docker-compose.yml infra/vm/Caddyfile infra/vm/update.sh infra/vm/backup.sh "$tmp/"
 
-  python3 -m venv ~/.gcloud-py && ~/.gcloud-py/bin/pip install grpcio
-  export CLOUDSDK_PYTHON=~/.gcloud-py/bin/python CLOUDSDK_PYTHON_SITEPACKAGES=1
+  log "Uploading the VM bundle ($TAG)"
+  gcloud storage cp "$tmp"/* "$bundle/" --quiet
+  rm -rf "$tmp"
 
-then re-run: infra/gcp/deploy.sh services
-EOF
-    rm -f "$worker_env" "$env_file"
-    return 1
-  fi
-  gcloud run worker-pools deploy "$POOL_WORKER" --region="$REGION" \
-    --image="$REGISTRY/app:$TAG" --service-account="$RUNTIME_SA" \
-    --instances=1 --cpu=1 --memory=2Gi \
-    --add-cloudsql-instances="$SQL_CONN" "${VPC_FLAGS[@]}" \
-    --env-vars-file="$worker_env" --set-secrets="$worker_secrets" \
-    --command=arq --args=stylist_worker.main.WorkerSettings
-  rm -f "$worker_env" "$env_file"
+  log "Updating the VM (pull, migrate, restart)"
+  vm_ssh "mkdir -p /opt/stylist && gcloud storage cp $bundle/update.sh /opt/stylist/update.sh --quiet && bash /opt/stylist/update.sh $bundle"
 
   cat <<EOF
 
 Deployed $TAG.
 
-  API:  $API_URL
-  Check: curl -s $API_URL/health/ready
-  (NOT /readyz: Cloud Run reserves some paths ending in z on public URLs.)
+  API:   https://$host
+  Check: curl -s https://$host/health/ready
+         (the first call can take ~60 s: it wakes the ml service)
 
-Vercel → Settings → Environment Variables:
-  NEXT_PUBLIC_API_BASE=$API_URL
+Vercel → Settings → Environment Variables (then redeploy the frontend):
+  NEXT_PUBLIC_API_BASE=https://$host
 Google OAuth client → Authorized redirect URIs:
-  $API_URL/calendar/callback
+  https://$host/calendar/callback
 EOF
 }
 
+cmd_admin() {
+  [ $# -gt 0 ] || { echo "usage: deploy.sh admin --email you@example.com [--revoke] | --list" >&2; exit 2; }
+  local args=""
+  local a
+  for a in "$@"; do args+=" $(printf %q "$a")"; done
+  log "grant_admin.py$args"
+  vm_ssh "cd /opt/stylist && docker compose exec -T api python scripts/grant_admin.py$args"
+}
+
+cmd_status() { vm_ssh "cd /opt/stylist && docker compose ps --format 'table {{.Service}}\t{{.Status}}'"; }
+
+cmd_logs() {
+  local svc=""
+  [ -n "${1:-}" ] && svc=" $(printf %q "$1")"
+  vm_ssh "cd /opt/stylist && docker compose logs --tail=100$svc"
+}
+
 case "${1:-}" in
-  all)      cmd_build; cmd_migrate; cmd_services ;;
-  build)    cmd_build ;;
-  migrate)  cmd_migrate ;;
-  services) cmd_services ;;
-  models)   cmd_models ;;
-  admin)    shift; cmd_admin "$@" ;;
-  *) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+  all)    cmd_build; cmd_ml; cmd_vm ;;
+  build)  cmd_build ;;
+  ml)     cmd_ml ;;
+  vm)     cmd_vm ;;
+  models) cmd_models ;;
+  admin)  shift; cmd_admin "$@" ;;
+  status) cmd_status ;;
+  logs)   shift; cmd_logs "${1:-}" ;;
+  *) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

@@ -1,60 +1,53 @@
 #!/usr/bin/env bash
-# One-time Google Cloud setup: everything deploy.sh assumes already exists.
+# One-time Google Cloud setup for the budget plan (~$35/month): everything
+# deploy.sh assumes already exists.
 #
 # Safe to re-run. Each step checks for its resource first and skips it if
-# present, so a run that died halfway (a quota error on Cloud SQL, say) is
-# resumed by running it again rather than by cleaning up by hand.
+# present, so a run that died halfway is resumed by running it again.
 #
-# Usage: infra/gcp/bootstrap.sh
-#
-# Takes ~15 minutes on a fresh project; Cloud SQL and Memorystore account for
-# nearly all of it.
+# Usage: infra/gcp/bootstrap.sh          (~5 minutes)
 
 source "$(dirname "$0")/lib.sh"
 
 log "Enabling APIs"
 gcloud services enable \
-  run.googleapis.com sqladmin.googleapis.com redis.googleapis.com \
-  artifactregistry.googleapis.com cloudbuild.googleapis.com \
-  secretmanager.googleapis.com compute.googleapis.com \
-  storage.googleapis.com iam.googleapis.com \
-  cloudresourcemanager.googleapis.com iamcredentials.googleapis.com \
-  sts.googleapis.com logging.googleapis.com
+  compute.googleapis.com run.googleapis.com artifactregistry.googleapis.com \
+  cloudbuild.googleapis.com secretmanager.googleapis.com storage.googleapis.com \
+  iam.googleapis.com cloudresourcemanager.googleapis.com \
+  iamcredentials.googleapis.com sts.googleapis.com logging.googleapis.com
 
 log "Artifact Registry"
 gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" >/dev/null 2>&1 ||
   gcloud artifacts repositories create "$AR_REPO" --repository-format=docker --location="$REGION"
-
-# Newer projects run Cloud Build as the Compute default service account, which
-# is not always granted push rights on a repository created after the fact.
+# Keep the registry from growing forever (each deploy adds ~2 GB of images):
+# delete untagged images and keep the 5 newest versions of each.
+cat > /tmp/stylist-ar-cleanup.json <<'JSON'
+[{"name": "keep-recent", "action": {"type": "Keep"}, "mostRecentVersions": {"keepCount": 5}},
+ {"name": "delete-old", "action": {"type": "Delete"}, "condition": {"olderThan": "1d"}}]
+JSON
+gcloud artifacts repositories set-cleanup-policies "$AR_REPO" --location="$REGION" \
+  --policy=/tmp/stylist-ar-cleanup.json --no-dry-run >/dev/null
+rm -f /tmp/stylist-ar-cleanup.json
+# Newer projects run Cloud Build as the Compute default service account.
 gcloud artifacts repositories add-iam-policy-binding "$AR_REPO" --location="$REGION" \
   --member="serviceAccount:$(project_number)-compute@developer.gserviceaccount.com" \
   --role=roles/artifactregistry.writer >/dev/null
 
 log "Service accounts"
-# stylist-runtime: what every Cloud Run workload runs as.
+# stylist-runtime: the VM and the ml service run as this.
 # stylist-storage: owns ONLY the uploads bucket, and exists to hold the HMAC
-#   key the S3 client signs with. Kept separate so a leaked HMAC key reaches
-#   user uploads and nothing else — not secrets, not the database.
+#   key the S3 client signs with, so a leaked HMAC key reaches user uploads
+#   and nothing else.
 for sa in stylist-runtime stylist-storage; do
   gcloud iam service-accounts describe "$sa@$PROJECT_ID.iam.gserviceaccount.com" >/dev/null 2>&1 ||
     gcloud iam service-accounts create "$sa"
 done
-for role in roles/cloudsql.client roles/secretmanager.secretAccessor \
-            roles/logging.logWriter roles/monitoring.metricWriter; do
+# run.invoker: the VM calls the PRIVATE ml service with this identity's token.
+for role in roles/secretmanager.secretAccessor roles/logging.logWriter \
+            roles/monitoring.metricWriter roles/artifactregistry.reader roles/run.invoker; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member="serviceAccount:$RUNTIME_SA" --role="$role" --condition=None >/dev/null
 done
-
-log "Network: Private Google Access + Cloud NAT"
-# all-traffic VPC egress sends EVERYTHING into the VPC, so without NAT the
-# api could reach Redis but not Gemini, Google OAuth, or the VTON provider.
-gcloud compute networks subnets update default --region="$REGION" --enable-private-ip-google-access
-gcloud compute routers describe stylist-router --region="$REGION" >/dev/null 2>&1 ||
-  gcloud compute routers create stylist-router --network=default --region="$REGION"
-gcloud compute routers nats describe stylist-nat --router=stylist-router --region="$REGION" >/dev/null 2>&1 ||
-  gcloud compute routers nats create stylist-nat --router=stylist-router --region="$REGION" \
-    --auto-allocate-nat-external-ips --nat-all-subnet-ip-ranges
 
 log "Generated secrets"
 for s in jwt-secret db-owner-password db-app-password; do
@@ -62,75 +55,37 @@ for s in jwt-secret db-owner-password db-app-password; do
 done
 secret_exists litellm-master-key || put_secret litellm-master-key "sk-$(random_hex)"
 
-log "Cloud SQL (Postgres 16) — the slow step"
-if ! gcloud sql instances describe "$SQL_INSTANCE" >/dev/null 2>&1; then
-  gcloud sql instances create "$SQL_INSTANCE" \
-    --database-version=POSTGRES_16 --edition=ENTERPRISE --tier="${DB_TIER:-db-custom-1-3840}" \
-    --region="$REGION" --availability-type=ZONAL \
-    --storage-auto-increase --backup-start-time=20:00 --enable-point-in-time-recovery
-fi
-for db in stylist litellm; do
-  gcloud sql databases describe "$db" --instance="$SQL_INSTANCE" >/dev/null 2>&1 ||
-    gcloud sql databases create "$db" --instance="$SQL_INSTANCE"
-done
-# stylist_owner runs migrations and nothing else. gcloud-created users are
-# members of cloudsqlsuperuser, which is what lets 0002 CREATE EXTENSION vector.
-# The app role, stylist_app, is created by migration 0001 and gets its real
-# password from scripts/set_app_role_password.py on every migrate run.
-OWNER_PW="$(read_secret db-owner-password)"
-APP_PW="$(read_secret db-app-password)"
-if gcloud sql users list --instance="$SQL_INSTANCE" --format='value(name)' | grep -qx stylist_owner; then
-  gcloud sql users set-password stylist_owner --instance="$SQL_INSTANCE" --password="$OWNER_PW"
-else
-  gcloud sql users create stylist_owner --instance="$SQL_INSTANCE" --password="$OWNER_PW"
-fi
-# Unix socket via the Cloud SQL connector (--add-cloudsql-instances), so the
-# database needs no private IP and no VPC peering.
-SOCK="/cloudsql/$SQL_CONN"
-put_secret database-url           "postgresql+asyncpg://stylist_app:$APP_PW@/stylist?host=$SOCK"
-put_secret migration-database-url "postgresql://stylist_owner:$OWNER_PW@/stylist?host=$SOCK"
-# Prisma (LiteLLM) wants a placeholder host alongside the socket path.
-put_secret litellm-database-url   "postgresql://stylist_owner:$OWNER_PW@localhost/litellm?host=$SOCK"
-
-log "Memorystore for Redis"
-if ! gcloud redis instances describe "$REDIS_QUEUE" --region="$REGION" >/dev/null 2>&1; then
-  # The queue: noeviction and RDB snapshots. An evicted or lost job is work
-  # that silently never happens.
-  gcloud redis instances create "$REDIS_QUEUE" --region="$REGION" --tier=basic \
-    --size="${REDIS_SIZE_GB:-1}" --redis-version=redis_7_2 --network=default \
-    --redis-config=maxmemory-policy=noeviction \
-    --persistence-mode=rdb --rdb-snapshot-period=1h
-fi
-if ! gcloud redis instances describe "$REDIS_CACHE" --region="$REGION" >/dev/null 2>&1; then
-  gcloud redis instances create "$REDIS_CACHE" --region="$REGION" --tier=basic \
-    --size="${REDIS_SIZE_GB:-1}" --redis-version=redis_7_2 --network=default \
-    --redis-config=maxmemory-policy=allkeys-lru
-fi
-
 log "Cloud Storage buckets"
-for b in "$UPLOAD_BUCKET" "$MODELS_BUCKET"; do
+for b in "$UPLOAD_BUCKET" "$MODELS_BUCKET" "$BACKUP_BUCKET" "$DEPLOY_BUCKET"; do
   gcloud storage buckets describe "gs://$b" >/dev/null 2>&1 ||
     gcloud storage buckets create "gs://$b" --location="$REGION" \
       --uniform-bucket-level-access --public-access-prevention
 done
 # The browser uploads straight to the bucket (presigned POST) and loads images
-# from it (presigned GET), so the bucket — not just the API — must allow the
-# Vercel origin. Missing this presents as "Failed to fetch" on upload.
+# from it (presigned GET), so the bucket itself must allow the Vercel origin.
 cors_file="$(mktemp)"
 origins_json="$(printf '%s' "$WEB_ORIGINS" | tr ',' '\n' | sed 's/^ *//;s/ *$//;/^$/d;s/.*/"&"/' | paste -sd, -)"
-cat > "$cors_file" <<EOF
+cat > "$cors_file" <<JSON
 [{"origin": [$origins_json],
   "method": ["GET", "HEAD", "POST", "PUT"],
   "responseHeader": ["Content-Type", "ETag"],
   "maxAgeSeconds": 3600}]
-EOF
+JSON
 gcloud storage buckets update "gs://$UPLOAD_BUCKET" --cors-file="$cors_file"
 rm -f "$cors_file"
+# Backups older than 30 days are deleted automatically.
+lc_file="$(mktemp)"
+echo '{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 30}}]}' > "$lc_file"
+gcloud storage buckets update "gs://$BACKUP_BUCKET" --lifecycle-file="$lc_file"
+rm -f "$lc_file"
 
 gcloud storage buckets add-iam-policy-binding "gs://$UPLOAD_BUCKET" \
   --member="serviceAccount:$STORAGE_SA" --role=roles/storage.objectAdmin >/dev/null
-# ml reads weights through a read-only FUSE mount; viewer is all it needs.
 gcloud storage buckets add-iam-policy-binding "gs://$MODELS_BUCKET" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/storage.objectViewer >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://$BACKUP_BUCKET" \
+  --member="serviceAccount:$RUNTIME_SA" --role=roles/storage.objectAdmin >/dev/null
+gcloud storage buckets add-iam-policy-binding "gs://$DEPLOY_BUCKET" \
   --member="serviceAccount:$RUNTIME_SA" --role=roles/storage.objectViewer >/dev/null
 
 log "HMAC key for the S3-compatible client"
@@ -141,23 +96,48 @@ if ! secret_exists s3-access-key; then
   put_secret s3-secret-key "$hmac_secret"
 fi
 
+log "Network: static IP + HTTPS firewall rule"
+gcloud compute addresses describe "$VM_IP_NAME" --region="$REGION" >/dev/null 2>&1 ||
+  gcloud compute addresses create "$VM_IP_NAME" --region="$REGION"
+gcloud compute firewall-rules describe stylist-web >/dev/null 2>&1 ||
+  gcloud compute firewall-rules create stylist-web --network=default \
+    --allow=tcp:80,tcp:443,udp:443 --target-tags=stylist-web --source-ranges=0.0.0.0/0
+
+log "Daily disk snapshots (kept 7 days)"
+gcloud compute resource-policies describe stylist-daily --region="$REGION" >/dev/null 2>&1 ||
+  gcloud compute resource-policies create snapshot-schedule stylist-daily --region="$REGION" \
+    --daily-schedule --start-time=21:00 --max-retention-days=7 \
+    --on-source-disk-delete=keep-auto-snapshots
+
+log "VM ($VM_MACHINE in $ZONE)"
+if ! gcloud compute instances describe "$VM_NAME" --zone="$ZONE" >/dev/null 2>&1; then
+  gcloud compute instances create "$VM_NAME" --zone="$ZONE" \
+    --machine-type="$VM_MACHINE" \
+    --image-family=debian-12 --image-project=debian-cloud \
+    --boot-disk-size=30GB --boot-disk-type=pd-balanced \
+    --service-account="$RUNTIME_SA" --scopes=cloud-platform \
+    --address="$(vm_ip)" --tags=stylist-web \
+    --shielded-secure-boot --shielded-vtpm --shielded-integrity-monitoring \
+    --metadata=enable-oslogin=TRUE \
+    --metadata-from-file=startup-script="$REPO_ROOT/infra/vm/vm-setup.sh"
+  gcloud compute disks add-resource-policies "$VM_NAME" --zone="$ZONE" \
+    --resource-policies=stylist-daily
+fi
+
 if [ -n "${GITHUB_REPO:-}" ]; then
   log "GitHub Actions deploy identity (Workload Identity Federation)"
   # GitHub's OIDC token is exchanged for short-lived credentials on
-  # stylist-deployer. There is no JSON key to leak, and the attribute
-  # condition means only $GITHUB_REPO — not any repo on GitHub — can use it.
+  # stylist-deployer: no JSON key exists, and only $GITHUB_REPO can use it.
   gcloud iam service-accounts describe "$DEPLOYER_SA" >/dev/null 2>&1 ||
     gcloud iam service-accounts create stylist-deployer
-  # viewer: the describes deploy.sh runs (redis host, secret existence,
-  # project number). The rest are exactly the writes it makes.
+  # osAdminLogin + instanceAdmin: `gcloud compute ssh` to run update.sh.
   for role in roles/viewer roles/run.admin roles/cloudbuild.builds.editor \
               roles/artifactregistry.writer roles/storage.objectAdmin \
-              roles/serviceusage.serviceUsageConsumer; do
+              roles/serviceusage.serviceUsageConsumer roles/compute.osAdminLogin \
+              roles/compute.instanceAdmin.v1; do
     gcloud projects add-iam-policy-binding "$PROJECT_ID" \
       --member="serviceAccount:$DEPLOYER_SA" --role="$role" --condition=None >/dev/null
   done
-  # actAs: deploy revisions that run as stylist-runtime, and builds that run
-  # as the Compute default account.
   for sa in "$RUNTIME_SA" "$(project_number)-compute@developer.gserviceaccount.com"; do
     gcloud iam service-accounts add-iam-policy-binding "$sa" \
       --member="serviceAccount:$DEPLOYER_SA" --role=roles/iam.serviceAccountUser >/dev/null
@@ -178,7 +158,7 @@ if [ -n "${GITHUB_REPO:-}" ]; then
   cat <<EOF
 
 GitHub → Settings → Environments → create one per deploy target
-(e.g. "production") with these VARIABLES (not secrets — none are sensitive):
+(e.g. "production") with these VARIABLES:
 
   GCP_WIF_PROVIDER = $pool_id/providers/github-oidc
   GCP_DEPLOYER_SA  = $DEPLOYER_SA
@@ -188,24 +168,13 @@ fi
 
 cat <<EOF
 
-Bootstrap complete.
+Bootstrap complete. The VM installs Docker on its first boot (~2 minutes).
 
-Next, add the third-party secrets you use (each is optional; deploy.sh wires
-up only the ones that exist). Paste the value, then press Ctrl-D:
+API address: https://$(api_host)
+  → put this in Vercel as NEXT_PUBLIC_API_BASE
 
-  gcloud secrets create gemini-api-key          --project=$PROJECT_ID --data-file=-
-  gcloud secrets create anthropic-api-key       --project=$PROJECT_ID --data-file=-
-  gcloud secrets create openrouter-api-key      --project=$PROJECT_ID --data-file=-
-  gcloud secrets create groq-api-key            --project=$PROJECT_ID --data-file=-
-  gcloud secrets create vton-api-token          --project=$PROJECT_ID --data-file=-
-  gcloud secrets create google-client-secret    --project=$PROJECT_ID --data-file=-
-  gcloud secrets create google-calendar-api-key --project=$PROJECT_ID --data-file=-
-  gcloud secrets create shop-postback-secret    --project=$PROJECT_ID --data-file=-
-
-Firebase push (a file, not a pasted value):
-
-  gcloud secrets create firebase-credentials --project=$PROJECT_ID \\
-    --data-file=secrets/<your-firebase-adminsdk>.json
+Third-party keys go in Secret Manager (paste the value, then Ctrl-D), e.g.:
+  gcloud secrets create openrouter-api-key --project=$PROJECT_ID --data-file=-
 
 Then: infra/gcp/deploy.sh models && infra/gcp/deploy.sh all
 EOF

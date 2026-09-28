@@ -1,0 +1,157 @@
+# Production stack on ONE Compute Engine VM (the ~$35/month plan).
+#
+# The same services as infra/compose/, minus two:
+#   ml    -> Cloud Run, scaled to zero and private (see infra/gcp/deploy.sh).
+#            Its 4 GB peak would not fit next to everything else on a 4 GB VM,
+#            and it is idle nearly all the time, so pay-per-use is cheaper.
+#   minio -> Cloud Storage via its S3 API (the uploads bucket).
+# plus Caddy in front of the api for automatic HTTPS.
+#
+# Images come from Artifact Registry at ${TAG}; nothing is built here. Every
+# ${VAR} is interpolated from /opt/stylist/.env, which update.sh renders from
+# app.env (non-secret) plus Secret Manager. That file is root-only (0600).
+
+name: stylist
+
+x-app: &app
+  image: ${REGISTRY}/app:${TAG}
+  env_file: .env
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis-queue: { condition: service_healthy }
+    redis-cache: { condition: service_healthy }
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: stylist_owner
+      POSTGRES_PASSWORD: ${DB_OWNER_PASSWORD}
+      POSTGRES_DB: stylist
+    # Sized for a 4 GB box shared with five other containers. 50 connections
+    # covers api (pool 5) + worker (pool 10) + litellm + migrations with room.
+    command: postgres -c shared_buffers=128MB -c max_connections=50
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U stylist_owner -d stylist"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 640m
+
+  # Two instances for the same reason as compose: maxmemory-policy is per
+  # instance, and the queue must never evict a job.
+  redis-queue:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 200mb --maxmemory-policy noeviction
+    volumes:
+      - redisq:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 256m
+
+  redis-cache:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    mem_limit: 192m
+
+  # One-shot jobs, run explicitly by update.sh (the "jobs" profile keeps
+  # `up -d` from re-running them).
+  litellm-db-init:
+    image: pgvector/pgvector:pg16
+    profiles: ["jobs"]
+    environment:
+      PGPASSWORD: ${DB_OWNER_PASSWORD}
+    command: >
+      sh -c "psql -h postgres -U stylist_owner -d stylist -tc
+      \"SELECT 1 FROM pg_database WHERE datname = 'litellm'\" | grep -q 1
+      || psql -h postgres -U stylist_owner -d stylist -c 'CREATE DATABASE litellm'"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  migrate:
+    <<: *app
+    profiles: ["jobs"]
+    restart: "no"
+    command: >
+      sh -c "alembic -c packages/stylist_db/alembic.ini upgrade head
+      && python scripts/set_app_role_password.py"
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  litellm:
+    image: ${REGISTRY}/litellm:${TAG}
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STORE_MODEL_IN_DB: "True"
+    depends_on:
+      postgres: { condition: service_healthy }
+    mem_limit: 1g
+
+  api:
+    <<: *app
+    # Behind Caddy on the compose network, so trust its X-Forwarded-* headers.
+    command: >
+      uvicorn stylist_api.main:app --host 0.0.0.0 --port 8000
+      --proxy-headers --forwarded-allow-ips=* --no-access-log
+    # LIVENESS, not /readyz: readiness probes ml, and ml is scale-to-zero on
+    # Cloud Run. A 3-second readiness check would keep an ml instance awake
+    # around the clock, which is the ~$80/month this plan exists to avoid.
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')\""]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+    mem_limit: 768m
+
+  worker:
+    <<: *app
+    command: arq stylist_worker.main.WorkerSettings
+    volumes:
+      - ./secrets:/app/secrets:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - python -c "import sys,redis; sys.exit(0 if redis.Redis.from_url('redis://redis-queue:6379/0').get('arq:health-check') else 1)"
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    mem_limit: 768m
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    environment:
+      API_HOST: ${API_HOST}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - api
+    mem_limit: 128m
+
+volumes:
+  pgdata:
+  redisq:
+  caddy_data:
+  caddy_config:

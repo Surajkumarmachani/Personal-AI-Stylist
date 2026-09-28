@@ -48,9 +48,11 @@ from fastapi import APIRouter, Response, status
 from sqlalchemy import text
 
 from stylist_api.deps import CacheRedisDep, QueueRedisDep
+from stylist_clients.gcp_identity import auth_headers
 from stylist_db.session import system_session
 
 ML_BASE_URL = os.environ.get("ML_BASE_URL", "http://ml:8000")
+ML_AUTH_AUDIENCE = os.environ.get("ML_AUTH_AUDIENCE") or None
 # Short: this is a probe, not a request path. A slow ml must not make readiness
 # itself time out and take the API out of rotation.
 ML_PROBE_TIMEOUT = 2.0
@@ -106,7 +108,9 @@ async def readyz(
     ml_status: str
     try:
         async with httpx.AsyncClient(timeout=ML_PROBE_TIMEOUT) as ml_client:
-            ml_resp = await ml_client.get(f"{ML_BASE_URL}/health/ready")
+            ml_resp = await ml_client.get(
+                f"{ML_BASE_URL}/health/ready", headers=await auth_headers(ML_AUTH_AUDIENCE)
+            )
         ml_body = ml_resp.json()
         if ml_resp.status_code == 200 and ml_body.get("ready"):
             ml_status = "ok"

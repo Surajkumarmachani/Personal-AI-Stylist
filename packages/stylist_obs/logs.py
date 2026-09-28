@@ -51,5 +51,9 @@ def configure_logging(level: str | int = "INFO") -> None:
     root.setLevel(level)
     for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
         lg = logging.getLogger(name)
+        # `--no-access-log` leaves uvicorn.access with no handlers; giving it
+        # one here would quietly switch access logging back on.
+        if name == "uvicorn.access" and not lg.handlers:
+            continue
         lg.handlers = [handler]
         lg.propagate = False

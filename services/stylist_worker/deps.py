@@ -42,7 +42,8 @@ def get_object_store() -> ObjectStore:
 def get_ml_client() -> MLClient:
     global _ml
     if _ml is None:
-        _ml = MLClient(get_settings().ml_base_url)
+        s = get_settings()
+        _ml = MLClient(s.ml_base_url, auth_audience=s.ml_auth_audience)
     return _ml
 
 

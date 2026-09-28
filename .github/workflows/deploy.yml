@@ -52,8 +52,9 @@ jobs:
       - name: Smoke check
         run: |
           source infra/gcp/lib.sh
-          url="${API_PUBLIC_URL:-$(run_url "$SVC_API")}"
-          for i in $(seq 1 10); do
+          url="https://$(api_host)"
+          # Generous: the first readiness call wakes the scale-to-zero ml service.
+          for i in $(seq 1 20); do
             if curl -fsS "$url/health/ready"; then echo; exit 0; fi
             sleep 6
           done
