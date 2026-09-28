@@ -32,7 +32,14 @@ function price(minor: number | null, currency: string | null): string {
   return `${currency === "INR" ? "₹" : ""}${major.toLocaleString("en-IN")}`;
 }
 
-export default function FillTheGap({ occasion }: { occasion: string }) {
+export default function FillTheGap({
+  occasion,
+  feelsLikeC,
+}: {
+  occasion: string;
+  /** The temperature the outfits above were built for. See `shopGaps`. */
+  feelsLikeC?: number | null;
+}) {
   const [data, setData] = useState<ShopGaps | null>(null);
   // "I bought this" appears only AFTER the user has been sent to the
   // merchant. Offering it beforehand invites a wardrobe full of things nobody
@@ -44,13 +51,13 @@ export default function FillTheGap({ occasion }: { occasion: string }) {
 
   useEffect(() => {
     let live = true;
-    shopGaps(occasion)
+    shopGaps(occasion, feelsLikeC)
       .then((r) => live && setData(r))
       .catch(() => undefined);
     return () => {
       live = false;
     };
-  }, [occasion]);
+  }, [occasion, feelsLikeC]);
 
   // Nothing missing, or nothing we can honestly offer: render NOTHING. An
   // empty "no gaps!" panel is still a shopping panel on a screen that is not
@@ -73,6 +80,7 @@ export default function FillTheGap({ occasion }: { occasion: string }) {
           </h3>
           <p className="ui-sub" style={{ marginBottom: 12 }}>{gap.reason}</p>
 
+          {gap.products.length ? (
           <div className="ui-grid tight">
             {gap.products.map((p) => (
               <a
@@ -107,6 +115,26 @@ export default function FillTheGap({ occasion }: { occasion: string }) {
               </a>
             ))}
           </div>
+          ) : null}
+
+          {/* Always offered: the catalogue covers a sliver of what can be
+              missing, and a gap with nowhere to go was why this panel used
+              to vanish. Plain searches, so no "sponsored" rel and no click
+              is recorded for them. */}
+          {gap.search?.links.length ? (
+            <p className="ui-sub" style={{ marginTop: gap.products.length ? 12 : 0 }}>
+              {gap.products.length ? "More options — search" : "Shop for"}{" "}
+              <strong>{gap.search.query}</strong> on{" "}
+              {gap.search.links.map((l, i) => (
+                <span key={l.store}>
+                  {i > 0 ? (i === gap.search.links.length - 1 ? " or " : ", ") : ""}
+                  <a href={l.url} target="_blank" rel="noopener noreferrer">
+                    {l.store}
+                  </a>
+                </span>
+              ))}
+            </p>
+          ) : null}
 
           {/* The buy-confirmation row sits OUTSIDE the product anchors: a
               button inside an <a> is invalid markup and, worse, a tap meant

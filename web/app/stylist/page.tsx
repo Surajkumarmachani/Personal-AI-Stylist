@@ -64,6 +64,9 @@ export default function StylistPage() {
   // The resolved occasion of the last answer. See `FillTheGap` for why the
   // shop panel is keyed on this and not on the message text.
   const [gapOccasion, setGapOccasion] = useState<string | null>(null);
+  // ...and the temperature it was built for, so the shop panel looks for a
+  // gap under the same weather the reply above it did.
+  const [gapFeelsLike, setGapFeelsLike] = useState<number | null>(null);
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
@@ -108,6 +111,7 @@ export default function StylistPage() {
       const res: ChatReply = await askStylist(message, 6);
       setOutfits(res.outfits);
       setGapOccasion(res.needs_clarification ? null : (res.understood?.occasion ?? null));
+      setGapFeelsLike(res.understood?.feels_like_c ?? null);
       const bits = [res.ranking_source, res.served_from].filter(Boolean) as string[];
       setBubbles((b) => [
         ...b,
@@ -212,7 +216,13 @@ export default function StylistPage() {
 
       {/* Below the looks, and renders nothing unless the wardrobe came up
           short for this occasion — the chat is not a shop front either. */}
-      {gapOccasion ? <FillTheGap key={gapOccasion} occasion={gapOccasion} /> : null}
+      {gapOccasion ? (
+        <FillTheGap
+          key={`${gapOccasion}@${gapFeelsLike}`}
+          occasion={gapOccasion}
+          feelsLikeC={gapFeelsLike}
+        />
+      ) : null}
     </Shell>
   );
 }

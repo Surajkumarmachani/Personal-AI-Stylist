@@ -140,7 +140,10 @@ function ExploreInner() {
           phrase in the input — the gap has to be for the same occasion the
           outfits above were built for, or the two contradict each other. */}
       {res?.understood?.occasion ? (
-        <FillTheGap occasion={res.understood.occasion} />
+        <FillTheGap
+          occasion={res.understood.occasion}
+          feelsLikeC={res.understood.feels_like_c}
+        />
       ) : null}
     </Shell>
   );

@@ -59,6 +59,7 @@ from stylist_shop.own import (
     check_image_url,
     garment_from_product,
 )
+from stylist_shop.search import search_phrase, store_links
 from stylist_suggest import load_wardrobe
 
 logger = logging.getLogger(__name__)
@@ -177,21 +178,31 @@ async def shop_gaps(
             if auto_add:
                 p["url"] = tracked_url(p["url"], str(event_id), settings.shop_subid_param)
 
-        # A GAP WITH NOTHING TO OFFER IS NOT ACTIONABLE.
-        #
-        # `find_gaps` states every route to a base outfit because it cannot
-        # see the catalogue; this is where the catalogue answers. Showing
-        # "no full body — 0 suggestions" next to a route we CAN fill tells
-        # the user about a hole in our stock, not about their wardrobe.
-        if not products:
-            continue
-
+        # EVERY GAP IS ACTIONABLE, catalogue or not. This used to `continue`
+        # past a gap the catalogue had no product for, and since a seeded
+        # catalogue covers a sliver of slot x dress code x weather x
+        # department, the panel was usually absent — the chat said "I
+        # couldn't put together an outfit" and offered nothing. A store
+        # search for exactly what is missing always gives the user somewhere
+        # to go (see stylist_shop/search.py).
+        phrase = search_phrase(
+            gap.slot,
+            gap.dress_code,
+            department=dresses_as if dresses_as in {"women", "men"} else None,
+            warmth_target=gap.warmth_target,
+        )
         results.append(
             {
                 "slot": gap.slot,
                 "severity": gap.severity,
                 "reason": gap.reason,
                 "products": products,
+                "search": {
+                    "query": phrase,
+                    "links": [
+                        {"store": link.store, "url": link.url} for link in store_links(phrase)
+                    ],
+                },
             }
         )
 
@@ -204,7 +215,7 @@ async def shop_gaps(
         # empty list, which is also what an unstocked catalogue looks like.
         # True when gaps EXIST but nothing in the catalogue fills them —
         # distinct from "your wardrobe is fine", which is `gaps == []`.
-        "catalogue_empty": bool(gaps) and not results,
+        "catalogue_empty": bool(gaps) and not any(r["products"] for r in results),
         # True when a purchase through these links is reported back by the
         # merchant and added to the wardrobe without the user saying so. The
         # client still offers "I bought this": reports lag the order by hours.

@@ -592,6 +592,10 @@ export type ShopGap = {
   severity: string;
   reason: string;
   products: ShopProduct[];
+  /** A search for exactly this gap on real stores. Always present, so a gap
+   *  the catalogue cannot fill still leaves the user somewhere to go. Plain
+   *  searches, not affiliate links. */
+  search: { query: string; links: { store: string; url: string }[] };
 };
 
 export type ShopGaps = {
@@ -606,9 +610,15 @@ export type ShopGaps = {
   auto_add: boolean;
 };
 
-export async function shopGaps(occasion: string): Promise<ShopGaps> {
+/** `feelsLikeC` MUST be the temperature the outfits were built for. Omitted,
+ *  the server assumes 26°C, and "it's freezing" then finds no gap at all:
+ *  a wardrobe that cannot dress 12°C dresses 26°C fine, so the panel stayed
+ *  hidden under a reply saying nothing fits. */
+export async function shopGaps(occasion: string, feelsLikeC?: number | null): Promise<ShopGaps> {
+  const params = new URLSearchParams({ occasion });
+  if (feelsLikeC != null) params.set("feels_like_c", String(feelsLikeC));
   return json(
-    await authedFetch(`${API_BASE}/shop/gaps?occasion=${encodeURIComponent(occasion)}`, {
+    await authedFetch(`${API_BASE}/shop/gaps?${params.toString()}`, {
       cache: "no-store",
     }),
   );

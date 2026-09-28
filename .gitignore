@@ -36,3 +36,6 @@ secrets/
 # Per-environment GCP settings for infra/gcp/*.sh (config.env, staging.env…). Not secret, but specific to one
 # person's project; the checked-in template is config.env.example.
 infra/gcp/*.env
+
+# Account-migration export (infra/gcp/migrate-account.sh): real user data.
+.migration/

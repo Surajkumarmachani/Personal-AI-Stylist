@@ -453,3 +453,20 @@ def test_the_advice_is_told_whose_clothes_and_nothing_when_both() -> None:
     assert "Describe: menswear" in build_user_message("the haldi", "festive_ethnic", "", "men")
     for unsaid in ("all", None):
         assert "Describe" not in build_user_message("the haldi", "festive_ethnic", "", unsaid)
+
+
+@pytest.mark.asyncio
+async def test_a_gap_the_catalogue_cannot_fill_still_offers_somewhere_to_shop(
+    api, registered
+) -> None:
+    """The bug: 'it's freezing and I'm going to the office' got "I couldn't put
+    together an outfit" and then NOTHING, because every gap with no catalogue
+    product was dropped. Each gap now carries a store search, and the panel is
+    asked at the SAME temperature the reply was built for."""
+    body = (
+        await api.get("/shop/gaps?occasion=office_casual&feels_like_c=12", headers=registered.auth)
+    ).json()
+    assert body["gaps"], "an empty wardrobe cannot dress the office"
+    for gap in body["gaps"]:
+        assert gap["search"]["query"] and "_" not in gap["search"]["query"]
+        assert [link["store"] for link in gap["search"]["links"]] == ["Myntra", "AJIO", "Amazon"]

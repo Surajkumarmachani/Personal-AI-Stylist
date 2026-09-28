@@ -58,6 +58,7 @@ export default function Home() {
   // what the outfits were built for, not on the words typed. Explore does the
   // same, for the same reason: the two must not disagree about the occasion.
   const [askedOccasion, setAskedOccasion] = useState<string | null>(null);
+  const [askedFeelsLike, setAskedFeelsLike] = useState<number | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
 
   /** Undo one wear, then re-read. Re-reading rather than splicing the item
@@ -146,6 +147,7 @@ export default function Home() {
         setReply(res.reply);
         setAsked(true);
         setAskedOccasion(res.needs_clarification ? null : (res.understood?.occasion ?? null));
+        setAskedFeelsLike(res.understood?.feels_like_c ?? null);
         // The user has now named an occasion, so the calendar provenance no
         // longer describes what is on screen.
         setWhy(null);
@@ -356,7 +358,9 @@ export default function Home() {
       ) : null}
 
       {/* Renders nothing unless the occasion's pool actually came back short. */}
-      {asked && askedOccasion ? <FillTheGap occasion={askedOccasion} /> : null}
+      {asked && askedOccasion ? (
+        <FillTheGap occasion={askedOccasion} feelsLikeC={askedFeelsLike} />
+      ) : null}
     </Shell>
   );
 }
