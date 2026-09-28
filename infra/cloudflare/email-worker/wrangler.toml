@@ -1,0 +1,6 @@
+# Deploy: cd infra/cloudflare/email-worker && npm install && npx wrangler deploy
+# Then:   npx wrangler secret put INBOUND_URL
+#         (value: https://<api host>/inbound/email?key=<inbound-email-secret>)
+name = "stylist-order-emails"
+main = "worker.js"
+compatibility_date = "2026-09-01"

@@ -101,6 +101,56 @@ boot and adds 2 GB of swap.
 - **Outgrowing it**: resize the VM (`VM_MACHINE=e2-standard-2`, ~$55) before
   reaching for managed Postgres or Redis.
 
+## Order emails: auto-add purchases (optional, $0)
+
+Users forward order emails from Myntra, AJIO, Amazon and other stores to a private
+address (`orders-<token>@<INBOUND_EMAIL_DOMAIN>`, shown on their Profile page), and
+each item joins their wardrobe with the store's photo, brand, price and size.
+Shipping and delivery emails for the same order don't add duplicates, and
+returns and cancellations take the item out again.
+
+```
+Store email ──(Gmail filter auto-forwards)──► Cloudflare Email Routing ──► Email Worker
+   ──POST /inbound/email?key=…──► api (stores email) ──outbox──► worker (reads it with
+   the ORDER_EMAIL_MODEL, fetches the photo, adds the garment)
+```
+
+Cloudflare receives the mail for free. SendGrid's inbound parse would also work
+(the webhook accepts the same fields), but it now needs a paid plan of at least
+$19.95/month.
+
+**Needs:** a domain whose DNS is on Cloudflare. It can be a cheap separate domain
+used only for this; the free Cloudflare plan is enough.
+
+1. **Cloudflare → your domain → Email → Email Routing → Enable.** Cloudflare adds its
+   own MX and SPF records.
+2. **Deploy the worker:**
+   ```bash
+   cd infra/cloudflare/email-worker
+   npm install
+   npx wrangler login
+   npx wrangler deploy
+   ```
+3. **Give the worker the webhook URL:** run `npx wrangler secret put INBOUND_URL` and
+   paste `https://<API address>/inbound/email?key=<secret>`. Print the secret with:
+   ```bash
+   gcloud secrets versions access latest --secret=inbound-email-secret --project=<PROJECT_ID>
+   ```
+   (`bootstrap.sh` creates it. Re-run bootstrap if the secret is missing.)
+4. **Email Routing → Routing rules → Catch-all address → Send to a Worker →
+   `stylist-order-emails` → Save.**
+5. Set `INBOUND_EMAIL_DOMAIN=<that domain>` in `config.env`, then run `deploy.sh vm`.
+
+Each user then opens **Profile → Add purchases automatically** and follows the
+Gmail steps there. Gmail's forwarding-confirmation code comes through this same
+path, so it appears on that page for the user to enter in Gmail.
+
+**What gets accepted:** email from known store domains
+(`packages/stylist_shop/order_email.py → KNOWN_STORES`), plus anything the user
+forwards by hand from their own account email. Anything else is logged as
+"ignored" on the Profile page. Raw email bodies are deleted as soon as they've
+been read.
+
 ## Deploying from GitHub (optional)
 
 Set `GITHUB_REPO=owner/name` in `config.env` and re-run `bootstrap.sh`. It

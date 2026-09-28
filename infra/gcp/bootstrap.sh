@@ -50,7 +50,7 @@ for role in roles/secretmanager.secretAccessor roles/logging.logWriter \
 done
 
 log "Generated secrets"
-for s in jwt-secret db-owner-password db-app-password; do
+for s in jwt-secret db-owner-password db-app-password inbound-email-secret; do
   secret_exists "$s" || put_secret "$s" "$(random_hex)"
 done
 secret_exists litellm-master-key || put_secret litellm-master-key "sk-$(random_hex)"

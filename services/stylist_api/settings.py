@@ -132,6 +132,19 @@ class Settings(BaseSettings):
     # refuses every call, so an unconfigured deployment cannot be made to add
     # garments by anyone who guesses the path.
     shop_postback_secret: str = Field(default="")
+    # ---- purchases from forwarded order emails (Phase 15) ----
+    # The domain inbound mail is received for (Cloudflare Email Routing, see
+    # infra/cloudflare/email-worker); each user's address
+    # is orders-<token>@<this>. Empty keeps the feature off: no address is
+    # shown and the webhook is closed.
+    inbound_email_domain: str = Field(default="")
+    # Required on the webhook URL (?key=...). The provider does not sign
+    # inbound mail, so this is what stops anyone posting fake orders.
+    inbound_email_secret: str = Field(default="")
+    # Which gateway model reads an order email. The free OpenRouter tier is
+    # documented as unreliable for structured output (infra/litellm/config.yaml),
+    # so this defaults to the Gemini-backed alias.
+    order_email_model: str = Field(default="vlm-tagger")
     # The query parameter the network reads the sub-id from: `subid` for
     # Cuelinks and Admitad, `aff_sub` for vCommission, `sub1` for others.
     shop_subid_param: str = Field(default="subid")

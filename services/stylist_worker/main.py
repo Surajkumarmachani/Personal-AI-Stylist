@@ -30,6 +30,7 @@ from stylist_worker.erasure import drain_erasures
 from stylist_worker.export import build_export, sweep_expired_exports
 from stylist_worker.notify import hourly_digest
 from stylist_worker.precompute import invalidate_precompute, nightly_precompute
+from stylist_worker.purchases import ingest_order_email
 from stylist_worker.relay import relay_outbox
 from stylist_worker.stages import INGEST_STAGES
 from stylist_worker.state_machine import (
@@ -131,7 +132,14 @@ async def shutdown(ctx: dict[str, Any]) -> None:
 
 
 class WorkerSettings:
-    functions = [ingest_photo, build_export, render_tryon, invalidate_precompute, ping]
+    functions = [
+        ingest_photo,
+        build_export,
+        render_tryon,
+        invalidate_precompute,
+        ingest_order_email,
+        ping,
+    ]
 
     # The relay tick. 1s rather than the plan's 250ms: at 250ms this is 4
     # queries/second/replica against Postgres forever, and the ingest UX

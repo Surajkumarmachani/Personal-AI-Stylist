@@ -21,6 +21,7 @@ import AvatarUpload from "../AvatarUpload";
 import HomeCity from "../HomeCity";
 import DressesAs from "../DressesAs";
 import CalendarConnect from "../CalendarConnect";
+import PurchaseInbox from "../PurchaseInbox";
 import PushNotifications from "../PushNotifications";
 import PrivacyControls from "../PrivacyControls";
 import SignIn from "../SignIn";
@@ -135,6 +136,8 @@ export default function ProfilePage() {
       </div>
 
       <CalendarConnect />
+
+      <PurchaseInbox />
 
       <PushNotifications />
 

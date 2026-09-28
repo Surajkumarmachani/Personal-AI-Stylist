@@ -43,6 +43,7 @@ app_pw="$(secret db-app-password)"
               GOOGLE_CLIENT_SECRET=google-client-secret \
               GOOGLE_CALENDAR_API_KEY=google-calendar-api-key \
               SHOP_POSTBACK_SECRET=shop-postback-secret \
+              INBOUND_EMAIL_SECRET=inbound-email-secret \
               LANGFUSE_PUBLIC_KEY=langfuse-public-key LANGFUSE_SECRET_KEY=langfuse-secret-key; do
     v="$(secret "${pair#*=}")"
     [ -n "$v" ] && echo "${pair%%=*}=$v"

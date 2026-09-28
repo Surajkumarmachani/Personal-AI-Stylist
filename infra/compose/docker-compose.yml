@@ -261,6 +261,9 @@ services:
       # Phase 13 affiliate postback, read from .env. Unset keeps shop links
       # untagged and `/shop/conversions` closed; see catalogue/README.md.
       SHOP_POSTBACK_SECRET: ${SHOP_POSTBACK_SECRET:-}
+      # Phase 15: forwarded order emails. Empty domain keeps the feature off.
+      INBOUND_EMAIL_DOMAIN: ${INBOUND_EMAIL_DOMAIN:-}
+      INBOUND_EMAIL_SECRET: ${INBOUND_EMAIL_SECRET:-}
       SHOP_SUBID_PARAM: ${SHOP_SUBID_PARAM:-subid}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8080/calendar/callback}
       # The GLOBAL calendar: a public holiday feed read with an API key,
@@ -351,6 +354,8 @@ services:
       # The WORKER is what renders, so the pass cap belongs here too.
       # Setting it only on the api service would change nothing at all.
       TRYON_MAX_PASSES: ${TRYON_MAX_PASSES:-2}
+      # Phase 15: which gateway model reads a forwarded order email.
+      ORDER_EMAIL_MODEL: ${ORDER_EMAIL_MODEL:-vlm-tagger}
     command: arq stylist_worker.main.WorkerSettings
     volumes:
       - ../../packages:/app/packages

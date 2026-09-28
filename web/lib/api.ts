@@ -624,6 +624,42 @@ export async function shopGaps(occasion: string, feelsLikeC?: number | null): Pr
   );
 }
 
+export type PurchaseEmail = {
+  id: string;
+  received_at: string;
+  store: string | null;
+  subject: string;
+  /** received | added | nothing_to_add | ignored | gmail_confirmation | failed */
+  status: string;
+  detail: {
+    added?: { garment_id: string; title: string; photo: boolean }[];
+    already_in_wardrobe?: string[];
+    dropped?: string[];
+    retired?: number;
+    reason?: string;
+    error?: string;
+    kind?: string;
+  };
+};
+
+export type PurchaseInbox = {
+  /** False when this server has no inbound mail domain configured. */
+  enabled: boolean;
+  address: string | null;
+  gmail_filter?: string;
+  recent: PurchaseEmail[];
+  /** Present only while Gmail forwarding is still waiting to be confirmed. */
+  gmail_confirmation: { code: string | null; link: string | null } | null;
+};
+
+export async function purchaseInbox(): Promise<PurchaseInbox> {
+  return json(await authedFetch(`${API_BASE}/me/purchase-inbox`, { cache: "no-store" }));
+}
+
+export async function rotatePurchaseInbox(): Promise<{ address: string }> {
+  return json(await authedFetch(`${API_BASE}/me/purchase-inbox/rotate`, { method: "POST" }));
+}
+
 /** Records the click, then the caller opens the url it already has.
  *  Deliberately not a redirect: our server must not sit in the path of an
  *  outbound click, or an outage here becomes a broken link to the merchant. */

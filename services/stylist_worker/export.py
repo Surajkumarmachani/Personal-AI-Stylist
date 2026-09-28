@@ -55,6 +55,9 @@ EXPORT_TABLES = (
     "outfits",
     "device_token",
     "calendar_link",
+    # Phase 15: what each forwarded order email became. The bodies are cleared
+    # once processed, and redacted below in case one is still pending.
+    "purchase_email",
 )
 
 # Columns that must never leave in an export, per table. An export is handed to
@@ -65,6 +68,7 @@ REDACTED = {
     "calendar_link": {"refresh_token"},
     "device_token": {"token"},
     "user_profile": {"litellm_key", "password_hash"},
+    "purchase_email": {"body_html", "body_text"},
 }
 
 EXPORT_PREFIX = "exports"

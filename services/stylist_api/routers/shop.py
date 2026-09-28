@@ -34,7 +34,6 @@ import logging
 import uuid
 from typing import Annotated, Any
 
-import httpx
 from fastapi import APIRouter, HTTPException, Query, status
 from sqlalchemy import text
 
@@ -52,13 +51,7 @@ from stylist_domain.context import resolve_context
 from stylist_domain.taxonomy import load_taxonomy
 from stylist_shop.conversions import normalise_status, tracked_url
 from stylist_shop.gaps import find_gaps
-from stylist_shop.own import (
-    ALLOWED_IMAGE_TYPES,
-    MAX_IMAGE_BYTES,
-    UnsafeImageURL,
-    check_image_url,
-    garment_from_product,
-)
+from stylist_shop.own import UnsafeImageURL, fetch_packshot, garment_from_product
 from stylist_shop.search import search_phrase, store_links
 from stylist_suggest import load_wardrobe
 
@@ -248,43 +241,6 @@ async def record_click(product_id: uuid.UUID, user: CurrentUser, db: TenantDB) -
     return {"url": url, "recorded": True}
 
 
-async def _fetch_packshot(url: str) -> tuple[bytes, str] | None:
-    """Download the merchant's product image, or return None.
-
-    Returns None rather than raising for an image that is merely missing or
-    broken: a garment the user genuinely bought should still be added to their
-    wardrobe when the merchant's CDN is having a bad day. Only an UNSAFE url is
-    an error, because that is a request we must refuse to make at all.
-    """
-    check_image_url(url)  # raises UnsafeImageURL; see stylist_shop.own
-    try:
-        async with (
-            httpx.AsyncClient(
-                timeout=10.0,
-                # A redirect can walk a public hostname to a private one,
-                # which is precisely what check_image_url exists to prevent.
-                follow_redirects=False,
-            ) as client,
-            client.stream("GET", url) as response,
-        ):
-            if response.status_code != 200:
-                return None
-            content_type = response.headers.get("content-type", "").split(";")[0].strip()
-            if content_type not in ALLOWED_IMAGE_TYPES:
-                return None
-            body = bytearray()
-            # Streamed with a running cap. `content-length` is a claim by the
-            # remote server, not a guarantee, so the bound has to be enforced
-            # on the bytes actually received.
-            async for chunk in response.aiter_bytes():
-                body.extend(chunk)
-                if len(body) > MAX_IMAGE_BYTES:
-                    return None
-            return bytes(body), content_type
-    except httpx.HTTPError:
-        return None
-
-
 @router.post("/shop/own/{product_id}", status_code=status.HTTP_201_CREATED)
 async def own_product(
     product_id: uuid.UUID,
@@ -349,7 +305,7 @@ async def _add_to_wardrobe(
     packshot = None
     if image_url:
         try:
-            packshot = await _fetch_packshot(image_url)
+            packshot = await fetch_packshot(image_url)
         except UnsafeImageURL as exc:
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,

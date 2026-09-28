@@ -39,3 +39,7 @@ infra/gcp/*.env
 
 # Account-migration export (infra/gcp/migrate-account.sh): real user data.
 .migration/
+
+# Cloudflare email worker dependencies
+infra/cloudflare/email-worker/node_modules/
+infra/cloudflare/email-worker/.wrangler/

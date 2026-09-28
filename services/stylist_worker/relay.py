@@ -60,6 +60,9 @@ EVENT_HANDLERS: dict[str, str] = {
     # run. A bandit that explores once a day regardless of input is not a
     # bandit.
     "feedback.recorded": "invalidate_precompute",
+    # Phase 15. The webhook only stores the email; reading it is a model call
+    # and a photo fetch, which must never sit inside the provider's request.
+    "purchase_email.received": "ingest_order_email",
 }
 
 
