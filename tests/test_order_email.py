@@ -7,6 +7,7 @@ import json
 from stylist_domain.taxonomy import load_taxonomy
 from stylist_shop.order_email import (
     gmail_confirmation,
+    inbox_address,
     inbox_token,
     parse_extraction,
     purchase_key,
@@ -27,11 +28,31 @@ def test_a_store_is_its_domain_or_a_parent_of_it_never_a_lookalike() -> None:
 
 def test_the_token_is_read_only_from_our_domain() -> None:
     domain = "in.example.com"
-    assert inbox_token(["orders-abcdef123456@in.example.com"], domain) == "abcdef123456"
-    assert inbox_token(["ORDERS-ABCDEF123456@IN.EXAMPLE.COM"], domain) == "abcdef123456"
-    assert inbox_token(["orders-abcdef123456@other.com"], domain) is None
-    assert inbox_token(["orders-short@in.example.com"], domain) is None
-    assert inbox_token(["orders-abcdef123456@in.example.com"], "") is None
+    assert inbox_token(["orders-abcdef123456@in.example.com"], domain=domain) == "abcdef123456"
+    assert inbox_token(["ORDERS-ABCDEF123456@IN.EXAMPLE.COM"], domain=domain) == "abcdef123456"
+    assert inbox_token(["orders-abcdef123456@other.com"], domain=domain) is None
+    assert inbox_token(["orders-short@in.example.com"], domain=domain) is None
+    assert inbox_token(["orders-abcdef123456@in.example.com"]) is None
+
+
+def test_a_gmail_inbox_uses_plus_addressing_and_ignores_dots() -> None:
+    inbox = "your.stylist.orders@gmail.com"
+    assert inbox_address("abcdef123456", gmail_address=inbox) == (
+        "your.stylist.orders+abcdef123456@gmail.com"
+    )
+    for sent_to in (
+        "your.stylist.orders+abcdef123456@gmail.com",
+        "yourstylistorders+abcdef123456@gmail.com",  # Gmail ignores dots
+        "Your.Stylist.Orders+ABCDEF123456@Gmail.com",
+    ):
+        assert inbox_token([sent_to], gmail_address=inbox) == "abcdef123456", sent_to
+    # The bare inbox, someone else's +tag, or another account are not ours.
+    assert inbox_token([inbox], gmail_address=inbox) is None
+    assert inbox_token(["other+abcdef123456@gmail.com"], gmail_address=inbox) is None
+    # The inbox wins over a domain when both are configured.
+    assert inbox_address("t" * 12, domain="in.example.com", gmail_address=inbox).endswith(
+        "@gmail.com"
+    )
 
 
 def test_gmails_forwarding_code_is_found_so_the_user_can_finish_setup() -> None:

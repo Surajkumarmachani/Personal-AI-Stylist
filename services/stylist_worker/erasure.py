@@ -210,15 +210,26 @@ async def _purge_providers(
                 }
             )
 
+    # EVERY Google link: Calendar AND Connect Gmail (provider 'google_gmail')
+    # live in this table. This read one row with scalar_one_or_none(), which
+    # RAISES once a user has two, so connecting Gmail would have made the
+    # account undeletable. Revoking any one token ends Google's whole grant
+    # for this app; each is still sent, and any confirmation counts.
     cal = await db.execute(
-        text("SELECT refresh_token FROM calendar_link WHERE user_id = :u"), {"u": user_id}
+        text(
+            "SELECT refresh_token FROM calendar_link "
+            "WHERE user_id = :u AND refresh_token IS NOT NULL"
+        ),
+        {"u": user_id},
     )
-    token = cal.scalar_one_or_none()
-    if token:
+    tokens = [r[0] for r in cal]
+    if tokens:
         from stylist_clients import google_calendar as gcal
 
-        confirmed = await gcal.revoke(token)
-        counts["calendar_revoked"] = 1
+        confirmed = False
+        for token in tokens:
+            confirmed = await gcal.revoke(token) or confirmed
+        counts["calendar_revoked"] = len(tokens)
         await db.execute(
             text(
                 "UPDATE calendar_link SET refresh_token = NULL, revoked_at = now(), "

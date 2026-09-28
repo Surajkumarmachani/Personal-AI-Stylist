@@ -264,6 +264,7 @@ services:
       # Phase 15: forwarded order emails. Empty domain keeps the feature off.
       INBOUND_EMAIL_DOMAIN: ${INBOUND_EMAIL_DOMAIN:-}
       INBOUND_EMAIL_SECRET: ${INBOUND_EMAIL_SECRET:-}
+      INBOUND_GMAIL_ADDRESS: ${INBOUND_GMAIL_ADDRESS:-}
       SHOP_SUBID_PARAM: ${SHOP_SUBID_PARAM:-subid}
       GOOGLE_REDIRECT_URI: ${GOOGLE_REDIRECT_URI:-http://localhost:8080/calendar/callback}
       # The GLOBAL calendar: a public holiday feed read with an API key,
@@ -356,6 +357,9 @@ services:
       TRYON_MAX_PASSES: ${TRYON_MAX_PASSES:-2}
       # Phase 15: which gateway model reads a forwarded order email.
       ORDER_EMAIL_MODEL: ${ORDER_EMAIL_MODEL:-vlm-tagger}
+      # No-domain mode: the worker polls this Gmail inbox over IMAP.
+      INBOUND_GMAIL_ADDRESS: ${INBOUND_GMAIL_ADDRESS:-}
+      INBOUND_GMAIL_APP_PASSWORD: ${INBOUND_GMAIL_APP_PASSWORD:-}
     command: arq stylist_worker.main.WorkerSettings
     volumes:
       - ../../packages:/app/packages

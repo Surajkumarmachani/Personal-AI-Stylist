@@ -54,10 +54,13 @@ STATE_TTL_SECONDS = 600
 STATE_AUDIENCE = "calendar-oauth"
 
 
-def _issue_state(user_id: uuid.UUID, settings: Any) -> str:
+def _issue_state(user_id: uuid.UUID, settings: Any, *, purpose: str = "calendar") -> str:
+    """`purpose` routes the shared callback: Calendar and Connect Gmail use the
+    same registered redirect URI (see routers/gmail.py)."""
     return jwt.encode(
         {
             "sub": str(user_id),
+            "purpose": purpose,
             "aud": STATE_AUDIENCE,
             "exp": datetime.now(UTC) + timedelta(seconds=STATE_TTL_SECONDS),
         },
@@ -67,6 +70,11 @@ def _issue_state(user_id: uuid.UUID, settings: Any) -> str:
 
 
 def _read_state(state: str, settings: Any) -> uuid.UUID:
+    return _read_claims(state, settings)[0]
+
+
+def _read_claims(state: str, settings: Any) -> tuple[uuid.UUID, str]:
+    """(user id, purpose). A state minted before `purpose` existed is calendar."""
     try:
         payload = jwt.decode(
             state,
@@ -74,7 +82,7 @@ def _read_state(state: str, settings: Any) -> uuid.UUID:
             algorithms=[settings.jwt_algorithm],
             audience=STATE_AUDIENCE,
         )
-        return uuid.UUID(payload["sub"])
+        return uuid.UUID(payload["sub"]), str(payload.get("purpose") or "calendar")
     except Exception as exc:
         # Expired, forged, or for a different audience — all the same answer.
         # Distinguishing them in the response would help an attacker more than
@@ -151,7 +159,12 @@ async def callback(
     if not code or not state:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="missing code or state")
 
-    user_id = _read_state(state, settings)
+    user_id, purpose = _read_claims(state, settings)
+    if purpose == "gmail":
+        # Lazy import: gmail.py imports _issue_state from here.
+        from stylist_api.routers.gmail import finish_connect
+
+        return await finish_connect(user_id, code, settings)
     grant = await gcal.exchange_code(
         code,
         client_id=settings.google_client_id,

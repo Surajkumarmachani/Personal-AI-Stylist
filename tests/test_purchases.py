@@ -256,3 +256,97 @@ async def test_an_order_email_becomes_one_garment_and_a_return_retires_it(
             )
         ).scalar()
     assert bodies == 0
+
+
+# ---------------------------------------------------------------- gmail inbox
+
+GMAIL_INBOX = "your.stylist.orders@gmail.com"
+
+
+@pytest.fixture
+def gmail_inbox(monkeypatch):
+    from stylist_api.settings import get_settings
+
+    monkeypatch.setenv("INBOUND_EMAIL_DOMAIN", "")
+    monkeypatch.setenv("INBOUND_GMAIL_ADDRESS", GMAIL_INBOX)
+    monkeypatch.setenv("INBOUND_GMAIL_APP_PASSWORD", "app-password")
+    get_settings.cache_clear()
+    yield
+    get_settings.cache_clear()
+
+
+def _auto_forwarded(plus_address: str, message_id: str) -> bytes:
+    """What Gmail delivers after a filter forwards a Myntra email: the ORIGINAL
+    headers (To: is still the user), with the +token only in Delivered-To."""
+    return (
+        f"Delivered-To: {plus_address}\r\n"
+        "From: Myntra <updates@mailer.myntra.com>\r\n"
+        "To: shopper@example.com\r\n"
+        "Subject: Your order MYN-9 is confirmed\r\n"
+        f"Message-ID: <{message_id}>\r\n"
+        "MIME-Version: 1.0\r\n"
+        'Content-Type: multipart/alternative; boundary="b"\r\n\r\n'
+        "--b\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nRoadster chinos\r\n"
+        "--b\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+        f'<p>Roadster chinos</p><img src="{PHOTO}" width="300">\r\n'
+        "--b--\r\n"
+    ).encode()
+
+
+def test_the_plus_token_is_read_from_delivered_to_not_to() -> None:
+    from stylist_worker.inbox_poll import fields_from_message
+
+    fields = fields_from_message(
+        _auto_forwarded(f"{GMAIL_INBOX[:-10]}+abcdef123456@gmail.com", "m1")
+    )
+    assert "your.stylist.orders+abcdef123456@gmail.com" in fields["recipients"]
+    assert "shopper@example.com" in fields["recipients"]
+    assert fields["sender_header"] == "Myntra <updates@mailer.myntra.com>"
+    assert PHOTO in (fields["html"] or "") and "Roadster chinos" in (fields["plain"] or "")
+    assert fields["headers"] == "Message-ID: <m1>\n"
+
+
+@pytest.mark.asyncio
+async def test_the_gmail_poller_files_mail_and_marks_only_accepted_mail_seen(
+    api, registered, gmail_inbox, owner_engine, monkeypatch
+) -> None:
+    from stylist_worker import inbox_poll
+
+    body = (await api.get("/me/purchase-inbox", headers=registered.auth)).json()
+    address = body["address"]
+    assert address.startswith("your.stylist.orders+") and address.endswith("@gmail.com")
+
+    message_id = f"poll-{uuid.uuid4()}"
+    inbox = [(b"7", _auto_forwarded(address, message_id)), (b"8", b"not an email at all")]
+    marked: list[bytes] = []
+    monkeypatch.setattr(inbox_poll, "_fetch_unseen", lambda user, password: list(inbox))
+    monkeypatch.setattr(inbox_poll, "_mark_seen", lambda user, password, uids: marked.extend(uids))
+
+    result = await inbox_poll.poll_order_inbox({})
+    assert result["read"] == 2 and result.get("received") == 1, result
+    assert b"7" in marked
+
+    async with owner_engine.begin() as conn:
+        row = (
+            await conn.execute(
+                sa.text("SELECT status, store FROM purchase_email WHERE message_id = :m"),
+                {"m": f"<{message_id}>"},
+            )
+        ).one()
+    assert tuple(row) == ("received", "Myntra")
+
+    # Polled again (say the mark-seen failed): a duplicate, not a second email.
+    assert (await inbox_poll.poll_order_inbox({})).get("duplicate") == 1
+
+
+@pytest.mark.asyncio
+async def test_the_poller_does_nothing_until_configured(monkeypatch) -> None:
+    from stylist_api.settings import get_settings
+    from stylist_worker import inbox_poll
+
+    monkeypatch.setenv("INBOUND_GMAIL_ADDRESS", "")
+    get_settings.cache_clear()
+    try:
+        assert await inbox_poll.poll_order_inbox({}) == {"skipped": "no gmail inbox configured"}
+    finally:
+        get_settings.cache_clear()

@@ -28,6 +28,8 @@ from stylist_db.session import dispose_engine, init_engine, system_session
 from stylist_obs import configure_logging, configure_tracing
 from stylist_worker.erasure import drain_erasures
 from stylist_worker.export import build_export, sweep_expired_exports
+from stylist_worker.gmail_sync import sync_gmail_orders
+from stylist_worker.inbox_poll import poll_order_inbox
 from stylist_worker.notify import hourly_digest
 from stylist_worker.precompute import invalidate_precompute, nightly_precompute
 from stylist_worker.purchases import ingest_order_email
@@ -160,6 +162,11 @@ class WorkerSettings:
         # whole night of rankings built on yesterday's signal — the same
         # ordering trap as "anything that pre-computes for a reader must order
         # by the reader's query, not its own".
+        # Phase 15, no-domain mode: read forwarded order emails from the Gmail
+        # inbox every minute. A no-op unless INBOUND_GMAIL_* are set.
+        cron(poll_order_inbox, second={20}, max_tries=1),
+        # Phase 15, Connect Gmail: pull order emails from each linked inbox.
+        cron(sync_gmail_orders, minute={2, 17, 32, 47}, max_tries=1),
         cron(compute_trends, hour={3}, minute={5}, max_tries=1),
         cron(nightly_precompute, hour={3}, minute={15}, max_tries=1),
         # EVERY HOUR, on purpose. The plan says "07:00 local", and there is no

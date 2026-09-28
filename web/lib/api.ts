@@ -652,6 +652,31 @@ export type PurchaseInbox = {
   gmail_confirmation: { code: string | null; link: string | null } | null;
 };
 
+export type GmailStatus = {
+  /** False when this server has no Google OAuth client configured. */
+  available: boolean;
+  connected: boolean;
+  /** Google stopped honouring the grant (revoked, or a 7-day test token). */
+  reconnect_required: boolean;
+  account_email?: string | null;
+  last_synced_at?: string | null;
+};
+
+export async function gmailStatus(): Promise<GmailStatus> {
+  return json(await authedFetch(`${API_BASE}/gmail/status`, { cache: "no-store" }));
+}
+
+export async function gmailConnectUrl(): Promise<string> {
+  const body = await json<{ authorize_url: string }>(
+    await authedFetch(`${API_BASE}/gmail/connect`, { cache: "no-store" }),
+  );
+  return body.authorize_url;
+}
+
+export async function gmailDisconnect(): Promise<{ disconnected: boolean; note: string | null }> {
+  return json(await authedFetch(`${API_BASE}/gmail`, { method: "DELETE" }));
+}
+
 export async function purchaseInbox(): Promise<PurchaseInbox> {
   return json(await authedFetch(`${API_BASE}/me/purchase-inbox`, { cache: "no-store" }));
 }

@@ -105,6 +105,8 @@ write_app_env() {
     kv SHOP_SUBID_PARAM "${SHOP_SUBID_PARAM:-subid}"
     # Forwarded order emails (Phase 15). Empty keeps the feature off.
     kv INBOUND_EMAIL_DOMAIN "${INBOUND_EMAIL_DOMAIN:-}"
+    # No-domain mode: the Gmail inbox the worker polls (app password is a secret).
+    kv INBOUND_GMAIL_ADDRESS "${INBOUND_GMAIL_ADDRESS:-}"
     kv ORDER_EMAIL_MODEL "${ORDER_EMAIL_MODEL:-vlm-tagger}"
     kv VTON_PROVIDER "${VTON_PROVIDER:-}"
     kv VTON_BASE_URL "${VTON_BASE_URL:-}"

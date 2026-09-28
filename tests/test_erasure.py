@@ -473,3 +473,18 @@ async def test_a_failed_sweep_leaves_the_record_for_the_next_run(populated, monk
             text("SELECT deleted_at FROM export_request WHERE id = :i"), {"i": export_id}
         )
         assert row.scalar_one() is None, "still pending, so the next sweep retries"
+
+
+async def test_an_account_with_calendar_and_gmail_linked_can_still_be_erased(populated) -> None:
+    """Connect Gmail adds a SECOND Google link. The saga read one row with
+    scalar_one_or_none(), which raises on two, so linking Gmail made the account
+    impossible to delete. Every token must be revoked and cleared."""
+    async with tenant_session(populated.id) as db:
+        await db.execute(
+            text(
+                "INSERT INTO calendar_link (id, user_id, provider, refresh_token) "
+                "VALUES (:i, :u, 'google_gmail', 'rt-gmail')"
+            ),
+            {"i": uuid.uuid4(), "u": populated.id},
+        )
+    await _run_full(populated.id)

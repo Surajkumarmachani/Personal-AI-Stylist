@@ -72,7 +72,9 @@ class TokenGrant:
     expires_in: int
 
 
-def authorize_url(*, client_id: str, redirect_uri: str, state: str) -> str:
+def authorize_url(
+    *, client_id: str, redirect_uri: str, state: str, scopes: tuple[str, ...] = SCOPES
+) -> str:
     """The consent URL.
 
     `access_type=offline` + `prompt=consent` because Google returns a refresh
@@ -86,7 +88,7 @@ def authorize_url(*, client_id: str, redirect_uri: str, state: str) -> str:
             "client_id": client_id,
             "redirect_uri": redirect_uri,
             "response_type": "code",
-            "scope": " ".join(SCOPES),
+            "scope": " ".join(scopes),
             "access_type": "offline",
             "prompt": "consent",
             "include_granted_scopes": "true",

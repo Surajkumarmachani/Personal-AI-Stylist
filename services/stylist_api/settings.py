@@ -141,6 +141,12 @@ class Settings(BaseSettings):
     # Required on the webhook URL (?key=...). The provider does not sign
     # inbound mail, so this is what stops anyone posting fake orders.
     inbound_email_secret: str = Field(default="")
+    # NO-DOMAIN MODE: one dedicated Gmail account is the inbox. Users forward to
+    # <local>+<token>@gmail.com; the worker reads it over IMAP with an app
+    # password (stylist_worker/inbox_poll.py). Takes precedence over the domain
+    # for the address shown to users.
+    inbound_gmail_address: str = Field(default="")
+    inbound_gmail_app_password: str = Field(default="")
     # Which gateway model reads an order email. The free OpenRouter tier is
     # documented as unreliable for structured output (infra/litellm/config.yaml),
     # so this defaults to the Gemini-backed alias.

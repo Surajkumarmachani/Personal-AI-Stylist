@@ -92,15 +92,42 @@ def addresses(value: str | None) -> list[str]:
     return [a.lower() for a in _ADDRESS.findall(value or "")]
 
 
-def inbox_token(recipients: list[str], domain: str) -> str | None:
-    """The token from the first orders-<token>@<domain> recipient, if any."""
-    if not domain:
-        return None
-    pattern = re.compile(rf"^orders-([a-z0-9]{{12,32}})@{re.escape(domain.lower())}$")
+def inbox_address(token: str, *, domain: str = "", gmail_address: str = "") -> str | None:
+    """The address a user forwards to. A Gmail inbox wins when both are set.
+
+    Gmail: <inbox>+<token>@gmail.com (plus-addressing delivers every +tag to
+    the one inbox). Own domain: orders-<token>@<domain>.
+    """
+    if gmail_address and "@" in gmail_address:
+        local, host = gmail_address.lower().split("@", 1)
+        return f"{local}+{token}@{host}"
+    if domain:
+        return f"orders-{token}@{domain.lower()}"
+    return None
+
+
+def inbox_token(recipients: list[str], *, domain: str = "", gmail_address: str = "") -> str | None:
+    """The token from the first recipient that is one of our inbox addresses."""
+    patterns = []
+    if gmail_address and "@" in gmail_address:
+        local, host = gmail_address.lower().split("@", 1)
+        # Gmail ignores dots in the local part, so a forward to a dotted or
+        # undotted spelling of the same account is still ours.
+        dotless = re.escape(local.replace(".", ""))
+        patterns.append(re.compile(rf"^{dotless}\+([a-z0-9]{{12,32}})@{re.escape(host)}$"))
+    if domain:
+        patterns.append(re.compile(rf"^orders-([a-z0-9]{{12,32}})@{re.escape(domain.lower())}$"))
     for address in recipients:
-        match = pattern.match(address.lower())
-        if match:
-            return match.group(1)
+        address = address.lower()
+        if "@" in address:
+            local, host = address.split("@", 1)
+            dotless_address = f"{local.replace('.', '')}@{host}"
+        else:
+            dotless_address = address
+        for pattern in patterns:
+            match = pattern.match(address) or pattern.match(dotless_address)
+            if match:
+                return match.group(1)
     return None
 
 

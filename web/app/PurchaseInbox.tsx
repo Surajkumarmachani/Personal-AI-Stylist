@@ -11,6 +11,11 @@
  * the confirmation code TO that address, which is ours. So the code is shown
  * here (polled while the panel is open), or the user could never finish.
  *
+ * TWO WAYS IN, ONE PIPELINE
+ * "Connect Gmail" reads store order emails straight from the user's inbox (one
+ * click, but Google's restricted-scope rules apply; see google_gmail.py).
+ * Forwarding works for anyone with no Google review. Both land in the same log.
+ *
  * THE LOG IS THE POINT
  * Every forwarded email is listed with what became of it, including "ignored"
  * and "failed". A feature that silently does nothing is indistinguishable from
@@ -18,7 +23,12 @@
  */
 
 import { useCallback, useEffect, useState } from "react";
+import { useSearchParams } from "next/navigation";
 import {
+  gmailConnectUrl,
+  gmailDisconnect,
+  gmailStatus,
+  type GmailStatus,
   purchaseInbox,
   rotatePurchaseInbox,
   type PurchaseEmail,
@@ -29,11 +39,14 @@ function outcome(e: PurchaseEmail): string {
   const d = e.detail ?? {};
   switch (e.status) {
     case "added":
-      if (d.retired) return `Removed ${d.retired} returned item${d.retired > 1 ? "s" : ""}`;
+      if (d.retired)
+        return `Removed ${d.retired} returned item${d.retired > 1 ? "s" : ""}`;
       return `Added: ${(d.added ?? []).map((a) => a.title).join(", ")}`;
     case "nothing_to_add":
       if (d.already_in_wardrobe?.length) return "Already in your wardrobe";
-      return d.dropped?.length ? `Skipped: ${d.dropped.join("; ")}` : "No clothing in this email";
+      return d.dropped?.length
+        ? `Skipped: ${d.dropped.join("; ")}`
+        : "No clothing in this email";
     case "ignored":
       return d.reason ?? "Not from a store we read";
     case "gmail_confirmation":
@@ -47,6 +60,9 @@ function outcome(e: PurchaseEmail): string {
 
 export default function PurchaseInbox() {
   const [inbox, setInbox] = useState<Inbox | null>(null);
+  const [gmail, setGmail] = useState<GmailStatus | null>(null);
+  const [gmailNote, setGmailNote] = useState<string | null>(null);
+  const params = useSearchParams();
   const [copied, setCopied] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -54,7 +70,23 @@ export default function PurchaseInbox() {
     purchaseInbox()
       .then(setInbox)
       .catch(() => undefined);
+    gmailStatus()
+      .then(setGmail)
+      .catch(() => undefined);
   }, []);
+
+  // Google sends the user back to /profile?gmail=connected|failed. Derived
+  // from the URL on render, not copied into state by an effect.
+  const returned = params.get("gmail");
+  const returnNote =
+    returned === "connected"
+      ? `Connected${params.get("account") ? ` as ${params.get("account")}` : ""}. Your recent orders appear within 15 minutes.`
+      : returned === "failed"
+        ? params.get("reason") === "gmail_permission_not_granted"
+          ? "Gmail was not connected: the permission to read emails was left unticked."
+          : "Gmail was not connected. Try again."
+        : null;
+  const shownNote = gmailNote ?? returnNote;
 
   useEffect(() => {
     refresh();
@@ -64,7 +96,7 @@ export default function PurchaseInbox() {
     return () => clearInterval(t);
   }, [refresh]);
 
-  if (!inbox) return null;
+  if (!inbox && !gmail) return null;
 
   function copy(value: string, what: string) {
     void navigator.clipboard.writeText(value).then(() => {
@@ -77,17 +109,89 @@ export default function PurchaseInbox() {
     <div className="ui-panel" style={{ marginBottom: 18 }}>
       <h2 className="ui-h3">Add purchases automatically</h2>
 
-      {!inbox.enabled || !inbox.address ? (
-        <p className="ui-sub">Not switched on for this server yet.</p>
+      {gmail?.available ? (
+        <div style={{ marginBottom: 16 }}>
+          <p style={{ margin: "0 0 4px", fontWeight: 600 }}>
+            Option 1: Connect Gmail (easiest)
+          </p>
+          {gmail.connected ? (
+            <>
+              <p className="ui-sub" style={{ marginBottom: 8 }}>
+                Reading order emails from {gmail.account_email ?? "your Gmail"}
+                {gmail.last_synced_at
+                  ? `, last checked ${new Date(gmail.last_synced_at).toLocaleString()}`
+                  : ", first check within 15 minutes"}
+                . Only emails from shops are read.
+              </p>
+              <button
+                className="ui-btn"
+                onClick={() => {
+                  void gmailDisconnect()
+                    .then((r) => setGmailNote(r.note ?? "Gmail disconnected."))
+                    .finally(refresh);
+                }}
+              >
+                Disconnect Gmail
+              </button>
+            </>
+          ) : (
+            <>
+              <p className="ui-sub" style={{ marginBottom: 8 }}>
+                {gmail.reconnect_required
+                  ? "Google stopped the connection. Connect again to keep adding purchases."
+                  : "One click: we look only for order emails from Myntra, AJIO, Amazon and other shops, and never read anything else."}
+              </p>
+              <button
+                className="ui-btn primary"
+                onClick={() => {
+                  void gmailConnectUrl()
+                    .then((url) => {
+                      window.location.assign(url);
+                    })
+                    .catch((e) =>
+                      setGmailNote(e instanceof Error ? e.message : String(e)),
+                    );
+                }}
+              >
+                {gmail.reconnect_required ? "Reconnect Gmail" : "Connect Gmail"}
+              </button>
+            </>
+          )}
+          {shownNote ? (
+            <p className="ui-sub" style={{ marginTop: 8 }}>
+              {shownNote}
+            </p>
+          ) : null}
+        </div>
+      ) : null}
+
+      {inbox?.enabled && inbox.address && gmail?.available ? (
+        <p style={{ margin: "0 0 4px", fontWeight: 600 }}>
+          Option 2: Forward your order emails
+        </p>
+      ) : null}
+
+      {!inbox || !inbox.enabled || !inbox.address ? (
+        gmail?.available ? null : (
+          <p className="ui-sub">Not switched on for this server yet.</p>
+        )
       ) : (
         <>
           <p className="ui-sub" style={{ marginBottom: 12 }}>
-            Forward your order emails from Myntra, AJIO, Amazon, Flipkart and more to your private
-            address, and each item appears in your wardrobe with its photo, brand and price. Returns
-            and cancellations are removed again.
+            Forward your order emails from Myntra, AJIO, Amazon, Flipkart and
+            more to your private address, and each item appears in your wardrobe
+            with its photo, brand and price. Returns and cancellations are
+            removed again.
           </p>
 
-          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <div
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              flexWrap: "wrap",
+            }}
+          >
             <code
               style={{
                 padding: "8px 12px",
@@ -100,7 +204,10 @@ export default function PurchaseInbox() {
             >
               {inbox.address}
             </code>
-            <button className="ui-btn" onClick={() => copy(inbox.address ?? "", "address")}>
+            <button
+              className="ui-btn"
+              onClick={() => copy(inbox.address ?? "", "address")}
+            >
               {copied === "address" ? "Copied" : "Copy"}
             </button>
           </div>
@@ -108,9 +215,15 @@ export default function PurchaseInbox() {
           {inbox.gmail_confirmation ? (
             <div
               className="ui-panel"
-              style={{ marginTop: 14, borderColor: "var(--accent)", background: "var(--bg)" }}
+              style={{
+                marginTop: 14,
+                borderColor: "var(--accent)",
+                background: "var(--bg)",
+              }}
             >
-              <p style={{ margin: 0, fontWeight: 600 }}>Gmail sent a confirmation code</p>
+              <p style={{ margin: 0, fontWeight: 600 }}>
+                Gmail sent a confirmation code
+              </p>
               {inbox.gmail_confirmation.code ? (
                 <p style={{ margin: "6px 0", fontSize: 20, letterSpacing: 2 }}>
                   {inbox.gmail_confirmation.code}
@@ -121,7 +234,11 @@ export default function PurchaseInbox() {
                 {inbox.gmail_confirmation.link ? (
                   <>
                     , or{" "}
-                    <a href={inbox.gmail_confirmation.link} target="_blank" rel="noopener noreferrer">
+                    <a
+                      href={inbox.gmail_confirmation.link}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                    >
                       confirm with this link
                     </a>
                   </>
@@ -135,17 +252,35 @@ export default function PurchaseInbox() {
             <summary className="ui-sub" style={{ cursor: "pointer" }}>
               Set it up in Gmail (2 minutes, once)
             </summary>
-            <ol className="ui-sub" style={{ paddingLeft: 18, marginTop: 8, lineHeight: 1.7 }}>
+            <ol
+              className="ui-sub"
+              style={{ paddingLeft: 18, marginTop: 8, lineHeight: 1.7 }}
+            >
               <li>
-                Gmail → ⚙ <strong>See all settings</strong> → <strong>Forwarding and POP/IMAP</strong>{" "}
-                → <strong>Add a forwarding address</strong> → paste the address above.
+                Gmail → ⚙ <strong>See all settings</strong> →{" "}
+                <strong>Forwarding and POP/IMAP</strong> →{" "}
+                <strong>Add a forwarding address</strong> → paste the address
+                above.
               </li>
-              <li>Gmail sends a confirmation code. It appears on this page; enter it in Gmail.</li>
               <li>
-                Back in Gmail, paste this into the search bar, then click the filter icon →{" "}
-                <strong>Create filter</strong> → <strong>Forward it to</strong> your address:
-                <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 4 }}>
-                  <code style={{ fontSize: 12, wordBreak: "break-all" }}>{inbox.gmail_filter}</code>
+                Gmail sends a confirmation code. It appears on this page; enter
+                it in Gmail.
+              </li>
+              <li>
+                Back in Gmail, paste this into the search bar, then click the
+                filter icon → <strong>Create filter</strong> →{" "}
+                <strong>Forward it to</strong> your address:
+                <div
+                  style={{
+                    display: "flex",
+                    gap: 8,
+                    alignItems: "center",
+                    marginTop: 4,
+                  }}
+                >
+                  <code style={{ fontSize: 12, wordBreak: "break-all" }}>
+                    {inbox.gmail_filter}
+                  </code>
                   <button
                     className="ui-btn"
                     onClick={() => copy(inbox.gmail_filter ?? "", "filter")}
@@ -154,19 +289,29 @@ export default function PurchaseInbox() {
                   </button>
                 </div>
               </li>
-              <li>No Gmail filter? Forwarding any order email to the address by hand works too.</li>
+              <li>
+                No Gmail filter? Forwarding any order email to the address by
+                hand works too.
+              </li>
             </ol>
           </details>
 
           {inbox.recent.length ? (
             <div style={{ marginTop: 14 }}>
-              <p className="ui-sub" style={{ marginBottom: 6, fontWeight: 600 }}>
+              <p
+                className="ui-sub"
+                style={{ marginBottom: 6, fontWeight: 600 }}
+              >
                 Recent emails
               </p>
               {inbox.recent.slice(0, 8).map((e) => (
-                <p key={e.id} className="ui-sub" style={{ margin: "0 0 6px", fontSize: 12.5 }}>
-                  <strong>{e.store ?? "Email"}</strong> · {e.subject || "(no subject)"} —{" "}
-                  {outcome(e)}
+                <p
+                  key={e.id}
+                  className="ui-sub"
+                  style={{ margin: "0 0 6px", fontSize: 12.5 }}
+                >
+                  <strong>{e.store ?? "Email"}</strong> ·{" "}
+                  {e.subject || "(no subject)"} — {outcome(e)}
                 </p>
               ))}
             </div>

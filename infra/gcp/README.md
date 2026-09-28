@@ -103,6 +103,62 @@ boot and adds 2 GB of swap.
 
 ## Order emails: auto-add purchases (optional, $0)
 
+There are three ways in. All of them feed the same pipeline:
+
+| | You need | What the user does |
+|---|---|---|
+| **Connect Gmail** (one click) | the Google OAuth client Calendar already uses | presses "Connect Gmail" |
+| **A. Gmail inbox** (forwarding, no domain) | one dedicated Gmail account | forwards to `yourinbox+<token>@gmail.com` |
+| **B. Your own domain** (forwarding) | a domain on Cloudflare | forwards to `orders-<token>@yourdomain.com` |
+
+### Connect Gmail (reads order emails straight from the user's inbox)
+
+This uses the **same OAuth client and the same redirect URI** (`/calendar/callback`)
+as Calendar, so there's nothing new to register. It needs two switches in the Google
+Cloud project that owns the OAuth client (for you: *My First Project*,
+`eastern-gravity-498407-a0`):
+
+1. **APIs & Services → Library → Gmail API → Enable.**
+2. **Google Auth Platform → Data Access → Add or remove scopes →** tick
+   `.../auth/gmail.readonly` → **Update → Save.**
+3. While the app is in **Testing** (Google Auth Platform → Audience), add each person
+   who will connect under **Test users**, up to 100.
+
+The worker searches each connected inbox every 15 minutes. It only looks for emails
+from known stores with an order-related subject, outside Promotions, and fetches
+nothing else. On the first run it looks back 30 days.
+
+**Google's rules for this permission.** `gmail.readonly` is a *restricted* scope:
+- **In Testing:** it works only for listed test users, and Google expires their
+  connection after **7 days**. The Profile page then shows "Reconnect Gmail".
+- **For the public:** you have to publish the app. That needs Google's verification
+  plus an annual third-party security assessment (CASA), roughly $500–$4,500 a year.
+  Until then, forwarding (A or B below) is the way to open this to everyone.
+
+Disconnecting Gmail while Calendar is connected deletes only the Gmail token. Google
+keeps one grant per app, so revoking it would also disconnect Calendar.
+
+### A. Gmail inbox (no domain needed)
+
+1. Create a Gmail account used **only** for this, e.g. `yourstylist.orders@gmail.com`.
+2. In that account, go to **Google Account → Security**, turn on **2-Step Verification**,
+   then open **App passwords** and create one (name it "stylist"). Copy the
+   16-character password.
+3. Store the app password as a secret. Paste it, then press Ctrl-D:
+   ```bash
+   gcloud secrets create inbound-gmail-app-password --project=<PROJECT_ID> --data-file=-
+   ```
+4. Set `INBOUND_GMAIL_ADDRESS=yourstylist.orders@gmail.com` in `config.env`, then run
+   `infra/gcp/deploy.sh vm`.
+
+The worker checks the inbox every minute over IMAP, and marks each email read once
+it's been handled. Gmail delivers every `+token` address to that one inbox, and the
+token says which user the email belongs to. Gmail's API isn't used, so there's no
+Google verification or security assessment to go through. Keep this account for the
+app alone: anyone with its password can read every user's forwarded orders.
+
+### B. Your own domain (Cloudflare)
+
 Users forward order emails from Myntra, AJIO, Amazon and other stores to a private
 address (`orders-<token>@<INBOUND_EMAIL_DOMAIN>`, shown on their Profile page), and
 each item joins their wardrobe with the store's photo, brand, price and size.
