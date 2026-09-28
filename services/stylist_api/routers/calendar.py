@@ -99,9 +99,10 @@ def _back_to_app(settings: Any, *, connected: bool, **extra: Any) -> RedirectRes
     with — their own, already on screen a moment ago — and no calendar content
     ever appears here.
     """
-    params = {"calendar": "connected" if connected else "failed", **{
-        k: str(v) for k, v in extra.items() if v
-    }}
+    params = {
+        "calendar": "connected" if connected else "failed",
+        **{k: str(v) for k, v in extra.items() if v},
+    }
     query = urllib.parse.urlencode(params)
     return RedirectResponse(
         url=f"{settings.web_base_url.rstrip('/')}/profile?{query}",

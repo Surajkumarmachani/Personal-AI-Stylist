@@ -430,7 +430,7 @@ Apply the same pattern to every state change that must trigger work: feedback �
 | Queue per workload | separate Deployment + HPA per queue | An onboarding burst starving daily suggestions |
 | Per-tenant concurrency | ingest 4, render 1 | One user with 2,000 photos monopolising the pool |
 | Per-provider circuit breaker | 5 failures / 30s → open 60s, half-open probe | A degraded VTON provider consuming all render workers on timeouts |
-| Redis logical separation | db0 queue (AOF, noeviction), db1 cache (LRU) | Cache eviction silently deleting jobs |
+| Redis separation | two instances: queue (persistence, noeviction), cache (LRU). Not db0/db1 on one instance: maxmemory-policy is per instance | Cache eviction silently deleting jobs |
 | Connection pool per service | api 20, workers 10, ml 5 | Worker burst exhausting Postgres connections and taking down the API |
 | Global spend breaker | 2× trailing mean | A retry storm producing a five-figure invoice |
 

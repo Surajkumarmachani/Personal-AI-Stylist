@@ -183,9 +183,7 @@ async def _resolve_weather(
     if feels_like_c is not None:
         return feels_like_c, precip, wind, "user-stated"
 
-    row = await db.execute(
-        text("SELECT home_lat_2dp, home_lon_2dp FROM user_profile LIMIT 1")
-    )
+    row = await db.execute(text("SELECT home_lat_2dp, home_lon_2dp FROM user_profile LIMIT 1"))
     got = row.mappings().one_or_none()
     lat = got["home_lat_2dp"] if got else None
     lon = got["home_lon_2dp"] if got else None
@@ -210,7 +208,6 @@ async def _resolve_weather(
         wind or weather.wind_kmh,
         "forecast-cached" if weather.from_cache else "forecast",
     )
-
 
 
 async def _occasion_from_global_calendar(
@@ -426,9 +423,7 @@ async def get_suggestions(
                 formality_override if formality_override is not None else ctx.formality_target
             ),
             dress_code_target=(
-                dress_code_override
-                if dress_code_override is not None
-                else ctx.dress_code_target
+                dress_code_override if dress_code_override is not None else ctx.dress_code_target
             ),
         )
 
@@ -502,9 +497,9 @@ async def get_suggestions(
                 "outfits": [],
                 "served_from": served_from,
                 "context": _context_payload(ctx, weather_source),
-        "occasion_source": occasion_source,
-        "occasion_reason": occasion_reason,
-        "calendar_events_seen": events_seen,
+                "occasion_source": occasion_source,
+                "occasion_reason": occasion_reason,
+                "calendar_events_seen": events_seen,
                 # WHY it is empty, not just that it is. "No suggestions" with
                 # no reason is the least actionable screen in the product.
                 # Why there is nothing, separate from notes about outfits
@@ -568,9 +563,9 @@ async def get_suggestions(
                 "outfits": [],
                 "served_from": served_from,
                 "context": _context_payload(ctx, weather_source),
-        "occasion_source": occasion_source,
-        "occasion_reason": occasion_reason,
-        "calendar_events_seen": events_seen,
+                "occasion_source": occasion_source,
+                "occasion_reason": occasion_reason,
+                "calendar_events_seen": events_seen,
                 # Why there is nothing, separate from notes about outfits
                 # that are merely incomplete. See `CandidatePool`.
                 "blocking_notes": pool.blocking_notes,

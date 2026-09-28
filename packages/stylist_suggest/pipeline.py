@@ -389,10 +389,7 @@ def _base_structure_note(pool: CandidatePool, ctx: Any) -> str:
     has_any = any(pool.by_slot.get(s) for s in base_slots)
 
     if not has_any:
-        return (
-            f"there's nothing {code} in your wardrobe yet — add a few pieces "
-            f"and I'll style them"
-        )
+        return f"there's nothing {code} in your wardrobe yet — add a few pieces and I'll style them"
 
     # Fewest additions first: with an ethnic top already owned, "add a bottom"
     # beats "add a one-piece", even though both would work.
@@ -401,10 +398,7 @@ def _base_structure_note(pool: CandidatePool, ctx: Any) -> str:
         key=len,
     )
     words = " and ".join(_SLOT_WORDS.get(s, s.replace("_", " ")) for s in missing)
-    return (
-        f"your {code} pieces don't make a full outfit yet — add {words} "
-        f"and I'll put it together"
-    )
+    return f"your {code} pieces don't make a full outfit yet — add {words} and I'll put it together"
 
 
 # The garment attributes a preference fact can name. Kept in sync with
@@ -720,9 +714,7 @@ def suggest(
     # and mixing the two would make `score_breakdown` unexplainable.
     diversity = load_scoring_config().get("diversity") or {}
     penalty = (
-        float(diversity.get("overlap_penalty", 0.0))
-        if diversity.get("enabled", False)
-        else 0.0
+        float(diversity.get("overlap_penalty", 0.0)) if diversity.get("enabled", False) else 0.0
     )
     return SuggestionResult(
         outfits=diversify(scored, limit=limit, overlap_penalty=penalty),

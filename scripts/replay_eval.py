@@ -115,9 +115,7 @@ async def main() -> int:
         wanted = {gid for p in pairs for gid in (*p.preferred, *p.rejected)}
         detail: dict[str, dict[str, Any]] = {}
         if wanted:
-            got = (
-                await conn.execute(GARMENTS_SQL, {"ids": sorted(wanted)})
-            ).mappings().all()
+            got = (await conn.execute(GARMENTS_SQL, {"ids": sorted(wanted)})).mappings().all()
             detail = {r["id"]: dict(r) for r in got}
     await engine.dispose()
 
@@ -148,8 +146,10 @@ async def main() -> int:
     }
     correct, graded = grade(pairs, champion_scores)
     champion = ReplayResult("deterministic", graded, correct, len(events))
-    print(f"\nchampion  {champion.scorer:16} pairs={champion.pairs} "
-          f"correct={champion.correct} accuracy={champion.accuracy:.3f}")
+    print(
+        f"\nchampion  {champion.scorer:16} pairs={champion.pairs} "
+        f"correct={champion.correct} accuracy={champion.accuracy:.3f}"
+    )
 
     if args.style_events:
         challenger_scores = {
@@ -159,8 +159,10 @@ async def main() -> int:
         }
         c_correct, c_graded = grade(pairs, challenger_scores)
         challenger = ReplayResult("personalised", c_graded, c_correct, len(events))
-        print(f"challenger {challenger.scorer:15} pairs={challenger.pairs} "
-              f"correct={challenger.correct} accuracy={challenger.accuracy:.3f}")
+        print(
+            f"challenger {challenger.scorer:15} pairs={challenger.pairs} "
+            f"correct={challenger.correct} accuracy={challenger.accuracy:.3f}"
+        )
         decision = may_promote(champion, challenger)
         print(f"\npromote: {decision.promote}  ({decision.reason})")
         print(f"margin : {decision.margin:+.4f}")

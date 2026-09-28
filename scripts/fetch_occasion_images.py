@@ -132,7 +132,7 @@ def _write_image_map() -> None:
         " * The `.<hash>.` in each filename is a CONTENT HASH. next/image caches",
         " * by source url for four hours, so a photo replaced in place stays",
         " * invisible until that expires. It has to be the FILENAME and not a",
-        " * `?v=` query: next/image answers 400 `\"url\" parameter is not allowed`",
+        ' * `?v=` query: next/image answers 400 `"url" parameter is not allowed`',
         " * for a local path carrying a query string. */",
         "export const OCCASION_IMAGES: Record<string, string> = {",
     ]

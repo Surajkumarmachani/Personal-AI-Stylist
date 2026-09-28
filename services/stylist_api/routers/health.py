@@ -58,11 +58,18 @@ ML_PROBE_TIMEOUT = 2.0
 router = APIRouter(tags=["ops"])
 
 
+# Each probe is served under two paths. Cloud Run's front end reserves "some
+# paths ending with z" (docs: run/docs/known-issues), so /healthz and /readyz
+# can 404 from Google before reaching this process on a *.run.app URL. The
+# /health/* spellings are what anything crossing that front end must use;
+# the z-paths stay for compose healthchecks and in-container probes.
+@router.get("/health/live")
 @router.get("/healthz")
 async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@router.get("/health/ready")
 @router.get("/readyz")
 async def readyz(
     response: Response,
@@ -99,7 +106,7 @@ async def readyz(
     ml_status: str
     try:
         async with httpx.AsyncClient(timeout=ML_PROBE_TIMEOUT) as ml_client:
-            ml_resp = await ml_client.get(f"{ML_BASE_URL}/readyz")
+            ml_resp = await ml_client.get(f"{ML_BASE_URL}/health/ready")
         ml_body = ml_resp.json()
         if ml_resp.status_code == 200 and ml_body.get("ready"):
             ml_status = "ok"

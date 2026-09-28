@@ -120,9 +120,9 @@ def test_a_wardrobe_with_no_footwear_still_produces_an_outfit() -> None:
     ctx = resolve_context(occasion="office_casual", feels_like_c=26.0)
     candidates = generate_candidates(pool, ctx)
     assert candidates, "a shirt and trousers is a wearable outfit"
-    assert all(
-        not any(item.slot == "feet" for item in combo) for combo in candidates
-    ), "there is no footwear to include"
+    assert all(not any(item.slot == "feet" for item in combo) for combo in candidates), (
+        "there is no footwear to include"
+    )
 
 
 def test_footwear_is_included_whenever_the_wardrobe_has_any() -> None:
@@ -141,9 +141,9 @@ def test_footwear_is_included_whenever_the_wardrobe_has_any() -> None:
     ctx = resolve_context(occasion="office_casual", feels_like_c=26.0)
     candidates = generate_candidates(pool, ctx)
     assert candidates
-    assert all(
-        any(item.slot == "feet" for item in combo) for combo in candidates
-    ), "every candidate must be shod when footwear exists"
+    assert all(any(item.slot == "feet" for item in combo) for combo in candidates), (
+        "every candidate must be shod when footwear exists"
+    )
 
 
 def test_ranking_puts_the_best_score_first() -> None:
@@ -209,9 +209,9 @@ async def test_suggestions_explains_an_empty_result(api: AsyncClient, registered
     body = resp.json()
     assert body["outfits"] == []
     assert body["notes"], body
-    assert any(
-        "shoes" in n or "wardrobe" in n or "outfit" in n for n in body["notes"]
-    ), body["notes"]
+    assert any("shoes" in n or "wardrobe" in n or "outfit" in n for n in body["notes"]), body[
+        "notes"
+    ]
     jargon = ("upper_base", "full_body", "base structure", "no wearable feet")
     for note in body["notes"]:
         assert not any(j in note for j in jargon), f"slot ids leaked to the user: {note!r}"
@@ -404,9 +404,10 @@ def test_diversify_is_deterministic() -> None:
         _fake(["d", "e"], 0.80),
     ]
     runs = [
-        [sorted(g.garment_id for g in items) for items, _ in diversify(
-            scored, limit=3, overlap_penalty=0.15
-        )]
+        [
+            sorted(g.garment_id for g in items)
+            for items, _ in diversify(scored, limit=3, overlap_penalty=0.15)
+        ]
         for _ in range(5)
     ]
     assert all(r == runs[0] for r in runs)
@@ -570,9 +571,7 @@ async def test_a_stored_outfit_is_rechecked_against_the_occasions_dress_code(
             },
         )
 
-    resp = await api.get(
-        "/suggestions?occasion=workout&feels_like_c=26", headers=registered.auth
-    )
+    resp = await api.get("/suggestions?occasion=workout&feels_like_c=26", headers=registered.auth)
     assert resp.status_code == 200, resp.text
     body = resp.json()
 

@@ -85,18 +85,22 @@ async def _resolve_api_key(request: Request, key: str) -> ApiClient:
         raise denied
     async with system_session() as session:
         row = (
-            await session.execute(
-                text(
-                    """
+            (
+                await session.execute(
+                    text(
+                        """
                     SELECT k.id AS key_id, k.key_hash, k.last_used_at,
                            c.id AS client_id, c.name, c.rate_limit_per_minute
                     FROM api_key k JOIN api_client c ON c.id = k.client_id
                     WHERE k.prefix = :p AND k.revoked_at IS NULL AND c.disabled_at IS NULL
                     """
-                ),
-                {"p": prefix},
+                    ),
+                    {"p": prefix},
+                )
             )
-        ).mappings().one_or_none()
+            .mappings()
+            .one_or_none()
+        )
         if row is None or not matches(key, row["key_hash"]):
             raise denied
         # At most one write a minute per key: `last_used_at` is for "is this

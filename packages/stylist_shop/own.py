@@ -36,9 +36,7 @@ from urllib.parse import urlparse
 # denial-of-service vector.
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 
-ALLOWED_IMAGE_TYPES = frozenset(
-    {"image/jpeg", "image/png", "image/webp", "image/avif"}
-)
+ALLOWED_IMAGE_TYPES = frozenset({"image/jpeg", "image/png", "image/webp", "image/avif"})
 
 
 class UnsafeImageURL(Exception):  # noqa: N818

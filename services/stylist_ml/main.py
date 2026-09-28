@@ -37,6 +37,7 @@ from fastapi import FastAPI, HTTPException, Request, Response, status
 
 from stylist_ml import embedding, matting, moderation, registry, segmentation
 from stylist_ml.runtime import LoadedModel, ModelUnavailable, load
+from stylist_obs.logs import configure_logging
 
 logger = logging.getLogger(__name__)
 
@@ -115,7 +116,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     unresponsive for the whole load — which an orchestrator reads as a failed
     start and restarts, forever.
     """
-    logging.basicConfig(level=logging.INFO)
+    configure_logging(logging.INFO)
     await asyncio.to_thread(_load_all)
     yield
     _models.clear()
@@ -151,6 +152,9 @@ async def _body(request: Request) -> bytes:
 # --------------------------------------------------------------------- ops
 
 
+# Two paths per probe; see stylist_api/routers/health.py. The api and worker
+# reach this service over its *.run.app URL, where /readyz may be reserved.
+@app.get("/health/live")
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
     """Liveness only — deliberately does NOT check the models.
@@ -162,6 +166,7 @@ async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/health/ready")
 @app.get("/readyz")
 async def readyz(response: Response) -> dict[str, Any]:
     """Ready means every session is BUILT, not that the files exist.

@@ -90,9 +90,7 @@ async def shop_gaps(
     """What is missing for this occasion, and what would fill it."""
     taxonomy = load_taxonomy()
     if occasion not in {o["id"] for o in taxonomy.raw["occasions"]}:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST, detail="unknown occasion"
-        )
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="unknown occasion")
 
     ctx = resolve_context(
         occasion=occasion,
@@ -142,9 +140,7 @@ async def shop_gaps(
             {
                 "slot": gap.slot,
                 "codes": list(
-                    taxonomy.dress_code_compatibility.get(
-                        gap.dress_code or "", [gap.dress_code]
-                    )
+                    taxonomy.dress_code_compatibility.get(gap.dress_code or "", [gap.dress_code])
                 )
                 or [gap.dress_code],
                 "warmth": gap.warmth_target or 3,
@@ -217,9 +213,7 @@ async def shop_gaps(
 
 
 @router.post("/shop/click/{product_id}")
-async def record_click(
-    product_id: uuid.UUID, user: CurrentUser, db: TenantDB
-) -> dict[str, Any]:
+async def record_click(product_id: uuid.UUID, user: CurrentUser, db: TenantDB) -> dict[str, Any]:
     """Attribution. Returns the destination rather than redirecting.
 
     A 302 here would be the conventional affiliate pattern and is worse for
@@ -228,9 +222,7 @@ async def record_click(
     client already has the url from `/shop/gaps`; this only records that the
     click happened.
     """
-    row = await db.execute(
-        text("SELECT url FROM product WHERE id = :id"), {"id": product_id}
-    )
+    row = await db.execute(text("SELECT url FROM product WHERE id = :id"), {"id": product_id})
     url = row.scalar_one_or_none()
     if url is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="unknown product")
@@ -289,7 +281,7 @@ async def own_product(
     db: TenantDB,
     store: ObjectStoreDep,
 ) -> dict[str, Any]:
-    """"I bought this" — add the product to the wardrobe.
+    """ "I bought this" — add the product to the wardrobe.
 
     STILL NEEDED NOW THAT PURCHASES ARE REPORTED
     --------------------------------------------

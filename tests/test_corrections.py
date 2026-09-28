@@ -1,5 +1,3 @@
-
-
 import json
 
 # ------------------------------------------------- brand and size (free text)
@@ -44,7 +42,7 @@ async def test_free_text_is_bounded_even_though_it_is_not_validated(api, registe
 
 
 async def test_blank_clears_rather_than_storing_an_empty_string(api, registered) -> None:
-    """"I was wrong, I don't know the brand" is a legitimate correction.
+    """ "I was wrong, I don't know the brand" is a legitimate correction.
 
     Stored as NULL so the UI has ONE falsy state to render. An empty string
     and a NULL would look identical on screen and different in every query.

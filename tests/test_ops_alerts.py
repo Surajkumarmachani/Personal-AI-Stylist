@@ -33,9 +33,7 @@ def _alert(body: dict, name: str) -> dict:
     return next(a for a in body["alerts"] if a["alert"] == name)
 
 
-async def test_ops_aggregates_see_across_tenants(
-    api: AsyncClient, admin, owner_engine
-) -> None:
+async def test_ops_aggregates_see_across_tenants(api: AsyncClient, admin, owner_engine) -> None:
     """The regression test for the bug that made every alert blind.
 
     A job belonging to a tenant must be counted by the ops aggregate even
@@ -57,9 +55,7 @@ async def test_ops_aggregates_see_across_tenants(
     assert after == before + 1, "the ops aggregate cannot see rows it must count"
 
 
-async def test_dlq_age_fires_when_a_job_is_stuck(
-    api: AsyncClient, admin, owner_engine
-) -> None:
+async def test_dlq_age_fires_when_a_job_is_stuck(api: AsyncClient, admin, owner_engine) -> None:
     async with owner_engine.begin() as conn:
         uid = (await conn.execute(text("SELECT id FROM users LIMIT 1"))).scalar_one()
         await conn.execute(
@@ -96,9 +92,7 @@ async def test_dlq_age_is_quiet_when_nothing_is_stuck(
     assert _alert(body, "dlq_age")["firing"] is False
 
 
-async def test_ingest_success_ignores_in_flight_jobs(
-    api: AsyncClient, admin, owner_engine
-) -> None:
+async def test_ingest_success_ignores_in_flight_jobs(api: AsyncClient, admin, owner_engine) -> None:
     """A burst of queued work must not look like a failure.
 
     Counting unsettled jobs against the rate makes it dip every time traffic
@@ -207,9 +201,7 @@ async def test_the_middleware_actually_counts_requests(api: AsyncClient, admin) 
     assert "2xx" in counts, counts
 
 
-async def test_ops_endpoints_are_not_counted_by_the_middleware(
-    api: AsyncClient, admin
-) -> None:
+async def test_ops_endpoints_are_not_counted_by_the_middleware(api: AsyncClient, admin) -> None:
     """A monitoring loop must not dilute the rate it is measuring."""
     before = (await api.get("/ops/alerts", headers=admin.auth)).json()
     n_before = sum(_alert(before, "api_5xx")["counts"].values())

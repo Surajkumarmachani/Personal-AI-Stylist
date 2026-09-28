@@ -248,9 +248,7 @@ async def test_an_explicit_occasion_is_never_overridden(api, registered) -> None
     assert body["occasion_source"] == "requested"
 
 
-async def test_a_confident_calendar_match_drives_the_occasion(
-    api, registered, monkeypatch
-) -> None:
+async def test_a_confident_calendar_match_drives_the_occasion(api, registered, monkeypatch) -> None:
     """Monkeypatched rather than driven through a live OAuth: the point under
     test is what `/suggestions` does with a classification, not whether Google
     returns one."""
@@ -265,9 +263,7 @@ async def test_a_confident_calendar_match_drives_the_occasion(
             "events_seen": 2,
         }
 
-    monkeypatch.setattr(
-        "stylist_api.routers.calendar.today", fake_today, raising=True
-    )
+    monkeypatch.setattr("stylist_api.routers.calendar.today", fake_today, raising=True)
     assert suggestions_router  # the router under test imports it lazily
 
     resp = await api.get("/suggestions?limit=1", headers=registered.auth)

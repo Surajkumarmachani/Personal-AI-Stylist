@@ -49,7 +49,7 @@ is Kaggle (P100/T4x2, 30 h/week), dropping `vt_model_dc` too (upper-body only),
 or a paid per-render API — NEVER a passthrough.
 """
 
-CELL_1 = r'''
+CELL_1 = r"""
 # ============================ CELL 1 — run the real model ====================
 # Runtime -> Change runtime type -> T4 GPU  BEFORE running this.
 
@@ -103,9 +103,9 @@ print("patched: pose-transfer (SDXL) model skipped, both try-on models kept")
 # THE REAL APP, otherwise unmodified — it downloads its weights and exposes
 # leffa_predict_vt with all nine arguments, then launches with share=True.
 exec(patched)
-'''
+"""
 
-CELL_2 = r'''
+CELL_2 = r"""
 # ==================== CELL 2 — prove it is NOT a passthrough =================
 # Run this in a SECOND cell while cell 1 is still serving.
 # If it says PASSTHROUGH, do not wire the URL up: the model is not running.
@@ -138,7 +138,7 @@ print(f"\nmean pixel difference vs the input photo: {diff:.1f} / 255")
 print("PASSTHROUGH — the model is NOT running" if diff < 2
       else "REAL RENDER — safe to wire up")
 display(result)
-'''
+"""
 
 if __name__ == "__main__":
     print(__doc__)

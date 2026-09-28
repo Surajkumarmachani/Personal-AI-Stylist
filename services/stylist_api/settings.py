@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field, ValidationInfo, field_validator
+from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -109,9 +109,7 @@ class Settings(BaseSettings):
     # `en.usa`, `en.uk` and so on exist for others. A deployment serving one
     # market sets one; serving several needs a per-user country, which this
     # system does not collect yet.
-    google_holiday_calendar_id: str = Field(
-        default="en.indian#holiday@group.v.calendar.google.com"
-    )
+    google_holiday_calendar_id: str = Field(default="en.indian#holiday@group.v.calendar.google.com")
     # Where to send the browser AFTER the OAuth callback. Google redirects to
     # the API, which is not a page anyone should end up looking at — without
     # this the user finishes a consent flow staring at `{"connected": true}`.
@@ -214,6 +212,30 @@ class Settings(BaseSettings):
         if env != "local" and v.startswith("dev-only"):
             raise ValueError("jwt_secret must be set outside the local environment")
         return v
+
+    @model_validator(mode="after")
+    def _reject_local_credentials_outside_local(self) -> Settings:
+        """Refuse to start a deployed service on credentials that are in git.
+
+        jwt_secret has its own validator above; these are the rest of the
+        defaults compose relies on. Each one, left in place by a deploy that
+        forgot a secret, would boot and look healthy: minioadmin simply fails
+        every upload with a 403, and the local app-role password is public.
+        Failing at startup turns "uploads are broken for everyone" into a
+        revision that never takes traffic, which is the cheaper incident.
+        """
+        if self.environment == "local":
+            return self
+        problems = []
+        if self.s3_access_key == "minioadmin" or self.s3_secret_key == "minioadmin":
+            problems.append("S3_ACCESS_KEY/S3_SECRET_KEY are the MinIO defaults")
+        if self.litellm_master_key == "sk-master-local-only":
+            problems.append("LITELLM_MASTER_KEY is the local default")
+        if "_local_only@" in self.database_url:
+            problems.append("DATABASE_URL uses the local-only app-role password")
+        if problems:
+            raise ValueError(f"environment={self.environment!r} but " + "; ".join(problems))
+        return self
 
     @property
     def db_dsn_sync(self) -> str:

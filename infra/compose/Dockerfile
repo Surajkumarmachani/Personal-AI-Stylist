@@ -17,14 +17,17 @@ WORKDIR /app
 # ~200MB). api and worker do not need it to start, and a slimmer image is a
 # faster rollout and a smaller attack surface.
 ARG INSTALL_ML=false
+# Production images (infra/gcp/deploy.sh) pass INSTALL_DEV=false: pytest, ruff
+# and mypy have no business in a deployed container. Defaults to true so the
+# compose stack, which runs tests inside these images, is unchanged.
+ARG INSTALL_DEV=true
 
 COPY pyproject.toml ./
 RUN pip install --upgrade pip \
-    && if [ "$INSTALL_ML" = "true" ]; then \
-         pip install -e ".[dev,ml]"; \
-       else \
-         pip install -e ".[dev]"; \
-       fi
+    && extras="" \
+    && if [ "$INSTALL_DEV" = "true" ]; then extras="dev"; fi \
+    && if [ "$INSTALL_ML" = "true" ]; then extras="${extras:+$extras,}ml"; fi \
+    && pip install -e ".${extras:+[$extras]}"
 
 COPY packages ./packages
 COPY services ./services

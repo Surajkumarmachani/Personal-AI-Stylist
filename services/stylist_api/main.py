@@ -48,7 +48,7 @@ from stylist_clients.litellm_client import LiteLLMClient
 from stylist_clients.redis_client import CacheRedis, QueueRedis
 from stylist_clients.storage import ObjectStore
 from stylist_db.session import dispose_engine, init_engine
-from stylist_obs import configure_tracing
+from stylist_obs import configure_logging, configure_tracing
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +57,7 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     configure_tracing("stylist-api")
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings.log_level)
 
     init_engine(settings.database_url, pool_size=settings.db_pool_size)
     app.state.queue_redis = QueueRedis(settings.redis_queue_url)

@@ -1,0 +1,42 @@
+# Builds the three images deploy.sh rolls out. Run through deploy.sh, which
+# supplies _REPO (the Artifact Registry path) and _TAG (the git SHA).
+steps:
+  - id: app
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -f
+      - infra/compose/Dockerfile
+      - --build-arg=INSTALL_DEV=false
+      - -t
+      - ${_REPO}/app:${_TAG}
+      - .
+  - id: ml
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - infra/compose/Dockerfile
+      - --build-arg=INSTALL_DEV=false
+      - --build-arg=INSTALL_ML=true
+      - -t
+      - ${_REPO}/ml:${_TAG}
+      - .
+  - id: litellm
+    name: gcr.io/cloud-builders/docker
+    waitFor: ["-"]
+    args:
+      - build
+      - -f
+      - infra/gcp/litellm.Dockerfile
+      - -t
+      - ${_REPO}/litellm:${_TAG}
+      - .
+images:
+  - ${_REPO}/app:${_TAG}
+  - ${_REPO}/ml:${_TAG}
+  - ${_REPO}/litellm:${_TAG}
+options:
+  machineType: E2_HIGHCPU_8
+timeout: 1800s

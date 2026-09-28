@@ -424,9 +424,7 @@ async def test_a_custom_name_beats_the_built_in_lexicon(api, registered) -> None
     reply = await api.post("/chat", json={"message": msg}, headers=registered.auth)
     assert reply.json()["understood"]["occasion"] == "party_night"
 
-    gone = await api.delete(
-        f"/me/occasions/{created.json()['id']}", headers=registered.auth
-    )
+    gone = await api.delete(f"/me/occasions/{created.json()['id']}", headers=registered.auth)
     assert gone.status_code == 200
     back = await api.post("/chat", json={"message": msg}, headers=registered.auth)
     assert back.json()["understood"]["occasion"] == "office_party", (

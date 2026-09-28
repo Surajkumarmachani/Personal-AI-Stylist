@@ -39,9 +39,7 @@ async def get_dresses_as(user: CurrentUser, db: TenantDB) -> dict[str, Any]:
 
 
 @router.put("/me/dresses-as")
-async def set_dresses_as(
-    body: DressesAsRequest, user: CurrentUser, db: TenantDB
-) -> dict[str, Any]:
+async def set_dresses_as(body: DressesAsRequest, user: CurrentUser, db: TenantDB) -> dict[str, Any]:
     await db.execute(
         text("UPDATE user_profile SET dresses_as = :v, updated_at = now()"),
         {"v": body.dresses_as},

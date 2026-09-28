@@ -395,9 +395,7 @@ async def test_the_daily_quota_counts_only_this_tenants_renders(
                 {"u": ids[second_tenant.email]},
             )
 
-        theirs = (
-            await conn.execute(quota_sql, {"uid": ids[second_tenant.email]})
-        ).scalar_one()
+        theirs = (await conn.execute(quota_sql, {"uid": ids[second_tenant.email]})).scalar_one()
         mine = (await conn.execute(quota_sql, {"uid": ids[registered.email]})).scalar_one()
 
         # The predicate the endpoint USED to run: no tenant filter at all.
@@ -418,9 +416,7 @@ async def test_the_daily_quota_counts_only_this_tenants_renders(
     )
 
 
-async def test_a_failed_render_is_reported_not_re_queued(
-    api, registered, owner_engine
-) -> None:
+async def test_a_failed_render_is_reported_not_re_queued(api, registered, owner_engine) -> None:
     """A failure and a job still in flight both leave NO object in storage, so
     this endpoint answered "queued" for both.
 
@@ -474,6 +470,5 @@ async def test_a_failed_render_is_reported_not_re_queued(
     # This is the predicate the endpoint runs. Before the fix there was no
     # such lookup at all, so the reason could never reach the response.
     assert current == "no Gradio API", (
-        "the worker's reason must be readable by the API, or the card can only "
-        "ever say 'queued'"
+        "the worker's reason must be readable by the API, or the card can only ever say 'queued'"
     )

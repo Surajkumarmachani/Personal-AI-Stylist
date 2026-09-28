@@ -44,6 +44,18 @@ async def test_readyz_reports_each_dependency(api: AsyncClient) -> None:
     assert body["checks"]["postgres"] == "ok"
 
 
+async def test_health_aliases_match_the_z_paths(api: AsyncClient) -> None:
+    """Cloud Run's front end reserves some paths ending in `z`, so anything
+    probing through a *.run.app URL uses /health/*. They must stay identical to
+    the z-paths, or production monitoring and local compose disagree."""
+    live = await api.get("/health/live")
+    assert live.status_code == 200
+    assert live.json() == (await api.get("/healthz")).json()
+    ready = await api.get("/health/ready")
+    assert ready.status_code == 200, ready.text
+    assert ready.json()["checks"] == (await api.get("/readyz")).json()["checks"]
+
+
 async def test_register_then_authenticated_request(api: AsyncClient) -> None:
     _email, token = await _register(api)
     resp = await api.get("/garments", headers={"Authorization": f"Bearer {token}"})

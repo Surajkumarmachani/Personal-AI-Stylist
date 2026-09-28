@@ -1,0 +1,24 @@
+# What `gcloud builds submit` must NOT upload. Explicit rather than inherited
+# from .gitignore: credentials and 1GB of weights leaving the machine because
+# of a missing line is not a failure mode worth leaving to a fallback.
+.gcloudignore
+.git/
+.github/
+.env
+.env.*
+secrets/
+*service-account*.json
+*adminsdk*.json
+*-firebase-*.json
+infra/gcp/*.env
+models/
+.venv/
+venv/
+web/
+eval/golden/images/
+**/__pycache__/
+*.pyc
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/

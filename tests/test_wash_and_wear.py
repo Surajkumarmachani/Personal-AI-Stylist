@@ -88,9 +88,7 @@ async def test_a_garment_in_the_wash_is_not_suggested_from_stored_outfits(
 
 
 @pytest.mark.asyncio
-async def test_a_garment_worn_today_is_not_suggested_from_stored_outfits(
-    api, owner_engine
-) -> None:
+async def test_a_garment_worn_today_is_not_suggested_from_stored_outfits(api, owner_engine) -> None:
     auth, ids = await _tenant(api, owner_engine)
     first, _ = await _suggested(api, auth)
     assert str(ids["jeans_a"]) in first, "precondition: the jeans were being suggested"

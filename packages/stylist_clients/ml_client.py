@@ -173,9 +173,7 @@ class MLClient:
         """
         try:
             async with httpx.AsyncClient(timeout=self._timeout(SEGMENT_TIMEOUT)) as client:
-                resp = await client.post(
-                    f"{self._base_url}/head-mask", content=image_bytes
-                )
+                resp = await client.post(f"{self._base_url}/head-mask", content=image_bytes)
         except Exception as exc:
             _raise_if_unavailable(exc)
             raise
@@ -275,7 +273,7 @@ class MLClient:
 
     async def readyz(self) -> dict[str, object]:
         async with httpx.AsyncClient(timeout=self._timeout(5.0)) as client:
-            resp = await client.get(f"{self._base_url}/readyz")
+            resp = await client.get(f"{self._base_url}/health/ready")
         return dict(resp.json())
 
     async def models(self) -> dict[str, object]:

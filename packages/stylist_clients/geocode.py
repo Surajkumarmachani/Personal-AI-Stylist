@@ -66,7 +66,7 @@ def _round(value: float) -> float:
 
 
 def _label(hit: dict[str, object]) -> str:
-    """"Patna, Bihar, India" — enough to tell two same-named cities apart.
+    """ "Patna, Bihar, India" — enough to tell two same-named cities apart.
 
     There are Hyderabads in India and Pakistan and a dozen Springfields. Echoing
     only the name the user typed would let them confirm a city they did not

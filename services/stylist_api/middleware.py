@@ -67,7 +67,7 @@ class RequestOutcomeMiddleware(BaseHTTPMiddleware):
     async def _record(self, request: Request, status_code: int) -> None:
         # /ops/alerts reads these counters; counting its own requests would let
         # a monitoring loop dilute the very rate it is measuring.
-        if request.url.path.startswith(("/ops/", "/healthz", "/readyz")):
+        if request.url.path.startswith(("/ops/", "/healthz", "/readyz", "/health/")):
             return
         cache = getattr(request.app.state, "cache_redis", None)
         if cache is None:

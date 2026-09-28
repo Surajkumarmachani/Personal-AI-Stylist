@@ -104,9 +104,7 @@ async def main() -> int:
             key = f"cutouts/{user_id}/{garment_id}.png"
             store.put_bytes(key, r.content, content_type=content_type)
             await conn.execute(
-                sa.text(
-                    "UPDATE garments SET cutout_key = :k, updated_at = now() WHERE id = :i"
-                ),
+                sa.text("UPDATE garments SET cutout_key = :k, updated_at = now() WHERE id = :i"),
                 {"k": key, "i": garment_id},
             )
             print(f"  {title:28} filled ({len(r.content)} bytes)")

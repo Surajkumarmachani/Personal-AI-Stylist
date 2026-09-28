@@ -79,6 +79,10 @@ filterwarnings = ["error::DeprecationWarning:stylist_.*"]
 line-length = 100
 target-version = "py312"
 src = ["packages", "services", "tests"]
+# Notebooks are Kaggle/Colab scratch (scripts/leffa_kaggle.ipynb): `!` shell
+# magics and one-cell imports that no lint rule can pass. Ruff lints .ipynb by
+# default, so without this CI's lint step failed on a file that never ships.
+extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]

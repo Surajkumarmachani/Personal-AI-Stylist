@@ -79,22 +79,24 @@ async def test_the_catalogue_is_public_and_events_are_not(owner_engine) -> None:
 
     async with owner_engine.begin() as conn:
         product_cols = (
-            await conn.execute(
-                sa.text(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'product'"
+            (
+                await conn.execute(
+                    sa.text(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_name = 'product'"
+                    )
                 )
             )
-        ).scalars().all()
+            .scalars()
+            .all()
+        )
         assert "user_id" not in product_cols, (
             "a user_id on the catalogue would make every product row personal data"
         )
 
         forced = (
             await conn.execute(
-                sa.text(
-                    "SELECT relforcerowsecurity FROM pg_class WHERE relname = :t"
-                ),
+                sa.text("SELECT relforcerowsecurity FROM pg_class WHERE relname = :t"),
                 {"t": "product_event"},
             )
         ).scalar_one()
@@ -111,6 +113,7 @@ async def test_the_catalogue_is_public_and_events_are_not(owner_engine) -> None:
 
 
 # --------------------------------------------------------------- owning one
+
 
 def _addr(ip: str):
     """One getaddrinfo result, shaped as the stdlib returns it."""
@@ -207,8 +210,7 @@ async def test_a_garment_can_only_be_owned_once_per_product(owner_engine) -> Non
         idx = (
             await conn.execute(
                 sa.text(
-                    "SELECT indexdef FROM pg_indexes "
-                    "WHERE indexname = 'uq_garment_one_per_product'"
+                    "SELECT indexdef FROM pg_indexes WHERE indexname = 'uq_garment_one_per_product'"
                 )
             )
         ).scalar_one()
@@ -274,9 +276,7 @@ async def test_a_reported_purchase_joins_the_wardrobe_once_and_leaves_on_return(
             {"id": product_id, "ext": str(product_id)},
         )
     try:
-        body = (
-            await api.get("/shop/gaps?occasion=casual_outing", headers=registered.auth)
-        ).json()
+        body = (await api.get("/shop/gaps?occasion=casual_outing", headers=registered.auth)).json()
         assert body["auto_add"] is True
         shown = [p for g in body["gaps"] for p in g["products"] if p["id"] == str(product_id)]
         assert shown, body
@@ -413,9 +413,7 @@ async def test_the_gap_filler_offers_only_the_users_line_plus_unisex(
             )
 
     async def offered() -> set[str]:
-        body = (
-            await api.get("/shop/gaps?occasion=casual_outing", headers=registered.auth)
-        ).json()
+        body = (await api.get("/shop/gaps?occasion=casual_outing", headers=registered.auth)).json()
         seen = {p["id"] for g in body["gaps"] for p in g["products"]}
         return {g for g, pid in ids.items() if str(pid) in seen}
 

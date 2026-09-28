@@ -187,9 +187,7 @@ async def list_garments(
             ),
             {"ids": [str(g.id) for g in garments]},
         )
-        by_id = {
-            str(r["garment_id"]): (int(r["n"] or 0), r["last_worn"]) for r in wears.mappings()
-        }
+        by_id = {str(r["garment_id"]): (int(r["n"] or 0), r["last_worn"]) for r in wears.mappings()}
 
     return [
         GarmentSummary(

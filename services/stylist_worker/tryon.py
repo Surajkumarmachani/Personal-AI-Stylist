@@ -102,7 +102,6 @@ def _looks_unchanged(before: bytes, after: bytes) -> bool:
     return bool((total / len(pixels_a)) < PASSTHROUGH_MAX_DIFF)
 
 
-
 async def _record_failure(uid: uuid.UUID, garment_set_hash: str, reason: str) -> None:
     """Write the failure where the API can SEE it.
 
@@ -133,7 +132,6 @@ async def _record_failure(uid: uuid.UUID, garment_set_hash: str, reason: str) ->
         )
 
 
-
 async def _record_render(
     uid: uuid.UUID, garment_set_hash: str, rendered: list[str], skipped: list[str]
 ) -> None:
@@ -156,7 +154,6 @@ async def _record_render(
                 ),
             },
         )
-
 
 
 async def _restore_head(original: bytes, rendered: bytes) -> bytes:

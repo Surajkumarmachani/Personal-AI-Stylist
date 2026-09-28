@@ -1,0 +1,73 @@
+name: Deploy
+
+# Manual only. Every push to main already runs CI; shipping is a separate,
+# deliberate act, because migrations run as part of it and a schema change is
+# not something to trigger by merging a README fix.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment to deploy (holds that project's variables)
+        type: environment
+        required: true
+        default: production
+
+# One deploy per environment at a time. Two overlapping runs would race the
+# migrate job and interleave revisions of different commits.
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # the GitHub OIDC token exchanged via Workload Identity Federation
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Refuse to deploy a commit CI has not passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          conclusion=$(gh api "repos/${{ github.repository }}/actions/workflows/ci.yml/runs?head_sha=${{ github.sha }}&status=completed" \
+            --jq '.workflow_runs[0].conclusion // "none"')
+          if [ "$conclusion" != "success" ]; then
+            echo "::error::CI for ${{ github.sha }} is '$conclusion', not 'success'. Wait for CI or fix it first."
+            exit 1
+          fi
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      # `gcloud run worker-pools` needs grpc, which the SDK does not bundle.
+      - name: Give gcloud grpc
+        run: |
+          python3 -m pip install --quiet grpcio
+          echo "CLOUDSDK_PYTHON_SITEPACKAGES=1" >> "$GITHUB_ENV"
+
+      - name: Write deploy config
+        env:
+          GCP_CONFIG_ENV: ${{ vars.GCP_CONFIG_ENV }}
+        run: printf '%s\n' "$GCP_CONFIG_ENV" > infra/gcp/config.env
+
+      - name: Build, migrate, deploy
+        run: infra/gcp/deploy.sh all
+
+      - name: Smoke check
+        run: |
+          source infra/gcp/lib.sh
+          url="${API_PUBLIC_URL:-$(run_url "$SVC_API")}"
+          for i in $(seq 1 10); do
+            if curl -fsS "$url/health/ready"; then echo; exit 0; fi
+            sleep 6
+          done
+          echo "::error::$url/health/ready did not report ready"
+          exit 1

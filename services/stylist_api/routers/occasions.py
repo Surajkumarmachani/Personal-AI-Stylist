@@ -141,9 +141,7 @@ async def create_custom(
 
 
 @router.delete("/me/occasions/{occasion_id}")
-async def delete_custom(
-    occasion_id: uuid.UUID, user: CurrentUser, db: TenantDB
-) -> dict[str, Any]:
+async def delete_custom(occasion_id: uuid.UUID, user: CurrentUser, db: TenantDB) -> dict[str, Any]:
     # No user_id predicate: RLS scopes it, so another tenant's id is a 404
     # rather than a 403 and we do not confirm that the id exists.
     result = await db.execute(

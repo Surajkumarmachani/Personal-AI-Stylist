@@ -61,9 +61,7 @@ async def test_a_key_only_reaches_its_own_partners_users(api, admin, registered)
     for key in (key_a, key_b):
         await api.post("/partner/users", json={"external_id": "same_id"}, headers=_as(key))
 
-    await api.put(
-        "/me/dresses-as", json={"dresses_as": "women"}, headers=_as(key_a, "same_id")
-    )
+    await api.put("/me/dresses-as", json={"dresses_as": "women"}, headers=_as(key_a, "same_id"))
     # Partner B's "same_id" is a different person.
     b = (await api.get("/me/dresses-as", headers=_as(key_b, "same_id"))).json()
     assert b["dresses_as"] is None

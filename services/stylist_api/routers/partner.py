@@ -73,22 +73,31 @@ async def list_clients(admin: CurrentAdmin) -> dict[str, Any]:
     """Every client and its keys — prefixes only, never a secret or a hash."""
     async with system_session() as db:
         clients = (
-            await db.execute(
-                text(
-                    "SELECT c.id, c.name, c.rate_limit_per_minute, c.created_at, c.disabled_at, "
-                    "(SELECT count(*) FROM users u WHERE u.api_client_id = c.id) AS users "
-                    "FROM api_client c ORDER BY c.created_at"
+            (
+                await db.execute(
+                    text(
+                        "SELECT c.id, c.name, c.rate_limit_per_minute, "
+                        "c.created_at, c.disabled_at, "
+                        "(SELECT count(*) FROM users u WHERE u.api_client_id = c.id) AS users "
+                        "FROM api_client c ORDER BY c.created_at"
+                    )
                 )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
         keys = (
-            await db.execute(
-                text(
-                    "SELECT id, client_id, prefix, label, created_at, last_used_at, revoked_at "
-                    "FROM api_key ORDER BY created_at"
+            (
+                await db.execute(
+                    text(
+                        "SELECT id, client_id, prefix, label, created_at, last_used_at, revoked_at "
+                        "FROM api_key ORDER BY created_at"
+                    )
                 )
             )
-        ).mappings().all()
+            .mappings()
+            .all()
+        )
 
     def iso(v: Any) -> str | None:
         return v.isoformat() if v else None

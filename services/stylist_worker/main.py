@@ -25,7 +25,7 @@ from sqlalchemy import text
 
 from stylist_api.settings import get_settings
 from stylist_db.session import dispose_engine, init_engine, system_session
-from stylist_obs import configure_tracing
+from stylist_obs import configure_logging, configure_tracing
 from stylist_worker.erasure import drain_erasures
 from stylist_worker.export import build_export, sweep_expired_exports
 from stylist_worker.notify import hourly_digest
@@ -120,7 +120,7 @@ async def ping(ctx: dict[str, Any]) -> dict[str, str]:
 async def startup(ctx: dict[str, Any]) -> None:
     configure_tracing("stylist-worker")
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level)
+    configure_logging(settings.log_level)
     # PROVISIONAL — re-dated 2026-09-17; see stylist_api.settings for the ratio.
     init_engine(settings.database_url, pool_size=10)
     logger.info("worker started, environment=%s", settings.environment)

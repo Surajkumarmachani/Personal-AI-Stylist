@@ -118,7 +118,5 @@ async def clear_avatar(user: CurrentUser, db: TenantDB) -> dict[str, Any]:
     version in a versioned bucket — doing a fraction of that here would make
     the strong guarantee harder to reason about, not easier.
     """
-    await db.execute(
-        text("UPDATE user_profile SET avatar_key = NULL, updated_at = now()")
-    )
+    await db.execute(text("UPDATE user_profile SET avatar_key = NULL, updated_at = now()"))
     return {"avatar_url": None, "cleared": True}
