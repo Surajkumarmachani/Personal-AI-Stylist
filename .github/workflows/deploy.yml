@@ -40,23 +40,11 @@ jobs:
             exit 1
           fi
 
-      - uses: google-github-actions/auth@v2
+      - uses: ./.github/actions/gcp
         with:
-          workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          wif_provider: ${{ vars.GCP_WIF_PROVIDER }}
           service_account: ${{ vars.GCP_DEPLOYER_SA }}
-
-      - uses: google-github-actions/setup-gcloud@v2
-
-      # `gcloud run worker-pools` needs grpc, which the SDK does not bundle.
-      - name: Give gcloud grpc
-        run: |
-          python3 -m pip install --quiet grpcio
-          echo "CLOUDSDK_PYTHON_SITEPACKAGES=1" >> "$GITHUB_ENV"
-
-      - name: Write deploy config
-        env:
-          GCP_CONFIG_ENV: ${{ vars.GCP_CONFIG_ENV }}
-        run: printf '%s\n' "$GCP_CONFIG_ENV" > infra/gcp/config.env
+          config_env: ${{ vars.GCP_CONFIG_ENV }}
 
       - name: Build, migrate, deploy
         run: infra/gcp/deploy.sh all

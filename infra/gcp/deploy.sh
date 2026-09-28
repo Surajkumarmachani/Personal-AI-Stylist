@@ -155,14 +155,24 @@ cmd_admin() {
   local args="scripts/grant_admin.py"
   local a
   for a in "$@"; do args+=",$a"; done
-  log "grant_admin.py $*"
+  # The image the api is RUNNING, not $TAG: the current commit may never have
+  # been built, and the grant must match the schema that is actually live.
+  local image
+  image="$(gcloud run services describe "$SVC_API" --region="$REGION" \
+    --format='value(spec.template.spec.containers[0].image)')"
+  [ -n "$image" ] || { echo "stylist-api is not deployed yet; run deploy first" >&2; exit 1; }
+  log "grant_admin.py $* (image $image)"
   gcloud run jobs deploy stylist-admin --region="$REGION" \
-    --image="$REGISTRY/app:$TAG" --service-account="$RUNTIME_SA" \
+    --image="$image" --service-account="$RUNTIME_SA" \
     --set-cloudsql-instances="$SQL_CONN" \
     --set-secrets="DATABASE_URL=database-url:latest" \
     --command=python --args="$args" \
     --task-timeout=5m --max-retries=0 --execute-now --wait
-  echo "Output: gcloud logging read 'resource.labels.job_name=stylist-admin' --limit=20 --format='value(textPayload)'"
+  # Print what the script said, so the result is visible where it was run
+  # (a terminal, or the GitHub Actions log) without opening Cloud Logging.
+  sleep 10
+  gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=stylist-admin" \
+    --freshness=10m --limit=20 --order=asc --format='value(textPayload)' || true
 }
 
 cmd_services() {

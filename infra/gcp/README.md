@@ -28,7 +28,23 @@
 | `minio` | Cloud Storage, through its S3-compatible API |
 | `.env` / `secrets/` | Secret Manager |
 
-## First deploy
+## Deploying without a terminal
+
+Everything below can be done in three websites: Google Cloud Console, GitHub
+and Vercel. GitHub Actions runs the scripts in this folder for you:
+
+| Workflow (Actions tab) | Does |
+|---|---|
+| **GCP Setup** | `bootstrap.sh` + model weights → Cloud Storage. First time, and after changing `WEB_ORIGINS`. |
+| **Deploy** | build → migrate → deploy, then a smoke check. Refuses commits whose CI failed. |
+| **GCP Admin** | grant / revoke / list `/ops` admins. |
+
+The one manual step in the Console is letting GitHub sign in to Google Cloud
+(Workload Identity Federation: no key file is ever created). Use exactly the
+IDs `github`, `github-oidc` and `stylist-deployer`. GCP Setup looks for those
+names and reuses them rather than creating duplicates.
+
+## First deploy (with a terminal)
 
 Prerequisites: `gcloud` logged in (`gcloud auth login`), a project with
 billing enabled, and model weights downloaded locally

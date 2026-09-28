@@ -17,7 +17,9 @@ gcloud services enable \
   run.googleapis.com sqladmin.googleapis.com redis.googleapis.com \
   artifactregistry.googleapis.com cloudbuild.googleapis.com \
   secretmanager.googleapis.com compute.googleapis.com \
-  storage.googleapis.com iam.googleapis.com
+  storage.googleapis.com iam.googleapis.com \
+  cloudresourcemanager.googleapis.com iamcredentials.googleapis.com \
+  sts.googleapis.com logging.googleapis.com
 
 log "Artifact Registry"
 gcloud artifacts repositories describe "$AR_REPO" --location="$REGION" >/dev/null 2>&1 ||

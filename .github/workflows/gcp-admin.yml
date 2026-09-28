@@ -1,0 +1,56 @@
+name: GCP Admin
+
+# Grant, revoke or list admin (access to /ops) in a deployed environment.
+# scripts/grant_admin.py runs as a one-off Cloud Run job, because the
+# production database is reachable only from inside Google Cloud. The result
+# is printed at the end of the "Run" step's log.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment
+        type: environment
+        required: true
+        default: production
+      action:
+        description: What to do
+        type: choice
+        options: [grant, revoke, list]
+        default: grant
+      email:
+        description: Account email (not needed for "list")
+        type: string
+        required: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  admin:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/gcp
+        with:
+          wif_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+          config_env: ${{ vars.GCP_CONFIG_ENV }}
+
+      - name: Run
+        env:
+          ACTION: ${{ inputs.action }}
+          EMAIL: ${{ inputs.email }}
+        run: |
+          case "$ACTION" in
+            list)   infra/gcp/deploy.sh admin --list ;;
+            grant|revoke)
+              if [ -z "$EMAIL" ]; then echo "::error::email is required to $ACTION"; exit 1; fi
+              if [ "$ACTION" = grant ]; then
+                infra/gcp/deploy.sh admin --email "$EMAIL"
+              else
+                infra/gcp/deploy.sh admin --email "$EMAIL" --revoke
+              fi ;;
+          esac

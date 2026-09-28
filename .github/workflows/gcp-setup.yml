@@ -1,0 +1,58 @@
+name: GCP Setup
+
+# One-time (and safe to re-run): creates every Google Cloud resource the Deploy
+# workflow needs, then publishes the model weights. This is
+# infra/gcp/bootstrap.sh + `deploy.sh models`, run from GitHub so nobody needs
+# gcloud on their machine. Re-run it after changing WEB_ORIGINS (bucket CORS)
+# or when a model version changes.
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: GitHub environment (holds that project's variables)
+        type: environment
+        required: true
+        default: production
+
+concurrency:
+  group: gcp-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/gcp
+        with:
+          wif_provider: ${{ vars.GCP_WIF_PROVIDER }}
+          service_account: ${{ vars.GCP_DEPLOYER_SA }}
+          config_env: ${{ vars.GCP_CONFIG_ENV }}
+
+      - name: Create cloud resources (~15 min on the first run)
+        run: infra/gcp/bootstrap.sh
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same key as CI, so a model bump invalidates both together.
+      - name: Cache model weights
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: models-u2net-segformer584abc1e-siglipc56244cc-nsfw8587de99-v3
+
+      - name: Fetch model weights
+        run: python scripts/download_models.py
+
+      # deploy.sh models re-verifies checksums before uploading anything.
+      - name: Publish model weights to Cloud Storage
+        run: infra/gcp/deploy.sh models

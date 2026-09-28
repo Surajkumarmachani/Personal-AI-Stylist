@@ -1,0 +1,60 @@
+name: Google Cloud session
+description: >
+  Sign in to Google Cloud through Workload Identity Federation (no key),
+  install gcloud with grpc, and write infra/gcp/config.env from the
+  environment's GCP_CONFIG_ENV variable. Shared by every GCP workflow so they
+  cannot drift apart.
+
+inputs:
+  wif_provider:
+    description: vars.GCP_WIF_PROVIDER
+    required: true
+  service_account:
+    description: vars.GCP_DEPLOYER_SA
+    required: true
+  config_env:
+    description: vars.GCP_CONFIG_ENV (the whole config.env file)
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Check the environment's variables are set
+      shell: bash
+      env:
+        WIF: ${{ inputs.wif_provider }}
+        SA: ${{ inputs.service_account }}
+        CFG: ${{ inputs.config_env }}
+      run: |
+        missing=""
+        [ -n "$WIF" ] || missing+=" GCP_WIF_PROVIDER"
+        [ -n "$SA" ]  || missing+=" GCP_DEPLOYER_SA"
+        [ -n "$CFG" ] || missing+=" GCP_CONFIG_ENV"
+        if [ -n "$missing" ]; then
+          echo "::error::Missing GitHub environment variables:$missing (Settings → Environments → this environment → Variables)"
+          exit 1
+        fi
+
+    - uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ inputs.wif_provider }}
+        service_account: ${{ inputs.service_account }}
+
+    - uses: google-github-actions/setup-gcloud@v2
+
+    # `gcloud run worker-pools` needs grpc, which the SDK does not bundle.
+    # A venv, because the runner's system Python refuses `pip install`
+    # (PEP 668, externally-managed-environment).
+    - name: Give gcloud grpc
+      shell: bash
+      run: |
+        python3 -m venv "$RUNNER_TEMP/gcloud-py"
+        "$RUNNER_TEMP/gcloud-py/bin/pip" install --quiet grpcio
+        echo "CLOUDSDK_PYTHON=$RUNNER_TEMP/gcloud-py/bin/python" >> "$GITHUB_ENV"
+        echo "CLOUDSDK_PYTHON_SITEPACKAGES=1" >> "$GITHUB_ENV"
+
+    - name: Write deploy config
+      shell: bash
+      env:
+        GCP_CONFIG_ENV: ${{ inputs.config_env }}
+      run: printf '%s\n' "$GCP_CONFIG_ENV" > infra/gcp/config.env
