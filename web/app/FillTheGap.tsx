@@ -68,8 +68,12 @@ export default function FillTheGap({
     <section style={{ marginTop: 30 }}>
       <h2 className="ui-h2">Your wardrobe is short a piece</h2>
       <p className="ui-sub" style={{ marginBottom: 14 }}>
-        These are the only things stopping this occasion working. Everything else in the look
-        above is already yours.
+        {/* "The look above" only exists when some outfit was built; when every
+            gap is blocking, there is none, and the sentence would point at
+            empty space. */}
+        {data.gaps.every((g) => g.severity === "blocking")
+          ? "Nothing you own makes a full outfit for this yet. Here is what to look for."
+          : "These are the only things stopping this occasion working. Everything else in the look above is already yours."}
       </p>
 
       {data.gaps.map((gap) => (
@@ -122,18 +126,30 @@ export default function FillTheGap({
               to vanish. Plain searches, so no "sponsored" rel and no click
               is recorded for them. */}
           {gap.search?.links.length ? (
-            <p className="ui-sub" style={{ marginTop: gap.products.length ? 12 : 0 }}>
-              {gap.products.length ? "More options — search" : "Shop for"}{" "}
-              <strong>{gap.search.query}</strong> on{" "}
-              {gap.search.links.map((l, i) => (
-                <span key={l.store}>
-                  {i > 0 ? (i === gap.search.links.length - 1 ? " or " : ", ") : ""}
-                  <a href={l.url} target="_blank" rel="noopener noreferrer">
-                    {l.store}
+            <div style={{ marginTop: gap.products.length ? 14 : 0 }}>
+              <p className="ui-sub" style={{ marginBottom: 0 }}>
+                {gap.products.length ? "More options — search" : "Shop for"}{" "}
+                <strong>{gap.search.query}</strong>:
+              </p>
+              {/* Real buttons, not inline text: the store names used to render
+                  as plain grey words (the theme strips link styling), so
+                  nothing said they could be clicked. */}
+              <div className="ui-pills" style={{ marginTop: 8 }}>
+                {gap.search.links.map((l) => (
+                  <a
+                    key={l.store}
+                    className="ui-pill"
+                    href={l.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title={l.url}
+                    style={{ textDecoration: "none" }}
+                  >
+                    Search on {l.store} ↗
                   </a>
-                </span>
-              ))}
-            </p>
+                ))}
+              </div>
+            </div>
           ) : null}
 
           {/* The buy-confirmation row sits OUTSIDE the product anchors: a
