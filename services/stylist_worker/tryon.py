@@ -35,6 +35,7 @@ one, and that applies with more force to a picture of someone's own body.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
@@ -52,6 +53,19 @@ logger = logging.getLogger(__name__)
 # Two renders is already up to four minutes. A third compounds artifacts for a
 # garment that is usually an outer layer the models render worst anyway.
 MAX_PASSES = 2
+
+# ONE RENDER AT A TIME, per worker. The provider is typically one free GPU
+# (a Kaggle/Colab notebook behind gradio.live). Two try-ons started together
+# both hit it at once; on 2026-09-30 that ended with the first render's stream
+# cut mid-pass and the Gradio app gone (404) a second later, so one try-on came
+# back half-done and the other failed. Queued behind this lock, the second
+# simply starts when the first finishes.
+_RENDER_LOCK = asyncio.Lock()
+
+# A dropped stream is often transient (a tunnel hiccup). One retry, after a
+# pause, turns that into a slower render instead of a half-finished one.
+RENDER_RETRIES = 1
+RETRY_PAUSE_S = 5.0
 
 # Lower first so the upper garment layers over it. See the module docstring.
 PASS_ORDER = {"lower": 0, "full_body": 0, "upper_base": 1, "upper_layer": 2}
@@ -343,20 +357,42 @@ async def render_tryon(
     for garment in renderable:
         category = SLOT_TO_CATEGORY[garment["slot"]]
         try:
-            with stage_span("vton_render"):
-                produced = client.render(
-                    person_png=current,
-                    garment_png=store.get_bytes(garment["cutout_key"]),
-                    category=category,
-                )
-            # THE PROVIDER MUST ACTUALLY HAVE CHANGED THE PICTURE. See
-            # PASSTHROUGH_MAX_DIFF: a provider that echoes the input yields
-            # valid bytes and a `rendered: True` that means nothing.
-            if _looks_unchanged(current, produced):
-                raise VTONUnavailable(
-                    f"{provider} returned the body photo unchanged for slot "
-                    f"{garment['slot']} — it accepted the request but fitted nothing"
-                )
+            attempt = 0
+            while True:
+                try:
+                    with stage_span("vton_render"):
+                        async with _RENDER_LOCK:
+                            # In a thread: `render` is blocking HTTP for up to
+                            # RENDER_TIMEOUT, and on the event loop it froze
+                            # every other job on this worker for the duration.
+                            produced = await asyncio.to_thread(
+                                client.render,
+                                person_png=current,
+                                garment_png=store.get_bytes(garment["cutout_key"]),
+                                category=category,
+                            )
+                    # THE PROVIDER MUST ACTUALLY HAVE CHANGED THE PICTURE. See
+                    # PASSTHROUGH_MAX_DIFF: a provider that echoes the input
+                    # yields valid bytes and a `rendered: True` that means nothing.
+                    if _looks_unchanged(current, produced):
+                        raise VTONUnavailable(
+                            f"{provider} returned the body photo unchanged for slot "
+                            f"{garment['slot']} — it accepted the request but fitted nothing"
+                        )
+                    break
+                except VTONUnavailable as exc:
+                    # Retry a dropped connection, not a provider that answered
+                    # and fitted nothing: that one would only do it again.
+                    if attempt >= RENDER_RETRIES or "unchanged" in str(exc):
+                        raise
+                    attempt += 1
+                    logger.info(
+                        "tryon %s: retrying %s pass after: %s",
+                        garment_set_hash,
+                        garment["slot"],
+                        exc,
+                    )
+                    await asyncio.sleep(RETRY_PAUSE_S)
             current = produced
             passes += 1
         except VTONUnavailable as exc:
@@ -395,6 +431,11 @@ async def render_tryon(
     store.put_bytes(key, current, content_type="image/png")
 
     rendered_slots = [g["slot"] for g in renderable[:passes]]
+    # A pass that FAILED is not rendered either. This was missing: when the
+    # top's pass died after the trousers', the result reported only `feet` as
+    # skipped, so the card presented a body still wearing the user's own shirt
+    # as a finished try-on of this outfit.
+    not_rendered = [g["slot"] for g in renderable[passes:]]
 
     # WHAT THE RENDER DOES NOT COVER IS PART OF THE RESULT.
     #
@@ -406,7 +447,7 @@ async def render_tryon(
     #
     # Recorded next to the failure rows, for the same reason: the worker is
     # the only place that knows, and the API cannot read arq's result.
-    await _record_render(uid, garment_set_hash, rendered_slots, skipped + dropped)
+    await _record_render(uid, garment_set_hash, rendered_slots, skipped + dropped + not_rendered)
 
     logger.info(
         "tryon %s: %d/%d passes via %s, skipped=%s",
@@ -414,7 +455,7 @@ async def render_tryon(
         passes,
         len(renderable),
         provider,
-        skipped + dropped,
+        skipped + dropped + not_rendered,
     )
     return {
         "rendered": True,
@@ -423,6 +464,6 @@ async def render_tryon(
         "rendered_slots": rendered_slots,
         # Reported, not silently dropped: the user is looking at a picture of
         # themselves and needs to know it is missing their saree.
-        "skipped": skipped + dropped,
+        "skipped": skipped + dropped + not_rendered,
         "provider": provider,
     }

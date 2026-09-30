@@ -210,7 +210,7 @@ export default function WardrobePage() {
       <input
         value={q}
         onChange={(e) => setQ(e.target.value)}
-        placeholder="Filter — black shirt, Levi\u2019s, size M…"
+        placeholder="Filter — black shirt, Levi’s, size M…"
         aria-label="Filter your wardrobe"
         style={{ width: "100%", marginBottom: 12, fontSize: 13 }}
       />

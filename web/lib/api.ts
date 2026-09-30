@@ -106,7 +106,25 @@ export function hasSession(): boolean {
  *
  *  Returns false when there is nothing to restore, which the caller reads as
  *  "show sign-in". */
-export async function refreshSession(): Promise<boolean> {
+// ONE refresh at a time. The server ROTATES refresh tokens: each works exactly
+// once. A page load fires several requests together (garments, duplicates,
+// avatar...), and when the access token has expired each used to start its own
+// refresh with the same token. The first rotated it, the rest were rejected as
+// "reused", the losing branch cleared the session, and a request then went out
+// with no token at all: "401 missing bearer token" on a page that had loaded.
+// Concurrent callers now share the one in-flight refresh.
+let refreshing: Promise<boolean> | null = null;
+
+export function refreshSession(): Promise<boolean> {
+  if (!refreshing) {
+    refreshing = doRefresh().finally(() => {
+      refreshing = null;
+    });
+  }
+  return refreshing;
+}
+
+async function doRefresh(): Promise<boolean> {
   const refresh = readRefresh();
   if (!refresh) return false;
   try {

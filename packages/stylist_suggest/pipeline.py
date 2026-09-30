@@ -254,20 +254,53 @@ async def _rescue_required_slots(
     # rescue they are filtered out and every outfit comes back shoeless — for
     # someone who owns shoes. Optional slots are excluded: an outfit without a
     # bag is not missing anything.
-    for slot in (*required_slots(), *preferred_slots()):
+    slots = [*required_slots(), *preferred_slots()]
+    # THE BASE OUTFIT TOO. The loop above used to cover only required and
+    # preferred slots, which today is just `feet`. The base structure
+    # (upper_base + lower, or full_body) was never rescued, so in a heatwave a
+    # wardrobe whose only bottoms are `warmth=3` jeans against a target of 1
+    # lost every bottom and answered "add something to wear on the bottom" to
+    # someone who owns four pairs. Only when NO base structure can be completed:
+    # if tops and bottoms both survived, a missing full_body is not a gap.
+    if not any(all(pool.by_slot.get(s) for s in group) for group in base_structures()):
+        for group in base_structures():
+            slots += [s for s in group if not pool.by_slot.get(s)]
+    for slot in dict.fromkeys(slots):
         if pool.by_slot.get(slot):
             continue
         rows = await session.execute(
             text(POOL_SQL), dict(params, slot=slot, warmth_slack=WARMTH_RELAXED)
         )
         found = [_to_garment(r) for r in rows.mappings()]
+        rain_relaxed = False
+        if not found and params.get("poor_wet"):
+            # RAIN, SAME ARGUMENT. On a wet day every `poor` material is a hard
+            # exclusion, which is right while there is something else to wear.
+            # When there is not (all four bottoms denim, forecast rain) it
+            # emptied the slot and the reply told the user to "add something to
+            # wear on the bottom" when they own four pairs. Damp jeans are a
+            # worse outfit, not an impossible one; the note says so plainly.
+            rows = await session.execute(
+                text(POOL_SQL),
+                dict(params, slot=slot, warmth_slack=WARMTH_RELAXED, poor_wet=[]),
+            )
+            found = [_to_garment(r) for r in rows.mappings()]
+            rain_relaxed = bool(found)
         if not found:
-            # Something OTHER than warmth emptied this slot. Leave it empty and
-            # let the caller's note stand — inventing a reason here would be
-            # the same mistake as a note that blames the laundry basket for a
-            # warmth filter.
+            # Something OTHER than warmth or rain emptied this slot. Leave it
+            # empty and let the caller's note stand — inventing a reason here
+            # would be the same mistake as a note that blames the laundry
+            # basket for a warmth filter.
             continue
         pool.by_slot[slot] = found
+        if rain_relaxed:
+            materials = sorted({g.material for g in found if g.material}) or ["unknown"]
+            pool.notes.append(
+                f"it looks rainy, and your only {slot.replace('_', ' ')} options are "
+                f"{', '.join(materials)}, which are heavy and slow to dry when wet — "
+                "suggested anyway; something quick-drying would suit today better"
+            )
+            continue
         levels = sorted({g.warmth for g in found if g.warmth is not None})
         shown = ", ".join(str(v) for v in levels) or "unset"
         pool.notes.append(
